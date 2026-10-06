@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Hisilicon kirin9000s (charlotte) SoC core support
+ *
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+/ {
+	interrupt-parent = <&gic>;
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu0>; };
+				core1 { cpu = <&cpu1>; };
+				core2 { cpu = <&cpu2>; };
+				core3 { cpu = <&cpu3>; };
+			};
+			cluster1 {
+				core0 { cpu = <&cpu4>; };
+				core1 { cpu = <&cpu5>; };
+			};
+			cluster2 {
+				core0 { cpu = <&cpu6>; };
+				core1 { cpu = <&cpu7>; };
+			};
+			cluster3 {
+				core0 { cpu = <&cpu8>; };
+				core1 { cpu = <&cpu9>; };
+			};
+			cluster4 {
+				core0 { cpu = <&cpu10>; };
+				core1 { cpu = <&cpu11>; };
+			};
+		};
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x000>;
+			enable-method = "psci";
+		};
+		cpu1: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x100>;
+			enable-method = "psci";
+		};
+		cpu2: cpu@200 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x200>;
+			enable-method = "psci";
+		};
+		cpu3: cpu@300 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x300>;
+			enable-method = "psci";
+		};
+		/* cluster1-3: hhee's per-core sysreg filter pins SCTLR_EL1
+		 * C/I and drops M writes, so these 8 cores can never enable
+		 * their MMU (v66-v70).  Each PSCI CPU_ON attempt burns ~5s
+		 * of timeout (44s of the pre-v77 boot) and the resulting
+		 * 12-present/4-online topology is exactly what blocked
+		 * lockup_detector_retry_init (v75).  Disable until hhee
+		 * hands over EL2/VHE or a release protocol is found. */
+		cpu4: cpu@400 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x400>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu5: cpu@401 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x401>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu6: cpu@500 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x500>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu7: cpu@501 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x501>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu8: cpu@600 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x600>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu9: cpu@601 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x601>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu10: cpu@700 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x700>;
+			enable-method = "psci";
+			status = "okay";
+		};
+		cpu11: cpu@701 {
+			device_type = "cpu";
+			compatible = "arm,armv8";
+			reg = <0x0 0x701>;
+			enable-method = "psci";
+			status = "okay";
+		};
+	};
+
+	psci {
+		compatible = "arm,psci";
+		method = "hvc";
+		cpu_suspend = <0xc4000001>;
+		cpu_off   = <0x84000002>;
+		cpu_on    = <0xc4000003>;
+		system_off = <0x84000008>;
+		system_reset = <0x84000009>;
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(12) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(12) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(12) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(12) | IRQ_TYPE_LEVEL_LOW)>;
+		clock-frequency = <1920000>;
+		arm,no-tick-in-suspend;
+	};
+
+	gic: interrupt-controller@ff000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <3>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-controller;
+		redistributor-stride = <0x0 0x20000>;
+		#redistributor-regions = <1>;
+		reg = <0x0 0xff000000 0x0 0x10000>,
+		      <0x0 0xff040000 0x0 0x180000>;
+		interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		uart6: serial@ffb82000 {
+			compatible = "hisilicon,uart";
+			reg = <0x0 0xffb82000 0x0 0x1000>;
+			interrupts = <GIC_SPI 0x18e IRQ_TYPE_LEVEL_HIGH>;
+			clock-rate = <0 0x124f800>;	/* 19.2 MHz */
+			status = "okay";
+		};
+
+		/*
+		 * USB3 DRD (P2 v72).  The dwc3 core only probes via a glue
+		 * driver -- v71's bare snps,dwc3 node never matched (g_serial
+		 * reported "couldn't find an available UDC").  Wrap it in the
+		 * of-simple glue (match added to dwc3-of-simple.c), which
+		 * creates the child platform device; clocks are optional and
+		 * the combophy is assumed still powered by UEFI fastboot.
+		 * reg/intr from the live stock tree hisi_usb/dwc3@efc00000.
+		 * Peripheral + high-speed first; host lsusb 0525:a4a6 =
+		 * P2 first light.
+		 */
+		usb@efc00000 {
+			compatible = "hisilicon,charlotte-dwc3";
+			/* v165: disabled -- probing the unpowered USB island
+			 * raises SError 0xbe000011 and panics the boot at
+			 * dwc3_core_probe+0xa94 (v164 pstore).  Re-enable for
+			 * the P2 clock-chain work. */
+			status = "disabled";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			dwc3@efc00000 {
+				compatible = "snps,dwc3";
+				reg = <0x0 0xefc00000 0x0 0x100000>;
+				interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+				dr_mode = "peripheral";
+				maximum-speed = "high-speed";
+				snps,dis_u2_susphy_quirk;
+				snps,dis_u3_susphy_quirk;
+				snps,dis_enblslpm_quirk;
+				snps,dis-split-quirk;
+				snps,gctl-reset-quirk;
+			};
+		};
+	};
+
+	aliases {
+		serial0 = &uart6;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Preserve firmware-owned EL2 memory and the warm-reset log. */
+		hhee@113c0000 {
+			reg = <0x0 0x113c0000 0x0 0x800000>;
+			no-map;
+		};
+
+		pstore-mem@2fc40000 {
+			reg = <0x0 0x2fc40000 0x0 0x100000>;
+		};
+
+
+		/*
+		 * UEFI logo framebuffer: HwLogoDxe reads
+		 * /reserved-memory/logo-buffer and the DPU scans out this
+		 * physical address while Linux boots (no ExitBootServices
+		 * teardown in the display DXE drivers).  Reserve it so the
+		 * kernel never hands these pages out.
+		 */
+		logo_buffer: logo-buffer@34380000 {
+			reg = <0x0 0x34380000 0x0 0x7080000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * Handoff framebuffer: the DPU is left scanning the logo buffer.
+	 * Geometry measured from the vendor kernel's own fb0 (read-only
+	 * FBIOGET ioctls): 1840x2800, 32 bpp, stride 7360, memory order
+	 * B,G,R,X (red 16:8, green 8:8, blue 0:8 -> "x8b8g8r8").  The old
+	 * 2800x1840/11200 guess produced the v49 horizontal tearing.
+	 */
+	framebuffer@34380000 {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0x34380000 0x0 0x13aa000>;
+		width = <1840>;
+		height = <2800>;
+		stride = <7360>;
+		format = "x8b8g8r8";
+	};
+};
+
