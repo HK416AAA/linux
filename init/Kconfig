@@ -237,8 +237,9 @@ config BROKEN_ON_SMP
 
 config INIT_ENV_ARG_LIMIT
 	int
-	default 32 if !UML
+	default 64 if CHARLOTTE_BBOXLOG
 	default 128 if UML
+	default 32
 	help
 	  Maximum of each of the number of arguments and environment
 	  variables passed to init from the kernel command line.

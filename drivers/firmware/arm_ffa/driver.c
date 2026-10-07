@@ -36,6 +36,7 @@
 #include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
@@ -63,6 +64,13 @@
 #define RXTX_MAP_MAX_BUFSZ_MASK	GENMASK(31, 16)
 #define RXTX_MAP_MIN_BUFSZ(x)	(FIELD_GET(RXTX_MAP_MIN_BUFSZ_MASK, (x)))
 #define RXTX_MAP_MAX_BUFSZ(x)	(FIELD_GET(RXTX_MAP_MAX_BUFSZ_MASK, (x)))
+
+/*
+ * OEM SMC from the HarmonyOS bl31 (vendor bl31_smc.h:
+ * make_fid(FID_ATF_FRAMEWORK_GROUP, 0x01)) handing Linux the fixed
+ * normal-world RX/TX buffer pair.
+ */
+#define FID_FFA_SHMEM_GET	0xc3002d01
 
 #define FFA_MAX_NOTIFICATIONS		64
 
@@ -105,6 +113,8 @@ struct ffa_drv_info {
 	void *rx_buffer;
 	void *tx_buffer;
 	size_t rxtx_bufsz;
+	bool rxtx_iomapped; /* RXTX buffers are ioremap_wc()ed firmware shmem */
+	bool charlotte; /* vendor FF-A 1.0 calls with 24-byte UUID records */
 	bool mem_ops_native;
 	bool msg_direct_req2_supp;
 	bool bitmap_created;
@@ -132,25 +142,26 @@ static struct platform_device *ffa_pdev;
  * by the caller(FFA_DRIVER_VERSION passed as parameter to FFA_VERSION),
  * it must return the NOT_SUPPORTED error code.
  */
-static u32 ffa_compatible_version_find(u32 version)
+static u32 ffa_compatible_version_find(u32 version, u32 driver_version)
 {
 	u16 major = FFA_MAJOR_VERSION(version), minor = FFA_MINOR_VERSION(version);
-	u16 drv_major = FFA_MAJOR_VERSION(FFA_DRIVER_VERSION);
-	u16 drv_minor = FFA_MINOR_VERSION(FFA_DRIVER_VERSION);
+	u16 drv_major = FFA_MAJOR_VERSION(driver_version);
+	u16 drv_minor = FFA_MINOR_VERSION(driver_version);
 
 	if ((major < drv_major) || (major == drv_major && minor <= drv_minor))
 		return version;
 
 	pr_info("Firmware version higher than driver version, downgrading\n");
-	return FFA_DRIVER_VERSION;
+	return driver_version;
 }
 
 static int ffa_version_check(u32 *version)
 {
 	ffa_value_t ver;
+	u32 driver_version = drv_info->charlotte ? FFA_VERSION_1_0 : FFA_DRIVER_VERSION;
 
 	invoke_ffa_fn((ffa_value_t){
-		      .a0 = FFA_VERSION, .a1 = FFA_DRIVER_VERSION,
+		      .a0 = FFA_VERSION, .a1 = driver_version,
 		      }, &ver);
 
 	if ((s32)ver.a0 == FFA_RET_NOT_SUPPORTED) {
@@ -158,11 +169,11 @@ static int ffa_version_check(u32 *version)
 		return -EOPNOTSUPP;
 	}
 
-	if (FFA_MAJOR_VERSION(ver.a0) > FFA_MAJOR_VERSION(FFA_DRIVER_VERSION)) {
+	if (FFA_MAJOR_VERSION(ver.a0) > FFA_MAJOR_VERSION(driver_version)) {
 		pr_err("Incompatible v%d.%d! Latest supported v%d.%d\n",
 		       FFA_MAJOR_VERSION(ver.a0), FFA_MINOR_VERSION(ver.a0),
-		       FFA_MAJOR_VERSION(FFA_DRIVER_VERSION),
-		       FFA_MINOR_VERSION(FFA_DRIVER_VERSION));
+		       FFA_MAJOR_VERSION(driver_version),
+		       FFA_MINOR_VERSION(driver_version));
 		return -EINVAL;
 	}
 
@@ -174,11 +185,11 @@ static int ffa_version_check(u32 *version)
 		return -EINVAL;
 	}
 
-	pr_info("Driver version %d.%d\n", FFA_MAJOR_VERSION(FFA_DRIVER_VERSION),
-		FFA_MINOR_VERSION(FFA_DRIVER_VERSION));
+	pr_info("Driver version %d.%d\n", FFA_MAJOR_VERSION(driver_version),
+		FFA_MINOR_VERSION(driver_version));
 	pr_info("Firmware version %d.%d found\n", FFA_MAJOR_VERSION(ver.a0),
 		FFA_MINOR_VERSION(ver.a0));
-	*version = ffa_compatible_version_find(ver.a0);
+	*version = ffa_compatible_version_find(ver.a0, driver_version);
 
 	return 0;
 }
@@ -269,7 +280,8 @@ __ffa_partition_info_get(u32 uuid0, u32 uuid1, u32 uuid2, u32 uuid3,
 	int idx, count, flags = 0, sz, buf_sz;
 	ffa_value_t partition_info;
 
-	if (FFA_SUPPORTS_GET_COUNT_ONLY(drv_info->version) &&
+	/* Charlotte rejects count-only queries, despite reporting FF-A 1.1. */
+	if (!drv_info->charlotte && FFA_SUPPORTS_GET_COUNT_ONLY(drv_info->version) &&
 	    (!buffer || !num_partitions)) /* Just get the count for now */
 		flags = PARTITION_INFO_GET_RETURN_COUNT_ONLY;
 
@@ -280,14 +292,31 @@ __ffa_partition_info_get(u32 uuid0, u32 uuid1, u32 uuid2, u32 uuid3,
 		      .a5 = flags,
 		      }, &partition_info);
 
+	if (drv_info->charlotte)
+		/* v178: the -22 shows up without an FFA_ERROR a0, so dump
+		 * the raw responder registers unconditionally. */
+		pr_info("%s: cpu %u req resp %lx %lx %lx %lx %lx %lx\n",
+			__func__, raw_smp_processor_id(), partition_info.a0,
+			partition_info.a1, partition_info.a2,
+			partition_info.a3, partition_info.a4,
+			partition_info.a5);
+
 	if (partition_info.a0 == FFA_ERROR) {
 		mutex_unlock(&drv_info->rx_lock);
+		pr_err("%s: cpu %u raw resp %lx/%lx/%lx/%lx/%lx\n", __func__,
+		       raw_smp_processor_id(),
+		       partition_info.a0, partition_info.a1,
+		       partition_info.a2, partition_info.a3,
+		       partition_info.a4);
 		return ffa_to_linux_errno((int)partition_info.a2);
 	}
 
 	count = partition_info.a2;
 
-	if (FFA_PART_INFO_HAS_SIZE_IN_RESP(drv_info->version)) {
+	if (drv_info->charlotte) {
+		/* Vendor discovery includes UUIDs but returns no descriptor size. */
+		buf_sz = sz = sizeof(*buffer);
+	} else if (FFA_PART_INFO_HAS_SIZE_IN_RESP(drv_info->version)) {
 		buf_sz = sz = partition_info.a3;
 		if (sz > sizeof(*buffer))
 			buf_sz = sizeof(*buffer);
@@ -426,7 +455,16 @@ ffa_partition_probe(const uuid_t *uuid, struct ffa_partition_info **buffer)
 	bool reg_mode = false;
 	struct ffa_partition_info *pbuf;
 
-	if (!ffa_features(FFA_PARTITION_INFO_GET_REGS, 0, NULL, NULL))
+	/*
+	 * Charlotte: firmware answers FFA_FEATURES for the 64-bit REGS
+	 * discovery FID but bl31 does not implement PARTITION_INFO_GET_REGS
+	 * itself -- the probe returns INVALID_PARAMETERS (-2, mapped to
+	 * -22) and every partition discovery died there since v172.  The
+	 * vendor driver has no reg-mode at all; force the legacy
+	 * PARTITION_INFO_GET path.
+	 */
+	if (!drv_info->charlotte &&
+	    !ffa_features(FFA_PARTITION_INFO_GET_REGS, 0, NULL, NULL))
 		reg_mode = true;
 
 	export_uuid((u8 *)uuid0_4, uuid);
@@ -2109,6 +2147,90 @@ cleanup:
 	ffa_notifications_cleanup();
 }
 
+/*
+ * Kirin 9000s (charlotte): the HarmonyOS bl31 only accepts the fixed
+ * RX/TX buffer pair it reserved for the normal world; FFA_RXTX_MAP of
+ * self-allocated pages is DENIED (observed -EACCES, v172). The region
+ * comes from the OEM call FID_FFA_SHMEM_GET: a0 = RX physical base,
+ * a1 = combined RX+TX length, with TX following RX at half of it.
+ * Measured on the stock kernel (/proc/vmallocinfo): RX 0x10967000,
+ * TX 0x10968000, one 4K page per buffer, ioremap_wc()ed by the vendor
+ * driver. Register the negotiated size capped by the region, never the
+ * other way around, and never fall back to arbitrary RAM here.
+ */
+static int ffa_charlotte_setup_rxtx_buffers(size_t negotiated_bufsz,
+					    size_t min_bufsz)
+{
+	ffa_value_t shmem;
+	phys_addr_t rx_pa, tx_pa;
+	u64 total, half, end;
+	size_t bufsz;
+	int ret;
+
+	invoke_ffa_fn((ffa_value_t){ .a0 = FID_FFA_SHMEM_GET, }, &shmem);
+
+	if (shmem.a0 == FFA_ERROR)
+		return ffa_to_linux_errno((int)shmem.a2);
+
+	rx_pa = shmem.a0;
+	total = shmem.a1;
+
+	if (!rx_pa || !IS_ALIGNED(rx_pa, FFA_PAGE_SIZE) ||
+	    !total || !IS_ALIGNED(total, 2 * FFA_PAGE_SIZE)) {
+		pr_err("%s: invalid shmem descriptor %pa/%llu\n",
+		       __func__, &rx_pa, total);
+		return -ENXIO;
+	}
+
+	if (check_add_overflow(rx_pa, total, &end)) {
+		pr_err("%s: shmem region %pa+%llu overflows\n",
+		       __func__, &rx_pa, total);
+		return -EOVERFLOW;
+	}
+
+	half = total >> 1;
+	tx_pa = rx_pa + half;
+
+	bufsz = min(negotiated_bufsz, (size_t)half);
+	if (bufsz < min_bufsz) {
+		pr_err("%s: shmem holds 0x%llx per buffer, min %zu\n",
+		       __func__, half, min_bufsz);
+		return -ENOSPC;
+	}
+
+	drv_info->rx_buffer = ioremap_wc(rx_pa, bufsz);
+	if (!drv_info->rx_buffer)
+		return -ENOMEM;
+
+	drv_info->tx_buffer = ioremap_wc(tx_pa, bufsz);
+	if (!drv_info->tx_buffer) {
+		ret = -ENOMEM;
+		goto err_unmap_rx;
+	}
+
+	ret = ffa_rxtx_map(tx_pa, rx_pa, bufsz / FFA_PAGE_SIZE);
+	if (ret) {
+		pr_err("failed to register FFA RxTx buffers\n");
+		goto err_unmap_tx;
+	}
+
+	drv_info->rxtx_bufsz = bufsz;
+	drv_info->rxtx_iomapped = true;
+
+	pr_info("charlotte: FFA RXTX shmem RX %pa TX %pa, using %zu of %llu bytes per buffer\n",
+		&rx_pa, &tx_pa, bufsz, half);
+
+	return 0;
+
+err_unmap_tx:
+	iounmap(drv_info->tx_buffer);
+	drv_info->tx_buffer = NULL;
+err_unmap_rx:
+	iounmap(drv_info->rx_buffer);
+	drv_info->rx_buffer = NULL;
+	return ret;
+}
+
 static int ffa_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -2127,6 +2249,7 @@ static int ffa_probe(struct platform_device *pdev)
 	if (!drv_info)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, drv_info);
+	drv_info->charlotte = of_machine_is_compatible("hisilicon,charlotte");
 
 	ret = ffa_version_check(&drv_info->version);
 	if (ret) {
@@ -2140,55 +2263,73 @@ static int ffa_probe(struct platform_device *pdev)
 		ret = -ENODEV;
 		goto free_drv_info;
 	}
+	if (drv_info->charlotte)
+		pr_info("charlotte: VM id 0x%x\n", drv_info->vm_id);
 
-	ret = ffa_features(FFA_FN_NATIVE(RXTX_MAP), 0, &buf_sz, NULL);
-	if (!ret) {
-		if (RXTX_MAP_MIN_BUFSZ(buf_sz) == 1)
-			rxtx_min_bufsz = SZ_64K;
-		else if (RXTX_MAP_MIN_BUFSZ(buf_sz) == 2)
-			rxtx_min_bufsz = SZ_16K;
-		else
-			rxtx_min_bufsz = SZ_4K;
+	/* Vendor parity: ffa_init never queries FEATURES before partition
+	 * discovery.  Skip it on charlotte -- it is the one remaining
+	 * call-order difference from the stock flow (v176). */
+	if (!drv_info->charlotte) {
+		ret = ffa_features(FFA_FN_NATIVE(RXTX_MAP), 0, &buf_sz, NULL);
+		if (!ret) {
+			if (RXTX_MAP_MIN_BUFSZ(buf_sz) == 1)
+				rxtx_min_bufsz = SZ_64K;
+			else if (RXTX_MAP_MIN_BUFSZ(buf_sz) == 2)
+				rxtx_min_bufsz = SZ_16K;
+			else
+				rxtx_min_bufsz = SZ_4K;
 
-		rxtx_max_bufsz = RXTX_MAP_MAX_BUFSZ(buf_sz) * SZ_4K;
-		if (rxtx_max_bufsz != 0 && rxtx_max_bufsz < rxtx_min_bufsz)
-			rxtx_max_bufsz = rxtx_min_bufsz;
+			rxtx_max_bufsz = RXTX_MAP_MAX_BUFSZ(buf_sz) * SZ_4K;
+			if (rxtx_max_bufsz != 0 && rxtx_max_bufsz < rxtx_min_bufsz)
+				rxtx_max_bufsz = rxtx_min_bufsz;
+		}
 	}
 
 	rxtx_bufsz = min_not_zero(PAGE_ALIGN(rxtx_min_bufsz), rxtx_max_bufsz);
-	drv_info->rx_buffer = alloc_pages_exact(rxtx_bufsz, GFP_KERNEL);
-	if (!drv_info->rx_buffer) {
-		ret = -ENOMEM;
-		goto free_drv_info;
-	}
+	if (drv_info->charlotte) {
+		/*
+		 * bl31 accepts only its own fixed RXTX pair: a failure
+		 * here must abort, not fall back to self-allocated RAM.
+		 */
+		ret = ffa_charlotte_setup_rxtx_buffers(rxtx_bufsz, rxtx_min_bufsz);
+		if (ret)
+			goto free_drv_info;
+	} else {
+		drv_info->rx_buffer = alloc_pages_exact(rxtx_bufsz, GFP_KERNEL);
+		if (!drv_info->rx_buffer) {
+			ret = -ENOMEM;
+			goto free_drv_info;
+		}
 
-	drv_info->tx_buffer = alloc_pages_exact(rxtx_bufsz, GFP_KERNEL);
-	if (!drv_info->tx_buffer) {
-		ret = -ENOMEM;
-		goto free_pages;
-	}
+		drv_info->tx_buffer = alloc_pages_exact(rxtx_bufsz, GFP_KERNEL);
+		if (!drv_info->tx_buffer) {
+			ret = -ENOMEM;
+			goto free_pages;
+		}
 
-	ret = ffa_rxtx_map(virt_to_phys(drv_info->tx_buffer),
-			   virt_to_phys(drv_info->rx_buffer),
-			   rxtx_bufsz / FFA_PAGE_SIZE);
-	if (ret == -EINVAL && !rxtx_max_bufsz && rxtx_min_bufsz < rxtx_bufsz) {
-		rxtx_bufsz = rxtx_min_bufsz;
 		ret = ffa_rxtx_map(virt_to_phys(drv_info->tx_buffer),
 				   virt_to_phys(drv_info->rx_buffer),
 				   rxtx_bufsz / FFA_PAGE_SIZE);
+		if (ret == -EINVAL && !rxtx_max_bufsz && rxtx_min_bufsz < rxtx_bufsz) {
+			rxtx_bufsz = rxtx_min_bufsz;
+			ret = ffa_rxtx_map(virt_to_phys(drv_info->tx_buffer),
+					   virt_to_phys(drv_info->rx_buffer),
+					   rxtx_bufsz / FFA_PAGE_SIZE);
+		}
+		if (ret) {
+			pr_err("failed to register FFA RxTx buffers\n");
+			goto free_pages;
+		}
+		drv_info->rxtx_bufsz = rxtx_bufsz;
 	}
-	if (ret) {
-		pr_err("failed to register FFA RxTx buffers\n");
-		goto free_pages;
-	}
-	drv_info->rxtx_bufsz = rxtx_bufsz;
 
 	mutex_init(&drv_info->rx_lock);
 	mutex_init(&drv_info->tx_lock);
 
 	ffa_drvinfo_flags_init();
 
-	ffa_notifications_setup();
+	if (!drv_info->charlotte)
+		ffa_notifications_setup();
 
 	ret = ffa_setup_partitions();
 	if (!ret)
@@ -2198,9 +2339,14 @@ static int ffa_probe(struct platform_device *pdev)
 	ffa_notifications_cleanup();
 	ffa_rxtx_unmap();
 free_pages:
-	if (drv_info->tx_buffer)
-		free_pages_exact(drv_info->tx_buffer, rxtx_bufsz);
-	free_pages_exact(drv_info->rx_buffer, rxtx_bufsz);
+	if (drv_info->rxtx_iomapped) {
+		iounmap(drv_info->tx_buffer);
+		iounmap(drv_info->rx_buffer);
+	} else {
+		if (drv_info->tx_buffer)
+			free_pages_exact(drv_info->tx_buffer, rxtx_bufsz);
+		free_pages_exact(drv_info->rx_buffer, rxtx_bufsz);
+	}
 free_drv_info:
 	platform_set_drvdata(pdev, NULL);
 	kfree(drv_info);
@@ -2215,8 +2361,13 @@ static void ffa_remove(struct platform_device *pdev)
 	ffa_notifications_cleanup();
 	ffa_partitions_cleanup();
 	ffa_rxtx_unmap();
-	free_pages_exact(info->tx_buffer, info->rxtx_bufsz);
-	free_pages_exact(info->rx_buffer, info->rxtx_bufsz);
+	if (info->rxtx_iomapped) {
+		iounmap(info->tx_buffer);
+		iounmap(info->rx_buffer);
+	} else {
+		free_pages_exact(info->tx_buffer, info->rxtx_bufsz);
+		free_pages_exact(info->rx_buffer, info->rxtx_bufsz);
+	}
 	kfree(info);
 	platform_set_drvdata(pdev, NULL);
 	drv_info = NULL;

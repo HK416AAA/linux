@@ -245,6 +245,9 @@ static int __init __apply_alternatives_multi_stop(void *unused)
 
 		bitmap_complement(remaining_capabilities, boot_cpucaps,
 				  ARM64_NCAPS);
+		/* charlotte: retain LL/SC atomics; enabling LSE stopped the
+		 * first post-patch spinlock during bring-up. */
+		clear_bit(ARM64_HAS_LSE_ATOMICS, remaining_capabilities);
 
 		BUG_ON(all_alternatives_applied);
 		__apply_alternatives(&kernel_alternatives, false,
@@ -261,8 +264,27 @@ void __init apply_alternatives_all(void)
 	pr_info("applying system-wide alternatives\n");
 
 	apply_alternatives_vdso();
-	/* better not try code patching on a live SMP system */
-	stop_machine(__apply_alternatives_multi_stop, NULL, cpu_online_mask);
+	/* better not try code patching on a live SMP system.
+	 * charlotte: with a single online CPU (maxcpus=1) the full
+	 * stop_machine handoff (kernel_init -> migration stopper ->
+	 * back) never returns on this platform (v39: STOP_RET ok,
+	 * ALL_DONE missing). Apply directly -- no concurrency exists
+	 * to stop. */
+	if (num_online_cpus() == 1) {
+		unsigned long charlotte_flags;
+
+		pr_info("charlotte: direct alternatives apply (1 cpu)\n");
+		/* IRQs off while patching: v40 proved an open interrupt
+		 * landing on half-patched .text kills the box, while the
+		 * (otherwise fatal) stop_machine handoff was the only part
+		 * stop_machine got right. */
+		local_irq_save(charlotte_flags);
+		__apply_alternatives_multi_stop(NULL);
+		local_irq_restore(charlotte_flags);
+	} else {
+		stop_machine(__apply_alternatives_multi_stop, NULL,
+			     cpu_online_mask);
+	}
 }
 
 /*

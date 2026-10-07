@@ -586,4 +586,46 @@ source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
 source "drivers/misc/issei/Kconfig"
+
+config CHARLOTTE_SIMPLEFB
+	bool "Kirin 9000s (charlotte) fixed-address framebuffer handoff"
+	depends on ARM64 && FB_SIMPLE
+	help
+	  Registers a simple-framebuffer platform device for the DPU
+	  scanout the vendor UEFI left running (logo-buffer @ 0x34380000,
+	  1840x2800/stride 7360/a8r8g8b8 measured from the vendor fb0).
+	  Say y if the bootloader FDT has no simple-framebuffer node.
+config CHARLOTTE_RESET_TEST
+	bool "Kirin 9000s PSCI reset boot probe"
+	depends on ARM64
+	help
+	  Issues PSCI SYSTEM_RESET via HVC at late_initcall as a
+	  deterministic boot-progress signature.
+
+config CHARLOTTE_BBOXLOG
+	bool "Kirin 9000s bbox-mem boot checkpoints"
+	depends on ARM64
+	help
+	  Writes ASCII boot-progress checkpoints into the DFX blackbox
+	  reserved memory so they survive LPM3 resets and can be read
+	  from the vendor last_kmsg after re-flashing stock.
+
 endmenu
+
+config CHARLOTTE_KEEPALIVE
+	bool "Kirin 9000s (charlotte) LPM3/watchdog keepalive"
+	depends on ARCH_HISI
+	help
+	  Kick the local V500 watchdog and notify the LPM3 housekeeping MCU
+	  over the HiIPCV230 mailbox so it does not reset the AP while
+	  mainline Linux runs.  Bare MMIO, no framework dependencies.
+
+config CHARLOTTE_PID1MON
+	bool "Kirin 9000s PID1 bring-up probe (temporary)"
+	depends on ARM64
+	help
+	  Reports the state and stack of PID 1 every 5 seconds so a
+	  silently-stuck initramfs userspace shows its wait channel in
+	  the pstore console.  Bring-up only; remove after the boot is
+	  proven.
+

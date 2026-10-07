@@ -38,6 +38,9 @@ static int dwc3_of_simple_probe(struct platform_device *pdev)
 
 	int			ret;
 
+	pr_info("CHARLOTTE-USB: of_simple probe for %s\n",
+		of_node_full_name(np));
+
 	simple = devm_kzalloc(dev, sizeof(*simple), GFP_KERNEL);
 	if (!simple)
 		return -ENOMEM;
@@ -73,6 +76,8 @@ static int dwc3_of_simple_probe(struct platform_device *pdev)
 		goto err_clk_put_all;
 
 	ret = of_platform_populate(np, NULL, NULL, dev);
+	pr_info("CHARLOTTE-USB: of_platform_populate ret=%d clocks=%d\n",
+		ret, simple->num_clocks);
 	if (ret)
 		goto err_clk_disable;
 

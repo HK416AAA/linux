@@ -1175,6 +1175,12 @@ static bool detect_ftr_has_mpam(void)
 	u64 pfr0 = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
 	u64 pfr1 = read_sanitised_ftr_reg(SYS_ID_AA64PFR1_EL1);
 
+	/* charlotte: hhee (EL2) does not enable MPAM access for EL1, so
+	 * read_cpuid(MPAMIDR_EL1) traps and kills the boot (v35 death).
+	 * The SoC reports MPAM in ID_AA64PFR0/1, so force the probe off
+	 * until hhee interplay is understood. */
+	return false;
+
 	return id_aa64pfr0_mpam(pfr0) || id_aa64pfr1_mpamfrac(pfr1);
 }
 
@@ -1233,25 +1239,11 @@ void __init init_cpu_features(struct cpuinfo_arm64 *info)
 
 	if (id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0))
 		init_32bit_cpu_features(&info->aarch32);
+#if 0
+	if (id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0))
+		init_32bit_cpu_features(&info->aarch32);
 
-	if (IS_ENABLED(CONFIG_ARM64_SVE) &&
-	    id_aa64pfr0_sve(read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1))) {
-		unsigned long cpacr = cpacr_save_enable_kernel_sve();
-
-		vec_init_vq_map(ARM64_VEC_SVE);
-
-		cpacr_restore(cpacr);
-	}
-
-	if (IS_ENABLED(CONFIG_ARM64_SME) &&
-	    id_aa64pfr1_sme(read_sanitised_ftr_reg(SYS_ID_AA64PFR1_EL1))) {
-		unsigned long cpacr = cpacr_save_enable_kernel_sme();
-
-		vec_init_vq_map(ARM64_VEC_SME);
-
-		cpacr_restore(cpacr);
-	}
-
+#endif
 	if (detect_ftr_has_mpam()) {
 		info->reg_mpamidr = read_cpuid(MPAMIDR_EL1);
 		init_cpu_ftr_reg(SYS_MPAMIDR_EL1, info->reg_mpamidr);

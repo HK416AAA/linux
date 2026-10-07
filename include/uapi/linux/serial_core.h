@@ -234,6 +234,9 @@
 /* Sunplus UART */
 #define PORT_SUNPLUS	123
 
+/* Hisilicon UART V500 (Kirin 9000s / charlotte) */
+#define PORT_UART_V500	124
+
 /* Generic type identifier for ports which type is not important to userspace. */
 #define PORT_GENERIC	(-1)
 

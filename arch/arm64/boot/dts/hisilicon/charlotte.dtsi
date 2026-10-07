@@ -177,40 +177,28 @@
 			status = "okay";
 		};
 
-		/*
-		 * USB3 DRD (P2 v72).  The dwc3 core only probes via a glue
-		 * driver -- v71's bare snps,dwc3 node never matched (g_serial
-		 * reported "couldn't find an available UDC").  Wrap it in the
-		 * of-simple glue (match added to dwc3-of-simple.c), which
-		 * creates the child platform device; clocks are optional and
-		 * the combophy is assumed still powered by UEFI fastboot.
-		 * reg/intr from the live stock tree hisi_usb/dwc3@efc00000.
-		 * Peripheral + high-speed first; host lsusb 0525:a4a6 =
-		 * P2 first light.
-		 */
 		usb@efc00000 {
 			compatible = "hisilicon,charlotte-dwc3";
-			/* v165: disabled -- probing the unpowered USB island
-			 * raises SError 0xbe000011 and panics the boot at
-			 * dwc3_core_probe+0xa94 (v164 pstore).  Re-enable for
-			 * the P2 clock-chain work. */
-			status = "disabled";
-			#address-cells = <2>;
-			#size-cells = <2>;
-			ranges;
-
-			dwc3@efc00000 {
-				compatible = "snps,dwc3";
-				reg = <0x0 0xefc00000 0x0 0x100000>;
-				interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
-				dr_mode = "peripheral";
-				maximum-speed = "high-speed";
-				snps,dis_u2_susphy_quirk;
-				snps,dis_u3_susphy_quirk;
-				snps,dis_enblslpm_quirk;
-				snps,dis-split-quirk;
-				snps,gctl-reset-quirk;
-			};
+			reg = <0x0 0xefc00000 0x0 0x100000>,
+			      <0x0 0xefb02000 0x0 0x1000>,
+			      <0x0 0xffb85000 0x0 0x1000>,
+			      <0x0 0xffb81000 0x0 0x1000>,
+			      <0x0 0xfb21b000 0x0 0x1000>,
+			      <0x0 0xefa02000 0x0 0x1000>,
+			      <0x0 0xfb913000 0x0 0x1000>,
+			      <0x0 0xefab0000 0x0 0x1000>;
+			reg-names = "dwc3", "hsdt-crg", "peri-crg", "pmctrl",
+				    "sysctrl", "misc", "sysqic", "utmi";
+			interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "peripheral";
+			dr_mode = "peripheral";
+			maximum-speed = "high-speed";
+			snps,hsphy_interface = "utmi";
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+			snps,dis_enblslpm_quirk;
+			snps,dis-split-quirk;
+			snps,gctl-reset-quirk;
 		};
 	};
 
@@ -226,16 +214,189 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-		/* Preserve firmware-owned EL2 memory and the warm-reset log. */
+		/*
+		 * Fixed reservations from the live UEFI FDT. Preserve every
+		 * enabled firmware region: an absent Linux driver does not
+		 * establish that EL3 has released its DDR protection. Reusable
+		 * Linux CMA pools and disabled loader areas are not copied.
+		 */
+		sensorhub-shmemext@10000000 {
+			reg = <0x0 0x10000000 0x0 0x600000>;
+			no-map;
+		};
+
+		sensorhub-shmem@10600000 {
+			reg = <0x0 0x10600000 0x0 0x40000>;
+			no-map;
+		};
+
+		sensorhub-share-mem@10640000 {
+			reg = <0x0 0x10640000 0x0 0x80000>;
+			no-map;
+		};
+
+		/* Bootloader display-SMMU page tables: live while the DPU
+		 * keeps scanning out the logo. */
+		iommu_pgtable@106c0000 {
+			reg = <0x0 0x106c0000 0x0 0x200000>;
+			no-map;
+		};
+
+		/* Firmware scratch pool (stock ddr_inspect); the FF-A RXTX
+		 * buffers live here (Android ffa: RX 0x10967000, TX 0x10968000).
+		 * no-map so the FF-A driver can ioremap_wc them with no
+		 * linear alias. */
+		fka-mem@108c0000 {
+			reg = <0x0 0x108c0000 0x0 0xfe000>;
+			no-map;
+		};
+
+		/* TEE OS command-line page. */
+		teeos-cmdline@109be000 {
+			reg = <0x0 0x109be000 0x0 0x1000>;
+			no-map;
+		};
+
+		/* Firmware mntn black-box dump magic page. */
+		mntndump@109bf000 {
+			reg = <0x0 0x109bf000 0x0 0x1000>;
+			no-map;
+		};
+
+		/* The v172 /init source page was in this GPU protected range. */
+		gpu-jcd@10f40000 {
+			reg = <0x0 0x10f40000 0x0 0x400000>;
+			no-map;
+		};
+
+		/* Firmware DP/display shared buffer between gpu-jcd and hhee. */
+		dp-dhcp@11340000 {
+			reg = <0x0 0x11340000 0x0 0x80000>;
+			no-map;
+		};
+
+		/* EL2 monitor (hhee) memory. */
 		hhee@113c0000 {
 			reg = <0x0 0x113c0000 0x0 0x800000>;
 			no-map;
 		};
 
+		/* LPM3 always-on island (warm reset / watchdog owner). */
+		lpmx-core@127c0000 {
+			reg = <0x0 0x127c0000 0x0 0x80000>;
+			no-map;
+		};
+
+		lpmcu@12840000 {
+			reg = <0x0 0x12840000 0x0 0xc0000>;
+			no-map;
+		};
+
+		sensorhub-s@12900000 {
+			reg = <0x0 0x12900000 0x0 0xd00000>;
+			no-map;
+		};
+
+		npu-tiny@13600000 {
+			reg = <0x0 0x13600000 0x0 0x600000>;
+			no-map;
+		};
+
+		mini-isp@13c00000 {
+			reg = <0x0 0x13c00000 0x0 0x200000>;
+			no-map;
+		};
+
+		/* ARM Trusted Firmware EL3 runtime (PSCI/FF-A conduit). */
+		bl31@13e00000 {
+			reg = <0x0 0x13e00000 0x0 0x200000>;
+			no-map;
+		};
+
+		/* Secure SMMU TCU page tables (GPU protect stream). */
+		sec_smmu_tcu@14380000 {
+			reg = <0x0 0x14380000 0x0 0x180000>;
+			no-map;
+		};
+
+		sensorhub-sdc@14500000 {
+			reg = <0x0 0x14500000 0x0 0x100000>;
+			no-map;
+		};
+
+		/* Secure OS (TrustZone) image and data. */
+		secos@14600000 {
+			reg = <0x0 0x14600000 0x0 0x3000000>;
+			no-map;
+		};
+
+		thee@17600000 {
+			reg = <0x0 0x17600000 0x0 0xb00000>;
+			no-map;
+		};
+
+		/* TEE-protected memory (stock platform-supersonic-ex). */
+		supersonic-ex@2b400000 {
+			reg = <0x0 0x2b400000 0x0 0x980000>;
+			no-map;
+		};
+
+		/* Secure OS extension (stock platform-secos-ex). */
+		secos-ex@2bd80000 {
+			reg = <0x0 0x2bd80000 0x0 0x480000>;
+			no-map;
+		};
+
+		sec-camera@2cc00000 {
+			reg = <0x0 0x2cc00000 0x0 0xc00000>;
+			no-map;
+		};
+
+		hieps@2d800000 {
+			reg = <0x0 0x2d800000 0x0 0x200000>;
+			no-map;
+		};
+
+		hifi-base@2da00000 {
+			reg = <0x0 0x2da00000 0x0 0xf80000>;
+			no-map;
+		};
+
+		npu-sec@2e980000 {
+			reg = <0x0 0x2e980000 0x0 0x700000>;
+			no-map;
+		};
+
+		hifi-data@2f080000 {
+			reg = <0x0 0x2f080000 0x0 0x580000>;
+			no-map;
+		};
+
+		bbox-mem@2f600000 {
+			reg = <0x0 0x2f600000 0x0 0x620000>;
+			no-map;
+		};
+
+		/* BL31 non-secure shared buffer (SMC payload/log). */
+		bl31_ns@2fc20000 {
+			reg = <0x0 0x2fc20000 0x0 0x20000>;
+			no-map;
+		};
+
+		/* Ramoops: keep mapped so the console log stays readable. */
 		pstore-mem@2fc40000 {
 			reg = <0x0 0x2fc40000 0x0 0x100000>;
 		};
 
+		npu-ai-ts-fw@2fd40000 {
+			reg = <0x0 0x2fd40000 0x0 0x400000>;
+			no-map;
+		};
+
+		npu-ai-server@30140000 {
+			reg = <0x0 0x30140000 0x0 0x600000>;
+			no-map;
+		};
 
 		/*
 		 * UEFI logo framebuffer: HwLogoDxe reads

@@ -29,6 +29,23 @@ config SERIAL_AMBA_PL010
 
 	  If unsure, say N.
 
+config SERIAL_UART_V500
+	tristate "Hisilicon UART V500 serial port support"
+	depends on ARCH_HISI || COMPILE_TEST
+	select SERIAL_CORE
+	help
+	  This selects the Hisilicon UART V500 IP found on Kirin SoCs of
+	  the charlotte (Kirin 9000s) generation.  The V500 UART is
+	  16550-like but not register compatible.  The driver is PIO-only
+	  and works without a clock driver (falls back to the clock-rate
+	  DT property or 19.2 MHz).
+
+config SERIAL_UART_V500_CONSOLE
+	bool "Support for console on Hisilicon UART V500"
+	depends on SERIAL_UART_V500 = y
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+
 config SERIAL_AMBA_PL010_CONSOLE
 	bool "Support for console on AMBA serial port"
 	depends on SERIAL_AMBA_PL010=y

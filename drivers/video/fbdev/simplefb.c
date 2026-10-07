@@ -74,6 +74,7 @@ struct simplefb_par {
 	resource_size_t base;
 	resource_size_t size;
 	struct resource *mem;
+	bool memremapped;
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 	bool clks_enabled;
 	unsigned int clk_count;
@@ -107,8 +108,12 @@ static void simplefb_destroy(struct fb_info *info)
 	simplefb_regulators_destroy(info->par);
 	simplefb_clocks_destroy(info->par);
 	simplefb_detach_genpds(info->par);
-	if (info->screen_base)
-		iounmap(info->screen_base);
+	if (info->screen_base) {
+		if (par->memremapped)
+			memunmap(info->screen_base);
+		else
+			iounmap(info->screen_base);
+	}
 
 	framebuffer_release(info);
 
@@ -602,6 +607,17 @@ static int simplefb_probe(struct platform_device *pdev)
 	info->screen_base = ioremap_wc(info->fix.smem_start,
 				       info->fix.smem_len);
 	if (!info->screen_base) {
+		/* charlotte bring-up: the handoff scanout lives in normal
+		 * DRAM (vendor /reserved-memory/logo-buffer), and arm64
+		 * __ioremap refuses RAM pfns outright (v56: probe failed
+		 * with -ENOMEM after "ioremap attempted on RAM pfn").
+		 * Map it through the direct map instead. */
+		info->screen_base = memremap(info->fix.smem_start,
+					     info->fix.smem_len,
+					     MEMREMAP_WB);
+		par->memremapped = !!info->screen_base;
+	}
+	if (!info->screen_base) {
 		ret = -ENOMEM;
 		goto error_fb_release;
 	}
@@ -654,7 +670,10 @@ error_regulators:
 error_clocks:
 	simplefb_clocks_destroy(par);
 error_unmap:
-	iounmap(info->screen_base);
+	if (par->memremapped)
+		memunmap(info->screen_base);
+	else
+		iounmap(info->screen_base);
 error_fb_release:
 	framebuffer_release(info);
 error_release_mem_region:

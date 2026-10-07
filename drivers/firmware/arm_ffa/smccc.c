@@ -4,6 +4,7 @@
  */
 
 #include <linux/printk.h>
+#include <linux/of.h>
 
 #include "common.h"
 
@@ -20,6 +21,16 @@ static void __arm_ffa_fn_hvc(ffa_value_t args, ffa_value_t *res)
 int ffa_transport_init(ffa_fn **invoke_ffa_fn)
 {
 	enum arm_smccc_conduit conduit;
+
+	/*
+	 * Charlotte: v176 proved the FF-A responder sits at EL3 -- HVC
+	 * reaches hhee, which answers FFA_VERSION with NOT_SUPPORTED,
+	 * while SMC-routed VERSION/RXTX_MAP succeed.  Keep SMC.
+	 */
+	if (of_machine_is_compatible("hisilicon,charlotte")) {
+		*invoke_ffa_fn = __arm_ffa_fn_smc;
+		return 0;
+	}
 
 	if (arm_smccc_get_version() < ARM_SMCCC_VERSION_1_2)
 		return -EOPNOTSUPP;

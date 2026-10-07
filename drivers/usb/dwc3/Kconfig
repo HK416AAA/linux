@@ -109,6 +109,15 @@ config USB_DWC3_MESON_G12A
 	  Support USB2/3 functionality in Amlogic G12A platforms.
 	  Say 'Y' or 'M' if you have one such device.
 
+config USB_DWC3_CHARLOTTE
+	tristate "HiSilicon Kirin 9000s (Charlotte) platform"
+	depends on OF && ARM64
+	depends on ARCH_HISI || COMPILE_TEST
+	select ARM_FFA_TRANSPORT
+	help
+	  Initialize the Charlotte USB controller and PHY resources, including
+	  the platform firmware's FF-A USB access configuration.
+
 config USB_DWC3_OF_SIMPLE
 	tristate "Generic OF Simple Glue Layer"
 	depends on OF && COMMON_CLK

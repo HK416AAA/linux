@@ -4,6 +4,11 @@
 #
 
 obj-$(CONFIG_IBMVMC)		+= ibmvmc.o
+obj-$(CONFIG_CHARLOTTE_RESET_TEST)	+= charlotte-reset-test.o
+obj-$(CONFIG_CHARLOTTE_BBOXLOG)	+= charlotte-bboxlog.o
+obj-$(CONFIG_CHARLOTTE_SIMPLEFB)	+= charlotte-simplefb.o
+obj-$(CONFIG_CHARLOTTE_KEEPALIVE)	+= charlotte-keepalive.o
+obj-$(CONFIG_CHARLOTTE_PID1MON)		+= charlotte-pid1mon.o
 obj-$(CONFIG_AD525X_DPOT)	+= ad525x_dpot.o
 obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
 obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o

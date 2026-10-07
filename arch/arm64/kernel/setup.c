@@ -7,6 +7,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/libfdt.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/stddef.h>
@@ -32,6 +33,7 @@
 #include <linux/sched/task.h>
 #include <linux/scs.h>
 #include <linux/mm.h>
+#include <linux/serial_core.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -54,6 +56,12 @@
 #include <asm/efi.h>
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
+
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+void charlotte_ckpt(const char *tag);
+void charlotte_ckpt_hex(const char *tag, unsigned long long v);
+void __init charlotte_s2_pool_init(void);
+#endif
 
 static int num_standard_resources;
 static struct resource *standard_resources;
@@ -173,14 +181,44 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 	void *dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
 	const char *name;
 
+	charlotte_ckpt_hex("E:SMF_PA   ", (u64)dt_phys);
+	charlotte_ckpt_hex("E:SMF_VA   ", (u64)dt_virt);
+	charlotte_ckpt_hex("E:SMF_SIZE ", (u64)size);
+
 	if (dt_virt)
 		memblock_reserve(dt_phys, size);
+	else {
+		/* remap failed: dump the raw header so we can see why */
+		u32 *hdr = early_memremap_ro(dt_phys, 32);
+
+		if (hdr) {
+			int i;
+
+			for (i = 0; i < 4; i++)
+				charlotte_ckpt_hex("E:SMF_H   ",
+						   ((u64)hdr[i] << 32) | hdr[i + 4]);
+			early_memunmap(hdr, 32);
+		} else {
+			charlotte_ckpt("E:SMF_HDR_UNMAP\n");
+		}
+	}
 
 	/*
 	 * dt_virt is a fixmap address, hence __pa(dt_virt) can't be used.
 	 * Pass dt_phys directly.
 	 */
 	if (!early_init_dt_scan(dt_virt, dt_phys)) {
+		u32 *h = dt_virt ? (u32 *)dt_virt : early_memremap_ro(dt_phys, 32);
+		int i;
+
+		charlotte_ckpt("E:SMF_DT_INVALID\n");
+		if (h) {
+			for (i = 0; i < 4; i++)
+				charlotte_ckpt_hex("E:SMF_X   ",
+						   ((u64)h[i] << 32) | h[i + 4]);
+			if (!dt_virt)
+				early_memunmap(h, 32);
+		}
 		pr_crit("\n"
 			"Error: invalid device tree blob: PA=%pa, VA=%px, size=%d bytes\n"
 			"The dtb must be 8-byte aligned and must not exceed 2 MB in size.\n"
@@ -195,6 +233,7 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 		while (true)
 			cpu_relax();
 	}
+	charlotte_ckpt("E:SMF_SCAN_OK\n");
 
 	/* Early fixups are done, map the FDT as read-only now */
 	fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL_RO);
@@ -288,8 +327,110 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	early_fixmap_init();
 	early_ioremap_init();
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	/* First checkpoint: early_memremap is only valid from here on.
+	 * (Calling it any earlier returns slot_virt[] == 0, i.e. a
+	 * near-NULL VA, and the memcpy below faults -- that mistake
+	 * silently killed every image since v10.) */
+	charlotte_ckpt("E:FIXMAP_READY\n");
 
+	/* Prefer a valid bootloader FDT. The entry diagnostics must preserve
+	 * x0 before preserve_boot_args; the old 0x34b80000 observation was
+	 * the paint loop's end pointer, not evidence of a firmware FDT.
+	 * --embed-dtb places a fallback at __pa(_end), outside the BSS
+	 * clear range, for boots where the original FDT is invalid. */
+	static bool charlotte_fdt_bl;
+
+	{
+		phys_addr_t embed_pa = __pa_symbol(_end);
+		u32 *m;
+
+		charlotte_ckpt_hex("E:FDT_BL   ", (u64)__fdt_pointer);
+		charlotte_ckpt_hex("E:FDT_EMBED ", (u64)embed_pa);
+		m = early_memremap_ro(__fdt_pointer, 4);
+		if (m) {
+			if (be32_to_cpup(m) == 0xd00dfeed) {
+				charlotte_ckpt("E:FDT_BL_OK\n");
+				charlotte_fdt_bl = true;
+			}
+			early_memunmap(m, 4);
+		}
+		/* v166b: prefer the EMBEDDED tree again -- the BL FDT is
+		 * the full stock tree (its dwc3 probe SError-panics the
+		 * boot at dwc3_core_probe+0xa94, and none of our DT
+		 * edits ever applied on it).  The ramdisk pointers: the
+		 * stock DTB is far too big to libfdt-walk through the
+		 * early fixmap, but BootImgDxe loads the ramdisk at the
+		 * FIXED address from our own boot image header (see
+		 * tools/repack_bootimg.py): 0x66800000 + size 0x3322bb.
+		 * Write those constants into the placeholder slots and
+		 * switch. */
+	{
+		phys_addr_t embed_pa2 = __pa_symbol(_end);
+		void *em = early_memremap(embed_pa2, 0x4000);
+		bool ok = false;
+
+		if (em && be32_to_cpup(em) == 0xd00dfeed) {
+			int eo = fdt_path_offset(em, "/chosen");
+
+			if (eo >= 0 &&
+			    fdt_setprop_u64(em, eo, "linux,initrd-start", 0x66800000ULL) == 0 &&
+			    fdt_setprop_u64(em, eo, "linux,initrd-end", 0x66800000ULL + 0x3322bbULL) == 0) {
+				charlotte_ckpt_hex("E:FDT_INITRD ", 0x66800000ULL);
+				ok = true;
+			}
+			if (ok) {
+				__fdt_pointer = embed_pa2;
+				charlotte_ckpt("E:FDT_USING_EMBED\n");
+			} else {
+				charlotte_ckpt("E:FDT_USING_BL\n");
+			}
+			early_memunmap(em, 0x4000);
+		} else {
+			charlotte_ckpt("E:FDT_RESCUE_FAIL\n");
+			if (em)
+				early_memunmap(em, 0x4000);
+		}
+	}
+	}
+#endif
+
+	charlotte_ckpt("E:SMF_ENTER\n");
 	setup_machine_fdt(__fdt_pointer);
+	charlotte_ckpt("E:SMF_DONE\n");
+
+	/* charlotte: the vendor UEFI fills /chosen/bootargs with ~40
+	 * device-specific key=value args and no mainline console setup;
+	 * this device ignores the bootimg cmdline field (DT bootargs
+	 * protocol only).  early_init_dt_scan() has copied the vendor
+	 * string into boot_command_line and parse_early_param() runs
+	 * right after this: append the diagnostics while we still can.
+	 * (The env overflow itself is handled by INIT_ENV_ARG_LIMIT=64.) */
+	if (charlotte_fdt_bl && !IS_ENABLED(CONFIG_CMDLINE_FORCE)) {
+		static const char charlotte_append[] =
+			" earlycon=uart_v500,mmio32,0xffb82000"
+			" console=tty0 console=ttyHW0,115200 keep_bootcon"
+			" ignore_loglevel loglevel=8 nokaslr";
+		size_t len = strlen(boot_command_line);
+
+		if (len + sizeof(charlotte_append) <= COMMAND_LINE_SIZE) {
+			strcpy(boot_command_line + len, charlotte_append);
+			charlotte_ckpt("E:ARGS_APPENDED\n");
+		} else {
+			charlotte_ckpt_hex("E:ARGS_SKIP len ", (u64)len);
+		}
+	}
+
+	/* v52 lesson: earlycon never registered even when the append
+	 * succeeded, so do not bet the only boot console on cmdline
+	 * parsing roulette -- register it directly.  setup_earlycon()
+	 * is a no-op if an earlycon is already registered. */
+	{
+		int ret = setup_earlycon("uart_v500,mmio32,0xffb82000");
+
+		charlotte_ckpt(ret ? "E:EARLYCON_DIRECT_FAIL\n"
+				   : "E:EARLYCON_DIRECT\n");
+	}
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the
@@ -297,6 +438,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	jump_label_init();
 	parse_early_param();
+	charlotte_ckpt("E:EARLY_PARAM_DONE\n");
 
 	dynamic_scs_init();
 
@@ -330,6 +472,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	}
 
 	arm64_memblock_init();
+	charlotte_ckpt("E:MEMBLOCK_DONE\n");
 
 	paging_init();
 
@@ -373,6 +516,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			"This indicates a broken bootloader or old kernel\n",
 			boot_args[1], boot_args[2], boot_args[3]);
 	}
+
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	/* v196: the real setup_arch tail.  The v194/v195 call sat in
+	 * dump_kernel_offset(), a panic notifier that never runs on a
+	 * healthy boot -- POOLPA/PFAIL stayed zero the whole time. */
+	charlotte_s2_pool_init();
+	charlotte_ckpt("E:SETUP_ARCH_EXIT\n");
+#endif
 }
 
 static inline bool cpu_can_disable(unsigned int cpu)

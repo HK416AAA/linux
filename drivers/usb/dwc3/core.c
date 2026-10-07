@@ -618,15 +618,20 @@ static void dwc3_cache_hwparams(struct dwc3 *dwc)
 {
 	struct dwc3_hwparams	*parms = &dwc->hwparams;
 
+	pr_info("CHARLOTTE-USB: cache_hwparams begin\n");
 	parms->hwparams0 = dwc3_readl(dwc, DWC3_GHWPARAMS0);
+	pr_info("CHARLOTTE-USB: hwp0=0x%08x\n", parms->hwparams0);
 	parms->hwparams1 = dwc3_readl(dwc, DWC3_GHWPARAMS1);
+	pr_info("CHARLOTTE-USB: hwp1=0x%08x\n", parms->hwparams1);
 	parms->hwparams2 = dwc3_readl(dwc, DWC3_GHWPARAMS2);
 	parms->hwparams3 = dwc3_readl(dwc, DWC3_GHWPARAMS3);
 	parms->hwparams4 = dwc3_readl(dwc, DWC3_GHWPARAMS4);
 	parms->hwparams5 = dwc3_readl(dwc, DWC3_GHWPARAMS5);
+	pr_info("CHARLOTTE-USB: hwp2-5 done\n");
 	parms->hwparams6 = dwc3_readl(dwc, DWC3_GHWPARAMS6);
 	parms->hwparams7 = dwc3_readl(dwc, DWC3_GHWPARAMS7);
 	parms->hwparams8 = dwc3_readl(dwc, DWC3_GHWPARAMS8);
+	pr_info("CHARLOTTE-USB: hwp6-8 done\n");
 
 	if (DWC3_IP_IS(DWC32))
 		parms->hwparams9 = dwc3_readl(dwc, DWC3_GHWPARAMS9);
@@ -2399,7 +2404,9 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 	if (ret)
 		goto err_free_event_buffers;
 
+	pr_info("CHARLOTTE-USB: before dwc3_core_init\n");
 	ret = dwc3_core_init(dwc);
+	pr_info("CHARLOTTE-USB: dwc3_core_init ret=%d\n", ret);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to initialize core\n");
 		goto err_free_event_buffers;
@@ -2409,10 +2416,13 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 	dwc3_debugfs_init(dwc);
 
 	if (!data->skip_core_init_mode) {
+		pr_info("CHARLOTTE-USB: before init_mode\n");
 		ret = dwc3_core_init_mode(dwc);
+		pr_info("CHARLOTTE-USB: init_mode ret=%d\n", ret);
 		if (ret)
 			goto err_exit_debugfs;
 	}
+
 
 	pm_runtime_put(dev);
 
@@ -2453,6 +2463,9 @@ static int dwc3_probe(struct platform_device *pdev)
 	struct dwc3_probe_data probe_data = {};
 	struct resource *res;
 	struct dwc3 *dwc;
+
+	pr_info("CHARLOTTE-USB: dwc3_probe entry for %s\n",
+		dev_name(&pdev->dev));
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {

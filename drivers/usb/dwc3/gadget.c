@@ -3008,7 +3008,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
 	dep->flags = 0;
 	ret = __dwc3_gadget_ep_enable(dep, DWC3_DEPCFG_ACTION_INIT);
 	if (ret) {
-		dev_err(dwc->dev, "failed to enable %s\n", dep->name);
+		dev_err(dwc->dev, "failed to enable %s ret=%d\n", dep->name, ret);
 		goto err0;
 	}
 
@@ -3016,7 +3016,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
 	dep->flags = 0;
 	ret = __dwc3_gadget_ep_enable(dep, DWC3_DEPCFG_ACTION_INIT);
 	if (ret) {
-		dev_err(dwc->dev, "failed to enable %s\n", dep->name);
+		dev_err(dwc->dev, "failed to enable %s ret=%d\n", dep->name, ret);
 		goto err1;
 	}
 

@@ -122,8 +122,28 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	secondary_data.task = idle;
 	update_cpu_boot_status(CPU_MMU_OFF);
 
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	/* v109: cores with Aff1 >= 4 arrive "managed" in hhee with
+	 * stock-era snapshots, so their first M=1 write is judged and
+	 * dropped.  Cycle them once through PSCI CPU_OFF first (via
+	 * the charlotte_cycle_pen trampoline) the way the vendor
+	 * hotplug lifecycle does, then bring them in for real. */
+	if (cpu >= 4) {
+		extern int charlotte_cpu_cycle(unsigned int cpu);
+		charlotte_cpu_cycle(cpu);
+	}
+#endif
 	/* Now bring the CPU into our world */
 	ret = boot_secondary(cpu, idle);
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	{
+		extern void charlotte_ckpt_hex(const char *tag,
+					       unsigned long long v);
+
+		charlotte_ckpt_hex("E:CPU_ON ret ",
+				   ((u64)cpu << 32) | (u32)ret);
+	}
+#endif
 	if (ret) {
 		if (ret != -EPERM)
 			pr_err("CPU%u: failed to boot: %d\n", cpu, ret);
@@ -140,6 +160,13 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 		return 0;
 
 	pr_crit("CPU%u: failed to come online\n", cpu);
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	{
+		extern void charlotte_slot_mirror(void);
+
+		charlotte_slot_mirror();
+	}
+#endif
 	secondary_data.task = NULL;
 	status = READ_ONCE(secondary_data.status);
 	if (status == CPU_MMU_OFF)
@@ -194,12 +221,19 @@ static void init_gic_priority_masking(void)
  * This is the secondary CPU boot entry.  We're using this CPUs
  * idle thread stack, but a set of temporary page tables.
  */
+
+/* v143's raw-PA probes removed (v147): the two stores after
+ * cpu_uninstall_idmap() hit unmapped low VAs (TTBR0 = zero page)
+ * and took down every secondary with a data abort -> panic at
+ * 0.25s in every v144-v146 boot.  Forensics stay in head.S (S
+ * markers) and charlotte_slot_mirror() on the primary. */
 asmlinkage notrace void secondary_start_kernel(void)
 {
 	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
 	struct mm_struct *mm = &init_mm;
 	const struct cpu_operations *ops;
 	unsigned int cpu = smp_processor_id();
+
 
 	/*
 	 * All kernel threads share the same mm context; grab a
@@ -213,6 +247,7 @@ asmlinkage notrace void secondary_start_kernel(void)
 	 * point to zero page to avoid speculatively fetching new entries.
 	 */
 	cpu_uninstall_idmap();
+
 
 	if (system_uses_irq_prio_masking())
 		init_gic_priority_masking();
@@ -446,6 +481,8 @@ void __init smp_cpus_done(unsigned int max_cpus)
 	mark_linear_text_alias_ro();
 }
 
+void charlotte_keepalive_early_poke(void);
+
 void __init smp_prepare_boot_cpu(void)
 {
 	/*
@@ -456,9 +493,11 @@ void __init smp_prepare_boot_cpu(void)
 	set_my_cpu_offset(per_cpu_offset(smp_processor_id()));
 
 	cpuinfo_store_boot_cpu();
+	charlotte_keepalive_early_poke();
 	setup_boot_cpu_features();
 
 	/* Conditionally switch to GIC PMR for interrupt masking */
+	charlotte_keepalive_early_poke();
 	if (system_uses_irq_prio_masking())
 		init_gic_priority_masking();
 
@@ -1362,3 +1401,34 @@ bool cpus_are_stuck_in_kernel(void)
 	return !!cpus_stuck_in_kernel || smp_spin_tables ||
 		is_protected_kvm_enabled();
 }
+
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+/* psci conduit: DT hvc fids, direct asm */
+extern char charlotte_cycle_pen[];
+
+/* PSCI v0.1 conduit is hvc with DT fids: cpu_on 0xc4000003. */
+static void charlotte_hvc_cpu_on(unsigned long fid, u64 target,
+				 u64 entry)
+{
+	asm volatile("mov x0, %0\n"
+		     "mov x1, %1\n"
+		     "mov x2, %2\n"
+		     "hvc #0"
+		     :
+		     : "r"((unsigned long)fid), "r"(target), "r"(entry)
+		     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+		       "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+		       "x15", "x16", "x17", "memory");
+}
+
+int charlotte_cpu_cycle(unsigned int cpu)
+{
+	u64 mpidr = cpu_logical_map(cpu);
+	unsigned long entry = (unsigned long)__pa_symbol(charlotte_cycle_pen);
+
+	/* park the core: it immediately CPU_OFFs itself */
+	charlotte_hvc_cpu_on(0xc4000003, mpidr, entry);
+	mdelay(200);
+	return 0;
+}
+#endif

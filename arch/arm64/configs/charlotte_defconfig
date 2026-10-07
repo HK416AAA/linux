@@ -1983,10 +1983,10 @@ CONFIG_MEMTEST=y
 CONFIG_SERIAL_UART_V500=y
 CONFIG_SERIAL_UART_V500_CONSOLE=y
 CONFIG_CHARLOTTE_SIMPLEFB=y
-# CONFIG_CHARLOTTE_FBPROBE is not set
 # CONFIG_CHARLOTTE_RESET_TEST is not set
 CONFIG_CHARLOTTE_BBOXLOG=y
 CONFIG_CHARLOTTE_KEEPALIVE=y
+CONFIG_CHARLOTTE_PID1MON=y
 CONFIG_DRM=y
 # CONFIG_DRM_SIMPLEDRM is not set
 CONFIG_FB_SIMPLE=y
@@ -1995,21 +1995,26 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_FONT_8x16=y
 
 # CONFIG_ARM64_SVE is not set
-# P2 v71: USB gadget — bare dwc3 + g_serial (PHY left powered by UEFI)
+# USB peripheral console; Charlotte glue owns firmware, clocks and PHY setup.
 CONFIG_USB_SUPPORT=y
 CONFIG_USB=y
 CONFIG_USB_GADGET=y
 CONFIG_USB_LIBCOMPOSITE=y
 CONFIG_USB_DWC3=y
 CONFIG_USB_DWC3_GADGET=y
+CONFIG_USB_DWC3_CHARLOTTE=y
 CONFIG_USB_G_SERIAL=y
+CONFIG_U_SERIAL_CONSOLE=y
 # v76: armv8 pmu init blocks the boot at ~76s (user-seen fbcon freeze on
 # the armv8 pmu initcall line; 8 present-but-offline CPUs suspected).
 # PMU is useless for bring-up: disable until SMP is complete.
 # CONFIG_ARM_PMU is not set
 # CONFIG_ARM_PMUV3 is not set
 # CONFIG_ARM_PMU_ACPI is not set
-CONFIG_INITRAMFS_SOURCE=""
+CONFIG_INITRAMFS_SOURCE="../tools/charlotte-initramfs/charlotte-initramfs.cpio.gz"
+CONFIG_INITRAMFS_FORCE=y
+CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 console=ttyGS0,115200 ignore_loglevel loglevel=8 nokaslr debug.exception-trace=1 charlotte_keepalive.stop_after=900"
+CONFIG_CMDLINE_FORCE=y
 CONFIG_ARM64_VA_BITS_39=y
 CONFIG_ARM64_PAGE_SIZE_4KB=y
 # A510 and Taishan fail the boot-time PAuth compatibility contract (v170).

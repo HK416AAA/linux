@@ -1454,6 +1454,17 @@ static void __init create_idmap(void)
 		       IDMAP_ROOT_LEVEL, (pte_t *)idmap_pg_dir, false,
 		       __phys_to_virt(ptep) - ptep);
 
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	/* charlotte v65: secondary CPUs enable the MMU on this FIXED
+	 * table, which normally covers only the idmap text.  The boot
+	 * probes live in the pstore prz block at PA 0x2fc00000; without
+	 * this mapping every post-MMU PA store on a secondary faults
+	 * (v63/v64: 8 cores die right after the M-probe write). */
+	__pi_map_range(&ptep, 0x2fc00000UL, 0x2fc00000UL + SZ_2M,
+		       0x2fc00000UL, PAGE_KERNEL, IDMAP_ROOT_LEVEL,
+		       (pte_t *)idmap_pg_dir, false,
+		       __phys_to_virt(ptep) - ptep);
+#endif
 	if (linear_map_requires_bbml3 ||
 	    (IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0) && !arm64_use_ng_mappings)) {
 		phys_addr_t pa = __pa_symbol(&idmap_kpti_bbml3_flag);

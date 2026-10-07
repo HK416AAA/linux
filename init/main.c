@@ -120,6 +120,11 @@
 
 #include <kunit/test.h>
 
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+void charlotte_keepalive_early_poke(void);
+void charlotte_ckpt(const char *tag);
+#endif
+
 static int kernel_init(void *);
 
 /*
@@ -988,6 +993,26 @@ void start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	/* charlotte probe: raw write via the idmap mapping installed in
+	 * head.S (VA=PA on TTBR0), then bring the fixmap up immediately so
+	 * the C ramlog can start recording from here. */
+	*(volatile unsigned int *)0x2fcb0020 = 0xcafe0008;
+	asm volatile("dc cvac, %0\n\tdsb sy" :: "r"(0x2fcb0020) : "memory");
+	{
+		void charlotte_panic_notify_arm(void);
+
+		charlotte_panic_notify_arm();
+	}
+	{
+		void early_fixmap_init(void);
+		void early_ioremap_init(void);
+
+		early_fixmap_init();
+		early_ioremap_init();
+		charlotte_ckpt("E:START_KERNEL\n");
+	}
+#endif
 
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
@@ -1007,6 +1032,9 @@ void start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	charlotte_keepalive_early_poke();
+#endif
 	mm_core_init_early();
 	/* Static keys and static calls are needed by LSMs */
 	jump_label_init();
@@ -1034,6 +1062,7 @@ void start_kernel(void)
 	if (extra_init_args)
 		parse_args("Setting extra init args", extra_init_args,
 			   NULL, 0, -1, -1, NULL, set_init_arg);
+	charlotte_keepalive_early_poke();
 
 	/* Architectural and non-timekeeping rng init, before allocator init */
 	random_init_early(command_line);
@@ -1586,6 +1615,13 @@ static int __ref kernel_init(void *unused)
 	rcu_end_inkernel_boot();
 
 	do_sysctl_args();
+
+	/* charlotte v193: pin PID 1 (and everything it execs) to the
+	 * cold-path boot CPU.  hhee denies EL0 instruction fetch (S2
+	 * permission, FSC 0x30-0x33) on other CPUs -- v192 placed this
+	 * before kernel_init_freeable(), which resets the affinity to
+	 * cpu_all_mask and re-enabled the IA storm. */
+	set_cpus_allowed_ptr(current, cpumask_of(0));
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);

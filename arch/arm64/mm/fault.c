@@ -28,8 +28,11 @@
 #include <linux/pkeys.h>
 #include <linux/preempt.h>
 #include <linux/hugetlb.h>
+#include <linux/page-isolation.h>
+#include <linux/memblock.h>
 
 #include <asm/acpi.h>
+#include <asm/sections.h>
 #include <asm/bug.h>
 #include <asm/cmpxchg.h>
 #include <asm/cpufeature.h>
@@ -56,6 +59,11 @@ struct fault_info {
 };
 
 static const struct fault_info fault_info[];
+
+void charlotte_ua_trace(unsigned long far, unsigned long esr,
+			struct pt_regs *regs, const char *kind);
+void charlotte_ckpt_hex(const char *tag, unsigned long long v);
+void charlotte_ckpt(const char *tag);
 
 static inline const struct fault_info *esr_to_fault_info(unsigned long esr)
 {
@@ -602,6 +610,303 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 	return false;
 }
 
+/* charlotte v188: hhee's stage 2 denies EL0 instruction fetch on
+ * some 2MB DRAM blocks (IABT_LOW with FSC 0x30-0x33 = S2 permission
+ * encoding; S1 PERM_L is only 0x0C-0x0F).  The kernel cannot fix S2,
+ * so: hardware-walk S1 for the PA, isolate the whole 2MB block from
+ * the buddy allocator, copy the faulting page elsewhere, swap the S1
+ * PTE, flush and let the fetch retry at the new PA.  PID 1 un-sticks
+ * without userspace cooperation. */
+#define CHARLOTTE_BAD_MAX	16
+static unsigned long charlotte_bad_base[CHARLOTTE_BAD_MAX];
+static unsigned long charlotte_bad_end[CHARLOTTE_BAD_MAX];
+static int charlotte_bad_count;
+static DEFINE_MUTEX(charlotte_bad_lock);
+
+static bool charlotte_pa_in_bad_range(unsigned long pa)
+{
+	int i;
+
+	for (i = 0; i < charlotte_bad_count; i++)
+		if (pa >= charlotte_bad_base[i] && pa < charlotte_bad_end[i])
+			return true;
+	return false;
+}
+
+static bool charlotte_page_in_bad_range(struct page *p)
+{
+	return charlotte_pa_in_bad_range(page_to_phys(p));
+}
+
+/* v199: start_isolate_page_range removed from the fault path -- the
+ * 16MB-margin isolation storm deadlocked the CPU at t=422s (v198).
+ * The pre-verified pool plus bulk migration cover everything the
+ * isolation was buying. */
+
+#define CHARLOTTE_POOL_PAGES	2048
+static struct page *charlotte_pool[CHARLOTTE_POOL_PAGES];
+static int charlotte_pool_n;
+static bool charlotte_pool_filled;
+static unsigned long charlotte_pool_pa;
+static int charlotte_pool_idx;
+static int charlotte_pool_fail;
+static bool charlotte_bulk_done;
+
+/* v194: carve the migration pool at memblock time, next to the boot
+ * image.  v193 proved the S2 denial is global (even the pinned boot
+ * CPU), so the buddy-swept pool pages were denied too.  v171 proved
+ * SOME region allows EL0 execution -- the prime candidate is the
+ * kernel-image neighborhood hhee itself loaded. */
+void __init charlotte_s2_pool_init(void)
+{
+	phys_addr_t size = 16UL << 20;
+	phys_addr_t kern_end = __pa_symbol(_end);
+	phys_addr_t pa = 0;
+
+	/* v195: candidate windows, logged at fill time (the early
+	 * ramlog lines wrap away within the first boot). */
+	pa = memblock_phys_alloc_range(size, SZ_2M,
+				       kern_end + SZ_2M,
+				       kern_end + 64 * SZ_1M);
+	if (!pa) {
+		phys_addr_t end = memblock_end_of_DRAM();
+
+		pa = memblock_phys_alloc_range(size, SZ_2M,
+					       end - 6 * size, end - size);
+		charlotte_pool_fail = 1;
+	}
+	if (!pa) {
+		charlotte_pool_fail = 2;
+		return;
+	}
+	charlotte_pool_pa = pa;
+}
+
+/* v191: draw migration targets from a one-shot pool of pages proven
+ * outside the stage-2-denied ranges.  Buddy hands out the lowest free
+ * pages in order, so a handful of retries never escapes an 18MB bad
+ * window (v190 BAIL4 x17).  Pages falling inside known-bad ranges are
+ * leaked, never freed -- freeing would put them back on the head of
+ * the free list for the very next allocation. */
+static void charlotte_fill_pool(void)
+{
+	int tries;
+
+	if (charlotte_pool_filled)
+		return;
+	charlotte_pool_filled = true;
+
+	charlotte_ckpt_hex("E:W POOLPA", charlotte_pool_pa);
+	charlotte_ckpt_hex("E:W PFAIL ", charlotte_pool_fail);
+
+	if (charlotte_pool_pa) {
+		while (charlotte_pool_n < CHARLOTTE_POOL_PAGES &&
+		       charlotte_pool_idx < (signed)(16UL << 20 >> PAGE_SHIFT)) {
+			charlotte_pool[charlotte_pool_n++] = pfn_to_page(
+				(charlotte_pool_pa >> PAGE_SHIFT) +
+				charlotte_pool_idx++);
+		}
+		charlotte_ckpt_hex("E:W POOL ", charlotte_pool_n);
+		return;
+	}
+
+	for (tries = 0; tries < 65536 &&
+	     charlotte_pool_n < CHARLOTTE_POOL_PAGES; tries++) {
+		struct page *p = alloc_pages(GFP_HIGHUSER_MOVABLE, 0);
+
+		if (!p)
+			break;
+		if (charlotte_page_in_bad_range(p))
+			continue;	/* leak: keep it out of buddy */
+		charlotte_pool[charlotte_pool_n++] = p;
+	}
+	charlotte_ckpt_hex("E:W POOL ", charlotte_pool_n);
+}
+
+static struct page *charlotte_alloc_good_page(gfp_t gfp)
+{
+	charlotte_fill_pool();
+	if (charlotte_pool_n > 0)
+		return charlotte_pool[--charlotte_pool_n];
+	return NULL;
+}
+
+/* v198/v199: one-shot bulk migration of every present page in the
+ * vma.  The per-fault single-page crawl (v191..v197) advances ~1
+ * page/s and never converges.  v199 runs in two phases per PMD table:
+ * snapshot bad PTEs under the ptl, then swap them outside it (the
+ * pool pop and page copy never sleep, but the v198 in-lock isolation
+ * storm deadlocked the CPU at t=422s).  Caller holds mmap read lock;
+ * PID 1 is single-threaded here. */
+static void charlotte_bulk_migrate_vma(struct vm_area_struct *vma)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr = vma->vm_start;
+	int migrated = 0;
+
+	while (addr < vma->vm_end) {
+		pgd_t *pgdp = pgd_offset(mm, addr);
+		p4d_t *p4dp = p4d_offset(pgdp, addr);
+		pud_t *pudp = pud_offset(p4dp, addr);
+		pmd_t *pmdp = pmd_offset(pudp, addr);
+		pte_t *ptep, pte;
+		spinlock_t *ptl = NULL;
+		unsigned long e = min(addr + PMD_SIZE, vma->vm_end);
+		unsigned long snap_addr[512];
+		pte_t snap_pte[512];
+		int snap_n = 0, i;
+
+		ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
+		if (!ptep) {
+			addr = e;
+			continue;
+		}
+		for (; addr < e && snap_n < 512; addr += PAGE_SIZE, ptep++) {
+			unsigned long pa;
+
+			pte = READ_ONCE(*ptep);
+			if (!pte_present(pte))
+				continue;
+			pa = __pte_to_phys(pte);
+			if (!charlotte_pa_in_bad_range(pa))
+				continue;
+			snap_addr[snap_n] = addr;
+			snap_pte[snap_n] = pte;
+			snap_n++;
+		}
+		pte_unmap_unlock(ptep, ptl);
+
+		for (i = 0; i < snap_n; i++) {
+			unsigned long sa = snap_addr[i];
+			unsigned long pa = __pte_to_phys(snap_pte[i]);
+			struct page *old, *new;
+			pte_t new_pte;
+
+			new = charlotte_alloc_good_page(GFP_HIGHUSER_MOVABLE);
+			if (!new)
+				break;
+			old = pfn_to_page(PHYS_PFN(pa));
+			copy_highpage(new, old);
+			ptep = pte_offset_map_lock(mm, pmdp, sa, &ptl);
+			if (!ptep)
+				break;
+			pte = READ_ONCE(*ptep);
+			if (pte_present(pte) && pte_val(pte) == pte_val(snap_pte[i])) {
+				new_pte = __pte((pte_val(pte) & ~PTE_ADDR_LOW) |
+						__phys_to_pte_val(page_to_phys(new)));
+				set_pte_at(mm, sa, ptep, new_pte);
+				migrated++;
+			}
+			pte_unmap_unlock(ptep, ptl);
+		}
+		if (migrated)
+			flush_tlb_range(vma, vma->vm_start, vma->vm_end);
+		addr = e;
+	}
+	charlotte_ckpt_hex("E:W BULK ", migrated);
+}
+
+static bool charlotte_s2_fixup(unsigned long far)
+{
+	struct mm_struct *mm = current->mm;
+	unsigned long par, pa, pfn;
+	struct vm_area_struct *vma;
+	struct page *old, *new;
+	pte_t *ptep, pte, new_pte;
+	spinlock_t *ptl;
+	pgd_t *pgdp;
+	p4d_t *p4dp;
+	pud_t *pudp;
+	pmd_t *pmdp;
+	bool ret = false;
+
+	if (!mm)
+		return false;
+
+	/* S1-only hardware walk: the PA our PTE points at. */
+	asm volatile("at s1e0r, %0" :: "r"(far));
+	isb();
+	par = read_sysreg(par_el1);
+	if (par & 1)
+		return false;		/* S1 itself faulted: not stage 2 */
+	pa = par & PTE_ADDR_LOW;
+	pfn = pa >> PAGE_SHIFT;
+	charlotte_ckpt_hex("E:W PA  ", pa);
+
+	if (mmap_read_lock_killable(mm))
+		return false;
+	vma = find_vma(mm, far);
+	if (!vma || far < vma->vm_start || far >= vma->vm_end ||
+	    !(vma->vm_flags & VM_EXEC)) {
+		charlotte_ckpt_hex("E:W BAIL1", far);
+		goto out_unlock;
+	}
+
+	pgdp = pgd_offset(mm, far);
+	p4dp = p4d_offset(pgdp, far);
+	pudp = pud_offset(p4dp, far);
+	pmdp = pmd_offset(pudp, far);
+	ptep = pte_offset_map_lock(mm, pmdp, far, &ptl);
+	if (!ptep) {
+		charlotte_ckpt_hex("E:W BAIL2", far);
+		goto out_unlock;
+	}
+	pte = READ_ONCE(*ptep);
+	if (!pte_present(pte) || pte_pfn(pte) != pfn) {
+		charlotte_ckpt_hex("E:W BAIL3", pte_val(pte));
+		goto out_pte;
+	}
+
+	new = charlotte_alloc_good_page(GFP_HIGHUSER_MOVABLE);
+	if (!new) {
+		charlotte_ckpt_hex("E:W BAIL4", 0);
+		goto out_pte;
+	}
+	old = pfn_to_page(pfn);
+	copy_highpage(new, old);
+
+	/* Keep the faulting pte's permission bits, swap the PA. */
+	new_pte = __pte((pte_val(pte) & ~PTE_ADDR_LOW) |
+			__phys_to_pte_val(page_to_phys(new)));
+	set_pte_at(mm, far, ptep, new_pte);
+	flush_tlb_page(vma, far);
+	charlotte_ckpt_hex("E:W MIGN ", page_to_phys(new));
+	/* v191: leak the denied page on purpose -- put_page() would
+	 * hand it back to buddy for the next innocent allocation. */
+	ret = true;
+out_pte:
+	pte_unmap_unlock(ptep, ptl);
+out_unlock:
+	if (ret) {
+		/* v201: bookkeep the denied 2MB block so the bulk sweep
+		 * sees it (v199 dropped the isolator that used to feed
+		 * this list -- pure bookkeeping, no page isolation). */
+		unsigned long b = pa & ~((1UL << PMD_SHIFT) - 1);
+		int i, known = 0;
+
+		mutex_lock(&charlotte_bad_lock);
+		for (i = 0; i < charlotte_bad_count; i++)
+			if (b >= charlotte_bad_base[i] &&
+			    b < charlotte_bad_end[i])
+				known = 1;
+		if (!known && charlotte_bad_count < CHARLOTTE_BAD_MAX) {
+			charlotte_bad_base[charlotte_bad_count] = b;
+			charlotte_bad_end[charlotte_bad_count] =
+				b + (1UL << PMD_SHIFT);
+			charlotte_bad_count++;
+		}
+		mutex_unlock(&charlotte_bad_lock);
+
+		/* v200: run the bulk sweep on EVERY fixup -- fault_around
+		 * keeps mapping fresh batches of denied file pages, so a
+		 * one-shot bulk (v198) degenerates back into the crawl.
+		 * Already-migrated pages fail pa_in_bad_range() in us. */
+		charlotte_bulk_migrate_vma(vma);
+	}
+	mmap_read_unlock(mm);
+	return ret;
+}
+
 static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 				   struct pt_regs *regs)
 {
@@ -675,6 +980,18 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 			goto no_context;
 		arm64_force_sig_fault(SIGSEGV, SEGV_ACCERR, far, "stage-2 fault");
 		return 0;
+	}
+
+	/* charlotte v188: hhee S2 permission aborts (FSC 0x30-0x33)
+	 * arrive as plain IABT_LOW and are unfixable by handle_mm_fault.
+	 * Migrate the page to a stage-2-allowed PA and retry instead of
+	 * force-signalling PID 1 into its fatal loop. */
+	if (user_mode(regs) && ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW) {
+		unsigned long fsc = esr & ESR_ELx_FSC;
+
+		if (fsc >= 0x30 && fsc <= 0x33 &&
+		    charlotte_s2_fixup(far))
+			return 0;
 	}
 
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
@@ -985,6 +1302,32 @@ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf = esr_to_fault_info(esr);
 	unsigned long addr = untagged_addr(far);
+
+	{
+		/* charlotte v186: rate-limited userspace IA/DA trace into
+		 * the pstore ramlog (PID 1 IA storm diagnostics). */
+		static atomic_t ua_limit = ATOMIC_INIT(64);
+
+		if (user_mode(regs) &&
+		    atomic_dec_if_positive(&ua_limit) >= 0)
+			charlotte_ua_trace(far, esr, regs,
+				ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW ?
+					"IAB" : "DAB");
+
+		/* charlotte v189: S2 permission aborts (FSC 0x30-0x33,
+		 * the S2-only encoding range; S1 PERM_L is 0x0C-0x0F)
+		 * land here unhandled because el0_ia calls do_mem_abort
+		 * directly.  Migrate the page to a stage-2-allowed PA
+		 * and retry instead of force-signalling PID 1.  NB: at
+		 * s12e0r is UNDEF under hhee -- never use it here. */
+		if (user_mode(regs) && ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW) {
+			unsigned long fsc = esr & ESR_ELx_FSC;
+
+			if (fsc >= 0x30 && fsc <= 0x33 &&
+			    charlotte_s2_fixup(far))
+				return;
+		}
+	}
 
 	if (!inf->fn(far, esr, regs))
 		return;

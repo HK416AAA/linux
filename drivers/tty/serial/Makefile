@@ -31,6 +31,7 @@ obj-$(CONFIG_SERIAL_AMBA_PL011)		+= amba-pl011.o
 obj-$(CONFIG_SERIAL_GRLIB_GAISLER_APBUART) += apbuart.o
 obj-$(CONFIG_SERIAL_AR933X)		+= ar933x_uart.o
 obj-$(CONFIG_SERIAL_ARC)		+= arc_uart.o
+obj-$(CONFIG_SERIAL_UART_V500)		+= uart_v500.o
 obj-$(CONFIG_SERIAL_ATMEL)		+= atmel_serial.o
 obj-$(CONFIG_SERIAL_BCM63XX)		+= bcm63xx_uart.o
 obj-$(CONFIG_SERIAL_CLPS711X)		+= clps711x.o
