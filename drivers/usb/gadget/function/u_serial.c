@@ -593,10 +593,18 @@ static int gserial_wakeup_host(struct gserial *gser)
 	struct usb_function	*func = &gser->func;
 	struct usb_gadget	*gadget = func->config->cdev->gadget;
 
-	if (func->func_suspended)
+	if (func->func_suspended) {
+		if (!func->func_wakeup_armed)
+			return -EOPNOTSUPP;
 		return usb_func_wakeup(func);
-	else
-		return usb_gadget_wakeup(gadget);
+	}
+
+	/* Keep data buffered until resume if the host has not armed wakeup. */
+	if (!(func->config->bmAttributes & USB_CONFIG_ATT_WAKEUP) ||
+	    (gadget->ops->set_remote_wakeup && !gadget->wakeup_armed))
+		return -EOPNOTSUPP;
+
+	return usb_gadget_wakeup(gadget);
 }
 
 /*-------------------------------------------------------------------------*/

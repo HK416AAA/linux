@@ -1995,7 +1995,7 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_FONT_8x16=y
 
 # CONFIG_ARM64_SVE is not set
-# USB peripheral console; Charlotte glue owns firmware, clocks and PHY setup.
+# USB serial shell; UART and framebuffer carry the kernel console.
 CONFIG_USB_SUPPORT=y
 CONFIG_USB=y
 CONFIG_USB_GADGET=y
@@ -2004,7 +2004,7 @@ CONFIG_USB_DWC3=y
 CONFIG_USB_DWC3_GADGET=y
 CONFIG_USB_DWC3_CHARLOTTE=y
 CONFIG_USB_G_SERIAL=y
-CONFIG_U_SERIAL_CONSOLE=y
+# CONFIG_U_SERIAL_CONSOLE is not set
 # v76: armv8 pmu init blocks the boot at ~76s (user-seen fbcon freeze on
 # the armv8 pmu initcall line; 8 present-but-offline CPUs suspected).
 # PMU is useless for bring-up: disable until SMP is complete.
@@ -2013,10 +2013,16 @@ CONFIG_U_SERIAL_CONSOLE=y
 # CONFIG_ARM_PMU_ACPI is not set
 CONFIG_INITRAMFS_SOURCE="../tools/charlotte-initramfs/charlotte-initramfs.cpio.gz"
 CONFIG_INITRAMFS_FORCE=y
-CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 console=ttyGS0,115200 ignore_loglevel loglevel=8 nokaslr debug.exception-trace=1 charlotte_keepalive.stop_after=900"
+CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 loglevel=5 nokaslr debug.exception-trace=1 id_aa64isar0.atomic=0"
 CONFIG_CMDLINE_FORCE=y
 CONFIG_ARM64_VA_BITS_39=y
 CONFIG_ARM64_PAGE_SIZE_4KB=y
 # A510 and Taishan fail the boot-time PAuth compatibility contract (v170).
 # Disable authentication system-wide; never bypass the CPU capability check.
 # CONFIG_ARM64_PTR_AUTH is not set
+
+# Firmware does not support hardware AF/dirty updates (IFSC 0x31 at EL0).
+# Use software access-flag faults, as in the vendor Charlotte configuration.
+# CONFIG_ARM64_HW_AFDBM is not set
+# Restrict LSE in the CPU feature framework, including EL0 HWCAP/CPUID.
+# The boot-time id_aa64isar0.atomic=0 override keeps kernel and libc on LL/SC.

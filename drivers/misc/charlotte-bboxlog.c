@@ -41,7 +41,7 @@
 #include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
-#include <linux/sched_clock.h>
+#include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -154,7 +154,7 @@ void charlotte_ua_trace(unsigned long far, unsigned long esr,
 		banner_done = true;
 	}
 	snprintf(note, sizeof(note),
-		 "E:%s +%lums FAR=%016lx ESR=%016lx PC=%016lx CPU=%d %s/%d\n",
+		 "E:%s +%ums FAR=%016lx ESR=%016lx PC=%016lx CPU=%d %s/%d\n",
 		 kind, jiffies_to_msecs(jiffies - INITIAL_JIFFIES), far, esr,
 		 instruction_pointer(regs), smp_processor_id(),
 		 current->comm, current->pid);

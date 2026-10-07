@@ -204,6 +204,11 @@ static int gs_bind(struct usb_composite_dev *cdev)
 	status = strings_dev[STRING_DESCRIPTION_IDX].id;
 	serial_config_driver.iConfiguration = status;
 
+	/* Peripheral-only controllers can support remote wakeup too. */
+	serial_config_driver.bmAttributes &= ~USB_CONFIG_ATT_WAKEUP;
+	if (cdev->gadget->wakeup_capable)
+		serial_config_driver.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+
 	if (gadget_is_otg(cdev->gadget)) {
 		if (!otg_desc[0]) {
 			struct usb_descriptor_header *usb_desc;
@@ -237,6 +242,9 @@ static int gs_bind(struct usb_composite_dev *cdev)
 		goto fail1;
 
 	usb_composite_overwrite_options(cdev, &coverwrite);
+	INFO(cdev, "remote wakeup: capable=%u advertised=%u\n",
+	     cdev->gadget->wakeup_capable,
+	     !!(serial_config_driver.bmAttributes & USB_CONFIG_ATT_WAKEUP));
 	INFO(cdev, "%s\n", GS_VERSION_NAME);
 
 	return 0;

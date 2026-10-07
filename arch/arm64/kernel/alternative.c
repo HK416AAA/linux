@@ -245,9 +245,6 @@ static int __init __apply_alternatives_multi_stop(void *unused)
 
 		bitmap_complement(remaining_capabilities, boot_cpucaps,
 				  ARM64_NCAPS);
-		/* charlotte: retain LL/SC atomics; enabling LSE stopped the
-		 * first post-patch spinlock during bring-up. */
-		clear_bit(ARM64_HAS_LSE_ATOMICS, remaining_capabilities);
 
 		BUG_ON(all_alternatives_applied);
 		__apply_alternatives(&kernel_alternatives, false,

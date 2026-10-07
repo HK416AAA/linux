@@ -60,7 +60,6 @@
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 void charlotte_ckpt(const char *tag);
 void charlotte_ckpt_hex(const char *tag, unsigned long long v);
-void __init charlotte_s2_pool_init(void);
 #endif
 
 static int num_standard_resources;
@@ -518,10 +517,6 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	}
 
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
-	/* v196: the real setup_arch tail.  The v194/v195 call sat in
-	 * dump_kernel_offset(), a panic notifier that never runs on a
-	 * healthy boot -- POOLPA/PFAIL stayed zero the whole time. */
-	charlotte_s2_pool_init();
 	charlotte_ckpt("E:SETUP_ARCH_EXIT\n");
 #endif
 }
