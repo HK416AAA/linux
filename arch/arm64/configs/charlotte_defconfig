@@ -2026,3 +2026,9 @@ CONFIG_ARM64_PAGE_SIZE_4KB=y
 # CONFIG_ARM64_HW_AFDBM is not set
 # Restrict LSE in the CPU feature framework, including EL0 HWCAP/CPUID.
 # The boot-time id_aa64isar0.atomic=0 override keeps kernel and libc on LL/SC.
+
+# PMIC reboot target on SPMI channel 2; reset uses the vendor SMC path.
+CONFIG_SPMI=y
+CONFIG_SPMI_HISI3670=y
+CONFIG_POWER_RESET=y
+CONFIG_POWER_RESET_CHARLOTTE=y

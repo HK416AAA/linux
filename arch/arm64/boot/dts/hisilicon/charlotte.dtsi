@@ -5,6 +5,7 @@
  */
 
 #include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/spmi/spmi.h>
 / {
 	interrupt-parent = <&gic>;
 
@@ -168,6 +169,22 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
+
+		spmi: spmi@fb210000 {
+			/* Same command/register layout as the upstream Kirin970 driver. */
+			compatible = "hisilicon,kirin970-spmi-controller";
+			reg = <0x0 0xfb210000 0x0 0x1000>;
+			hisilicon,spmi-channel = <2>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			reboot@9 {
+				compatible = "hisilicon,charlotte-reboot";
+				reg = <9 SPMI_USID>;
+				mode-normal = <0x10>;
+				mode-bootloader = <0x01>;
+			};
+		};
 
 		uart6: serial@ffb82000 {
 			compatible = "hisilicon,uart";
@@ -427,4 +444,3 @@
 		format = "x8b8g8r8";
 	};
 };
-

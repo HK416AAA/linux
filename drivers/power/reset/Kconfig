@@ -117,6 +117,14 @@ config POWER_RESET_HISI
 	help
 	  Reboot support for Hisilicon boards.
 
+config POWER_RESET_CHARLOTTE
+	bool "HiSilicon Charlotte restart and boot target"
+	depends on ARM64 && OF && SPMI=y
+	select REBOOT_MODE
+	help
+	  Record the boot target in Charlotte's main PMIC and restart through
+	  the vendor EL3 PSCI reset service. CPU PSCI can keep its HVC conduit.
+
 config POWER_RESET_LINKSTATION
 	tristate "Buffalo LinkStation power-off driver"
 	depends on ARCH_MVEBU || COMPILE_TEST

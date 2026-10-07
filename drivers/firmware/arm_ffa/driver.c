@@ -2373,10 +2373,29 @@ static void ffa_remove(struct platform_device *pdev)
 	drv_info = NULL;
 }
 
+static void ffa_shutdown(struct platform_device *pdev)
+{
+	struct ffa_drv_info *info = platform_get_drvdata(pdev);
+
+	if (info->charlotte) {
+		/*
+		 * The vendor boot flow retains the BL31-owned RX/TX buffers
+		 * until system reset.  Do not unregister the FF-A partitions
+		 * here: that would also unbind their still-bound consumers
+		 * from inside device_shutdown().  Charlotte does not enable
+		 * FF-A notification interrupts, so no IRQ cleanup is needed.
+		 */
+		dev_info(&pdev->dev, "Charlotte FF-A transport retained until system reset\n");
+		return;
+	}
+
+	ffa_remove(pdev);
+}
+
 static struct platform_driver ffa_driver = {
 	.probe = ffa_probe,
 	.remove = ffa_remove,
-	.shutdown = ffa_remove,
+	.shutdown = ffa_shutdown,
 	.driver = {
 		.name = FFA_PLATFORM_NAME,
 	},
