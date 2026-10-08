@@ -45,6 +45,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/sysfs.h>
 #include <asm/ptrace.h>
 
 #define RAMLOG_PA	(0x2fc40000UL + 0x60000UL)
@@ -65,6 +66,10 @@ static u32 dropped;
 static bool banner_done;
 static void __iomem *ramlog_map;
 static DEFINE_RAW_SPINLOCK(ramlog_lock);
+/* Snapshot before this boot writes its first byte over the preceding boot. */
+static u8 previous_ramlog[0x10000];
+static bool previous_saved;
+
 static void ramlog_emit(const char *s, size_t n)
 {
 	const size_t room = 0x10000U - RAMLOG_HDR;
@@ -78,6 +83,10 @@ static void ramlog_emit(const char *s, size_t n)
 	m = armed ? ramlog_map : early_memremap(RAMLOG_PA, RAMLOG_CAP);
 	if (!m)
 		return;
+	if (!previous_saved) {
+		memcpy_fromio(previous_ramlog, m, sizeof(previous_ramlog));
+		previous_saved = true;
+	}
 	/* Before SMP, only the boot CPU uses temporary fixmaps. */
 	if (armed)
 		raw_spin_lock_irqsave(&ramlog_lock, flags);
@@ -423,3 +432,16 @@ static int __init ramlog_notify(void)
 	return 0;
 }
 late_initcall(ramlog_notify);
+
+static BIN_ATTR_SIMPLE_ADMIN_RO(charlotte_previous_ramlog);
+
+static int __init ramlog_previous_export(void)
+{
+	if (!previous_saved)
+		return -ENODATA;
+	bin_attr_charlotte_previous_ramlog.private = previous_ramlog;
+	bin_attr_charlotte_previous_ramlog.size = sizeof(previous_ramlog);
+	return sysfs_create_bin_file(kernel_kobj,
+				    &bin_attr_charlotte_previous_ramlog);
+}
+late_initcall(ramlog_previous_export);

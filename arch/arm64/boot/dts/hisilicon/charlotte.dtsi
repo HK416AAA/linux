@@ -183,7 +183,27 @@
 				reg = <9 SPMI_USID>;
 				mode-normal = <0x10>;
 				mode-bootloader = <0x01>;
+				hisilicon,watchdog-recovery-bootloader;
+				hisilicon,powerhold = <&powerhold>;
 			};
+		};
+
+		powerhold: poweroff@fb22a000 {
+			compatible = "hisilicon,charlotte-powerhold";
+			/* Vendor GPIO176 = GPIO bank 5 offset 16; SCTRL protect bit 15. */
+			reg = <0x0 0xfb22a000 0x0 0x1000>,
+			      <0x0 0xfb21b31c 0x0 0x4>;
+			reg-names = "gpio", "protect";
+		};
+
+		ufs: ufs@fa500000 {
+			compatible = "hisilicon,charlotte-ufs";
+			reg = <0x0 0xfa500000 0x0 0x80000>,
+			      <0x0 0xfa400000 0x0 0x100000>,
+			      <0x0 0xfa3fd000 0x0 0x1000>,
+			      <0x0 0xfa58a000 0x0 0x1000>;
+			reg-names = "hci", "unipro", "crg", "mphy-mcu";
+			interrupts = <GIC_SPI 134 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		uart6: serial@ffb82000 {

@@ -30,7 +30,9 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/panic_notifier.h>
 #include <linux/printk.h>
+#include <linux/reboot.h>
 #include <linux/timer.h>
 
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
@@ -42,6 +44,12 @@ void charlotte_bbox_checkpoint(const char *s);
 #define WDT_LOCKEN	0x000	/* write 0x1AAEE533 to unlock */
 #define WDT_LOCKDIS	0x004	/* write 0x1 to re-lock */
 #define WDT_KICK	0x018	/* write 0x1 to kick */
+#define WDT_INTR_TIME	0x00c
+#define WDT_RST_TIME	0x010
+#define WDT_ENABLE	0x014
+#define WDT_INTR_MASK	0x020
+#define WDT_RST_MASK	0x024
+#define WDT_CLOCK_HZ	32764
 #define WDT_UNLOCK_KEY	0x1AAEE533
 
 /* ---- HiIPCV230 IPC (vendor DTB ipc@FF870000, ipc_version=1) ---- */
@@ -65,18 +73,70 @@ void charlotte_bbox_checkpoint(const char *s);
 #define IDLE_STATUS		0x1	/* state machine nibble, low bits */
 
 /* vendor default-timeout = 24 s; kick period = timeout/2/3 = 4 s */
-#define WDT_TIMEOUT_SEC		24
 #define KICK_PERIOD_MS		4000
 
 static void __iomem *wdt_base;
 static void __iomem *ipc_base;
 static struct timer_list keepalive_timer;
 static unsigned long mbx5_sent, mbx5_busy, wdt_kicks;
+static bool panic_seen;
+static bool poweroff_seen;
+
+/* Keep feeding on healthy boots; allow several minutes for panic capture. */
+static unsigned int timeout = 300;
+module_param(timeout, uint, 0444);
+MODULE_PARM_DESC(timeout, "Local watchdog and LPM3 recovery timeout in seconds");
 
 /* Optional recovery window for bring-up; normal boots keep feeding forever. */
 static unsigned int stop_after;
 module_param(stop_after, uint, 0644);
 MODULE_PARM_DESC(stop_after, "Stop watchdog feeding after this many seconds (0: never)");
+
+static void wdt_configure(void __iomem *base, unsigned int seconds)
+{
+	u32 load = (WDT_CLOCK_HZ / 2) * seconds - 1;
+
+	/* Vendor V500 uses two equal stages and the 32764 Hz clkin_ref. */
+	writel_relaxed(WDT_UNLOCK_KEY, base + WDT_LOCKEN);
+	writel_relaxed(load, base + WDT_INTR_TIME);
+	writel_relaxed(load, base + WDT_RST_TIME);
+	/* Recovery uses hardware reset; there is no root watchdog FIQ handler. */
+	writel_relaxed(1, base + WDT_INTR_MASK);
+	writel_relaxed(0, base + WDT_RST_MASK);
+	writel_relaxed(1, base + WDT_ENABLE);
+	writel_relaxed(1, base + WDT_KICK);
+	writel_relaxed(1, base + WDT_LOCKDIS);
+	readl(base + WDT_LOCKDIS);
+}
+
+static int keepalive_panic(struct notifier_block *nb, unsigned long event, void *data)
+{
+	WRITE_ONCE(panic_seen, true);
+	pr_emerg("charlotte-keepalive: panic; stop feeding, hardware recovery within %us\n",
+		 timeout);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block keepalive_panic_nb = {
+	.notifier_call = keepalive_panic,
+	.priority = 200,
+};
+
+static int keepalive_poweroff(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	if (action != SYS_POWER_OFF)
+		return NOTIFY_DONE;
+	WRITE_ONCE(poweroff_seen, true);
+	pr_emerg("charlotte-keepalive: poweroff; stop feeding, failed shutdown recovers within %us\n",
+		 timeout);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block keepalive_poweroff_nb = {
+	.notifier_call = keepalive_poweroff,
+	.priority = 200,
+};
 
 static void wdt_kick(void)
 {
@@ -141,6 +201,9 @@ static void keepalive_tick(struct timer_list *t)
 	static unsigned int tick_count;
 	unsigned int limit = READ_ONCE(stop_after);
 
+	if (READ_ONCE(panic_seen) || READ_ONCE(poweroff_seen))
+		return;
+
 	if (limit && (u64)tick_count * KICK_PERIOD_MS >= (u64)limit * 1000) {
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 		charlotte_bbox_checkpoint("E:KA_STOP\n");
@@ -155,7 +218,7 @@ static void keepalive_tick(struct timer_list *t)
 		charlotte_bbox_checkpoint("E:KA_TICK1\n");
 #endif
 	}
-	mbx5_notify_timeout(WDT_TIMEOUT_SEC);
+	mbx5_notify_timeout(timeout);
 	tick_count++;
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	/* liveness heartbeat: every other 4 s tick lands in the
@@ -182,10 +245,7 @@ void charlotte_keepalive_early_poke(void)
 
 	w = early_ioremap(WDT_BASE, 0x100);
 	if (w) {
-		writel_relaxed(WDT_UNLOCK_KEY, w + WDT_LOCKEN);
-		writel_relaxed(1, w + WDT_KICK);
-		writel_relaxed(1, w + WDT_LOCKDIS);
-		readl(w + WDT_LOCKEN);
+		wdt_configure(w, timeout);
 		early_iounmap(w, 0x100);
 	}
 
@@ -203,7 +263,7 @@ void charlotte_keepalive_early_poke(void)
 	writel_relaxed(DES_LPMCU_BIT, p + MBX5_DSET);
 	writel_relaxed(1, p + MBX5_MODE);
 	writel_relaxed(0x00080201, p + MBX5_DATA(0));
-	writel_relaxed(WDT_TIMEOUT_SEC, p + MBX5_DATA(1));
+	writel_relaxed(timeout, p + MBX5_DATA(1));
 	writel_relaxed(SRC_ACPU_BIT, p + MBX5_SEND);
 out:
 	early_iounmap(p, 0x10000);
@@ -220,15 +280,19 @@ static int __init charlotte_keepalive_init(void)
 	}
 
 	/* first kick + notify immediately, then periodically */
+	timeout = clamp(timeout, 8U, 86400U);
+	wdt_configure(wdt_base, timeout);
 	wdt_kick();
-	mbx5_notify_timeout(WDT_TIMEOUT_SEC);
+	mbx5_notify_timeout(timeout);
+	atomic_notifier_chain_register(&panic_notifier_list, &keepalive_panic_nb);
+	register_reboot_notifier(&keepalive_poweroff_nb);
 
 	timer_setup(&keepalive_timer, keepalive_tick, 0);
 	keepalive_timer.expires = jiffies + msecs_to_jiffies(KICK_PERIOD_MS);
 	add_timer(&keepalive_timer);
 
 	pr_info("charlotte-keepalive: armed (wdt %us, kick %ums, mbx5 chn%u)\n",
-		WDT_TIMEOUT_SEC, KICK_PERIOD_MS, MBX5_CHN);
+		timeout, KICK_PERIOD_MS, MBX5_CHN);
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	charlotte_bbox_checkpoint("E:KEEPALIVE_ARMED\n");
 #endif
