@@ -86,6 +86,13 @@ config SCSI_UFS_MEDIATEK
 
 	  If unsure, say N.
 
+config SCSI_UFS_CHARLOTTE
+	tristate "Huawei Charlotte HUFS controller"
+	depends on (ARCH_HISI || COMPILE_TEST) && SCSI_UFSHCD_PLATFORM
+	help
+	  Support the Huawei HUFS controller and independent UniPro register
+	  interface on the Kirin 9000s Charlotte platform.
+
 config SCSI_UFS_HISI
 	tristate "Hisilicon specific hooks to UFS controller platform driver"
 	depends on (ARCH_HISI || COMPILE_TEST) && SCSI_UFSHCD_PLATFORM

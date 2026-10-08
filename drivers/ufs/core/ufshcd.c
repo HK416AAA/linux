@@ -2688,6 +2688,12 @@ int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 	mutex_lock(&hba->uic_cmd_mutex);
 	ufshcd_add_delay_before_dme_cmd(hba);
 
+	if (hba->vops && hba->vops->uic_cmd) {
+		ret = hba->vops->uic_cmd(hba, uic_cmd);
+		if (ret != -ENOIOCTLCMD)
+			goto unlock_uic;
+	}
+
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	ufshcd_enable_intr(hba, UIC_COMMAND_COMPL);
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
@@ -2696,6 +2702,7 @@ int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 	if (!ret)
 		ret = ufshcd_wait_for_uic_cmd(hba, uic_cmd);
 
+unlock_uic:
 	mutex_unlock(&hba->uic_cmd_mutex);
 
 	ufshcd_release(hba);
@@ -2958,9 +2965,9 @@ static void ufshcd_comp_scsi_upiu(struct ufs_hba *hba, struct scsi_cmnd *cmd)
 static void ufshcd_init_lrb(struct ufs_hba *hba, struct scsi_cmnd *cmd)
 {
 	const int i = scsi_cmd_to_rq(cmd)->tag;
-	struct utp_transfer_req_desc *utrdlp = hba->utrdl_base_addr;
-	u16 response_offset = le16_to_cpu(utrdlp[i].response_upiu_offset);
-	u16 prdt_offset = le16_to_cpu(utrdlp[i].prd_table_offset);
+	struct utp_transfer_req_desc *utrdlp = ufshcd_get_utrd(hba, i);
+	u16 response_offset = le16_to_cpu(utrdlp->response_upiu_offset);
+	u16 prdt_offset = le16_to_cpu(utrdlp->prd_table_offset);
 	struct ufshcd_lrb *lrb = scsi_cmd_priv(cmd);
 	u8 *command_upiu, *response_upiu, *prd_table;
 	dma_addr_t cmd_desc_element_addr;
@@ -2988,9 +2995,9 @@ static void ufshcd_init_lrb(struct ufs_hba *hba, struct scsi_cmnd *cmd)
 		prd_table = cmd_descp->prd_table;
 	}
 
-	lrb->utr_descriptor_ptr = utrdlp + i;
+	lrb->utr_descriptor_ptr = utrdlp;
 	lrb->utrd_dma_addr =
-		hba->utrdl_dma_addr + i * sizeof(struct utp_transfer_req_desc);
+		hba->utrdl_dma_addr + i * ufshcd_get_utrd_size(hba);
 	lrb->ucd_req_ptr = (struct utp_upiu_req *)command_upiu;
 	lrb->ucd_req_dma_addr = cmd_desc_element_addr;
 	lrb->ucd_rsp_ptr = (struct utp_upiu_rsp *)response_upiu;
@@ -4088,7 +4095,7 @@ static int ufshcd_memory_alloc(struct ufs_hba *hba)
 	 * Allocate memory for UTP Transfer descriptors
 	 * UFSHCI requires 1KB alignment of UTRD
 	 */
-	utrdl_size = (sizeof(struct utp_transfer_req_desc) * hba->nutrs);
+	utrdl_size = ufshcd_get_utrd_size(hba) * hba->nutrs;
 	hba->utrdl_base_addr = dmam_alloc_coherent(hba->dev,
 						   utrdl_size,
 						   &hba->utrdl_dma_addr,
@@ -4154,12 +4161,11 @@ static void ufshcd_host_memory_configure(struct ufs_hba *hba)
 	int cmd_desc_size;
 	int i;
 
-	utrdlp = hba->utrdl_base_addr;
-
 	cmd_desc_size = ufshcd_get_ucd_size(hba);
 	cmd_desc_dma_addr = hba->ucdl_dma_addr;
 
 	for (i = 0; i < hba->nutrs; i++) {
+		utrdlp = ufshcd_get_utrd(hba, i);
 		/*
 		 * Reserved tags (low end) use the dedicated devman UCD with a
 		 * larger response area; other tags index the pool at i - RESERVED.
@@ -4182,23 +4188,23 @@ static void ufshcd_host_memory_configure(struct ufs_hba *hba)
 		}
 
 		/* Configure UTRD with command descriptor base address */
-		utrdlp[i].command_desc_base_addr =
+		utrdlp->command_desc_base_addr =
 				cpu_to_le64(cmd_desc_element_addr);
 
 		/* Response upiu and prdt offset should be in double words */
 		if (hba->quirks & UFSHCD_QUIRK_PRDT_BYTE_GRAN) {
-			utrdlp[i].response_upiu_offset =
+			utrdlp->response_upiu_offset =
 				cpu_to_le16(response_offset);
-			utrdlp[i].prd_table_offset =
+			utrdlp->prd_table_offset =
 				cpu_to_le16(prdt_offset);
-			utrdlp[i].response_upiu_length =
+			utrdlp->response_upiu_length =
 				cpu_to_le16(response_len);
 		} else {
-			utrdlp[i].response_upiu_offset =
+			utrdlp->response_upiu_offset =
 				cpu_to_le16(response_offset >> 2);
-			utrdlp[i].prd_table_offset =
+			utrdlp->prd_table_offset =
 				cpu_to_le16(prdt_offset >> 2);
-			utrdlp[i].response_upiu_length =
+			utrdlp->response_upiu_length =
 				cpu_to_le16(response_len >> 2);
 		}
 	}
@@ -4497,6 +4503,18 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 
 	mutex_lock(&hba->uic_cmd_mutex);
 	ufshcd_add_delay_before_dme_cmd(hba);
+
+	if (hba->vops && hba->vops->uic_cmd) {
+		spin_lock_irqsave(hba->host->host_lock, flags);
+		if (ufshcd_is_link_broken(hba)) {
+			ret = -ENOLINK;
+			goto out_unlock;
+		}
+		spin_unlock_irqrestore(hba->host->host_lock, flags);
+		ret = hba->vops->uic_cmd(hba, cmd);
+		if (ret != -ENOIOCTLCMD)
+			goto out;
+	}
 
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	if (ufshcd_is_link_broken(hba)) {
@@ -9292,7 +9310,7 @@ static void ufshcd_release_sdb_queue(struct ufs_hba *hba, int nutrs)
 	dmam_free_coherent(hba->dev, ucdl_size, hba->ucdl_base_addr,
 			   hba->ucdl_dma_addr);
 
-	utrdl_size = sizeof(struct utp_transfer_req_desc) * nutrs;
+	utrdl_size = ufshcd_get_utrd_size(hba) * nutrs;
 	dmam_free_coherent(hba->dev, utrdl_size, hba->utrdl_base_addr,
 			   hba->utrdl_dma_addr);
 }
@@ -9609,6 +9627,7 @@ static const struct attribute_group *ufshcd_driver_groups[] = {
 static struct ufs_hba_variant_params ufs_hba_vps = {
 	.hba_enable_delay_us		= 1000,
 	.wb_flush_threshold		= UFS_WB_BUF_REMAIN_PERCENT(40),
+	.utrd_size			= sizeof(struct utp_transfer_req_desc),
 	.devfreq_profile.polling_ms	= 100,
 	.devfreq_profile.target		= ufshcd_devfreq_target,
 	.devfreq_profile.get_dev_status	= ufshcd_devfreq_get_dev_status,

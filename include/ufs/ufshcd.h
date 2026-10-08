@@ -420,6 +420,8 @@ struct ufshcd_tx_eq_params {
  *	to allow platform vendor specific configs to take place.
  * @get_hba_nortt: called to get maximum number of outstanding RTTs supported by
  *	the controller.
+ * @uic_cmd: optional synchronous UniPro transport; -ENOIOCTLCMD selects the
+ *	standard UFSHCI command path. Called with uic_cmd_mutex held.
  */
 struct ufs_hba_variant_ops {
 	const char *name;
@@ -482,6 +484,7 @@ struct ufs_hba_variant_ops {
 				  enum ufs_notify_change_status status,
 				  struct ufs_pa_layer_attr *pwr_mode);
 	int	(*get_hba_nortt)(struct ufs_hba *hba);
+	int	(*uic_cmd)(struct ufs_hba *hba, struct uic_command *cmd);
 };
 
 /* clock gating state  */
@@ -908,6 +911,8 @@ struct ufs_hba_variant_params {
 	struct devfreq_simple_ondemand_data ondemand_data;
 	u16 hba_enable_delay_us;
 	u32 wb_flush_threshold;
+	/* Controllers may append vendor data after the standard 32-byte UTRD. */
+	u16 utrd_size;
 };
 
 struct ufs_hba_monitor {
@@ -1452,6 +1457,17 @@ static inline bool ufshcd_is_tx_eq_supported(struct ufs_hba *hba)
 	writel_relaxed((val), (hba)->mcq_base + (reg))
 #define ufsmcq_readlx(hba, reg)	\
 	readl_relaxed((hba)->mcq_base + (reg))
+
+static inline size_t ufshcd_get_utrd_size(struct ufs_hba *hba)
+{
+	return hba->vps->utrd_size ?: sizeof(struct utp_transfer_req_desc);
+}
+
+static inline struct utp_transfer_req_desc *ufshcd_get_utrd(struct ufs_hba *hba,
+							 int tag)
+{
+	return (void *)hba->utrdl_base_addr + tag * ufshcd_get_utrd_size(hba);
+}
 
 #define ufshcd_writel(hba, val, reg)	\
 	writel((val), (hba)->mmio_base + (reg))
