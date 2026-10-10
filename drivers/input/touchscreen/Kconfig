@@ -691,6 +691,14 @@ config TOUCHSCREEN_MTOUCH
 	  To compile this driver as a module, choose M here: the
 	  module will be called mtouch.
 
+config TOUCHSCREEN_CHARLOTTE_THP
+	bool "Charlotte Novatek host processing touch transport"
+	depends on ARCH_HISI && SPI && GPIOLIB && 64BIT
+	help
+	  Exposes the original AFE transport ABI at /dev/thp (root only).
+	  Firmware loading and contact extraction require the tablet's private
+	  AFE/TSA libraries and the charlotte-touch userspace service.
+
 config TOUCHSCREEN_NOVATEK_NVT_TS
 	tristate "Novatek NT11205 touchscreen support"
 	depends on I2C

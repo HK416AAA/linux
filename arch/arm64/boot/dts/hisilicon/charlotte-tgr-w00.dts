@@ -11,6 +11,22 @@
 	model = "Huawei TGR-W00";
 	compatible = "hisilicon,charlotte";
 
+	/* Physical panel metadata from the live stock TGR LCD configuration.
+	 * The display hardware remains owned by the firmware handoff.
+	 */
+	tgr_panel: panel {
+		/* Metadata only: no autonomous panel driver is available yet.
+		 * Prevent fw_devlink waiting for a supplier that will not bind.
+		 */
+		status = "disabled";
+		width-mm = <173>;
+		height-mm = <258>;
+	};
+
+	framebuffer@34380000 {
+		panel = <&tgr_panel>;
+	};
+
 	chosen {
 		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 ignore_loglevel loglevel=8 nokaslr";
 		stdout-path = "serial0:115200n8";
@@ -20,6 +36,12 @@
 
 	memory@0 {
 		device_type = "memory";
-		reg = <0x0 0x400000 0x0 0xbffa0000>;
+		/* TGR-W00 live stock FDT: 3.5 GiB below the MMIO hole,
+		 * 4 GiB at 4 GiB and 512 MiB at 32 GiB. Keep the existing
+		 * first 4 MiB exclusion and all firmware reservations.
+		 */
+		reg = <0x0 0x00400000 0x0 0xdfc00000>,
+		      <0x1 0x00000000 0x1 0x00000000>,
+		      <0x8 0x00000000 0x0 0x20000000>;
 	};
 };

@@ -387,6 +387,14 @@ config GPIO_GRGPIO
 	  Select this to support Aeroflex Gaisler GRGPIO cores from the GRLIB
 	  VHDL IP core library.
 
+config GPIO_CHARLOTTE_V500
+	bool "Charlotte GPIO v500 firmware handoff"
+	depends on ARCH_HISI && OF_GPIO
+	select GPIOLIB_IRQCHIP
+	help
+	  GPIO lines and interrupts used by the TGR-W00 touch controller.
+	  Firmware-owned lines must be excluded with gpio-reserved-ranges.
+
 config GPIO_HISI
 	tristate "HiSilicon GPIO controller driver"
 	depends on ARM64 || COMPILE_TEST
