@@ -1202,4 +1202,18 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config BATTERY_CHARLOTTE
+	tristate "Charlotte PMIC21v900 battery"
+	depends on SPMI && OF
+	help
+	  Battery voltage, current and thermistor measurements on Huawei TGR-W00.
+
+config CHARGER_CHARLOTTE_HI6526
+	tristate "Charlotte HI6526 V510 USB charger"
+	depends on I2C && OF && GPIOLIB && BATTERY_CHARLOTTE
+	depends on USB_DWC3_CHARLOTTE
+	help
+	  Conservative USB charging on Huawei TGR-W00 with live battery
+	  temperature/voltage guards and the hardware charge watchdog.
+
 endif # POWER_SUPPLY

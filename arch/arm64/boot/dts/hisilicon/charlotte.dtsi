@@ -195,6 +195,50 @@
 			};
 		};
 
+		battery: battery {
+			compatible = "hisilicon,charlotte-battery";
+			hisilicon,pmic = <&main_pmic>;
+			shunt-resistor-micro-ohms = <1000>;
+			charge-full-design-microamp-hours = <8700000>;
+		};
+
+		i2c6: i2c@ff88e000 {
+			compatible = "hisilicon,charlotte-i2c-v400";
+			reg = <0 0xff88e000 0 0x1000>,
+			      <0 0xffb85000 0 0x1000>,
+			      <0 0xff810010 0 8>,
+			      <0 0xff811810 0 8>,
+			      <0 0xff811010 0 8>;
+			reg-names = "controller", "crg", "iomux", "pad", "function";
+			interrupts = <GIC_SPI 359 IRQ_TYPE_LEVEL_HIGH>;
+			clk_rate = <0 112000000>;
+			clock-frequency = <100000>;
+			i2c-sda-hold-time-ns = <554>;
+			i2c-digital-filter-width-ns = <9>;
+			scl-gpios = <&i2c6_gpio 12 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+			sda-gpios = <&i2c6_gpio 13 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			charger@6b {
+				compatible = "huawei,hi6526-charger";
+				reg = <0x6b>;
+				hisilicon,battery = <&battery>;
+				hisilicon,usb-controller = <&usb>;
+				irq-gpios = <&touch_irq 15 GPIO_ACTIVE_LOW>;
+				interrupt-parent = <&touch_irq>;
+				interrupts = <15 IRQ_TYPE_LEVEL_LOW>;
+			};
+		};
+
+		i2c6_gpio: gpio@ff812000 {
+			compatible = "hisilicon,charlotte-gpio-v500";
+			reg = <0 0xff812000 0 0x1000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0 12>, <14 18>;
+		};
+
 		powerkey {
 			compatible = "hisilicon,charlotte-powerkey";
 			hisilicon,pmic = <&main_pmic>;
@@ -224,7 +268,7 @@
 			reg-names = "gpio", "protect";
 		};
 
-		/* Expose only CS177, IRQ222 and reset352; all other lines
+		/* Expose CS177, charger IRQ207, touch IRQ222 and reset352; other lines
 		 * remain owned by firmware (including powerhold GPIO176).
 		 */
 		touch_cs: gpio@fb22a000 {
@@ -244,7 +288,7 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			#address-cells = <0>;
-			gpio-reserved-ranges = <0 30>, <31 1>;
+			gpio-reserved-ranges = <0 15>, <16 14>, <31 1>;
 		};
 
 		touch_reset: gpio@efb06000 {
@@ -297,7 +341,7 @@
 			status = "okay";
 		};
 
-		usb@efc00000 {
+		usb: usb@efc00000 {
 			compatible = "hisilicon,charlotte-dwc3";
 			reg = <0x0 0xefc00000 0x0 0x100000>,
 			      <0x0 0xefb02000 0x0 0x1000>,

@@ -5,11 +5,15 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/power_supply.h>
+#include <linux/usb/charlotte.h>
+#include <linux/usb/gadget.h>
 
 #include "glue.h"
 #include "io.h"
@@ -38,6 +42,8 @@ enum charlotte_usb_bank {
 	HSDT, PERI, PMC, SYSCTRL, MISC, SYSQIC, UTMI, NUM_BANKS,
 };
 
+#include "dwc3-charlotte-bc12.h"
+
 static const char * const charlotte_bank_names[NUM_BANKS] = {
 	"hsdt-crg", "peri-crg", "pmctrl", "sysctrl", "misc", "sysqic", "utmi",
 };
@@ -45,7 +51,11 @@ static const char * const charlotte_bank_names[NUM_BANKS] = {
 struct charlotte_usb {
 	struct dwc3 dwc;
 	void __iomem *bank[NUM_BANKS];
+	struct mutex bc_lock;
 	bool powered;
+	bool ready;
+	bool charger_deactivated;
+	bool dcp;
 };
 
 static DEFINE_MUTEX(charlotte_fw_lock);
@@ -116,6 +126,135 @@ static void charlotte_usb_update_bits(struct charlotte_usb *usb,
 
 	writel((readl(reg) & ~mask) | value, reg);
 }
+
+static void charlotte_bc_apply(struct charlotte_usb *usb,
+			       const struct charlotte_bc_reg *regs, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		charlotte_usb_update_bits(usb, regs[i].bank, regs[i].offset,
+					 regs[i].mask, regs[i].value);
+}
+
+#define BC_APPLY(usb, sequence) \
+	charlotte_bc_apply(usb, sequence, ARRAY_SIZE(sequence))
+
+/* Vendor chip-usb2-phy-t5.c, using the stock Charlotte DT sequences. */
+static int charlotte_bc_detect(struct charlotte_usb *usb)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(900);
+	int stable = 0, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+
+	BC_APPLY(usb, bc12_detect_dcd);
+	msleep(50);
+	while (stable < 10 && time_before(jiffies, deadline)) {
+		if (!(readl(usb->bank[MISC] + 0x1fc) & BIT(0)))
+			stable++;
+		else
+			stable = 0;
+		usleep_range(10000, 11000);
+	}
+	if (stable < 10) {
+		BC_APPLY(usb, bc12_detect_dcd_fail);
+		goto close;
+	}
+	BC_APPLY(usb, bc12_detect_dcd_end);
+	usleep_range(2000, 2500);
+	BC_APPLY(usb, bc12_primary_detect);
+	msleep(30);
+	if (!(readl(usb->bank[MISC] + 0x20c) & BIT(0))) {
+		type = POWER_SUPPLY_USB_TYPE_SDP;
+		BC_APPLY(usb, bc12_primary_detect_fail);
+		goto close;
+	}
+	BC_APPLY(usb, bc12_detect_sdp_stop);
+	usleep_range(2000, 2500);
+	BC_APPLY(usb, bc12_secondary_detect);
+	msleep(30);
+	type = readl(usb->bank[MISC] + 0x20c) & BIT(0) ?
+		POWER_SUPPLY_USB_TYPE_DCP : POWER_SUPPLY_USB_TYPE_CDP;
+	BC_APPLY(usb, bc12_secondary_detect_done);
+	if (type == POWER_SUPPLY_USB_TYPE_CDP)
+		BC_APPLY(usb, bc12_detect_cdp_done);
+close:
+	BC_APPLY(usb, bc12_detect_close);
+	return type;
+}
+
+/* The charger owns VBUS/CC events and invalidates its cached type on each
+ * event. PHY access stays with this glue; never detect on a live data link.
+ * Deactivation preserves gadget connect requests across the PHY reset.
+ */
+int charlotte_usb_dpdm_run(struct device *dev, int (*run)(void *data), void *data)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct charlotte_usb *usb;
+	int ret, activate_ret;
+
+	if (!dwc)
+		return -EPROBE_DEFER;
+	usb = container_of(dwc, struct charlotte_usb, dwc);
+	mutex_lock(&usb->bc_lock);
+	if (!usb->ready || !dwc->gadget) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		goto unlock;
+	if (dwc->gadget->deactivated && !usb->charger_deactivated) {
+		ret = -EBUSY;
+		goto put;
+	}
+	if (!usb->charger_deactivated) {
+		ret = usb_gadget_deactivate(dwc->gadget);
+		if (ret)
+			goto put;
+		usb->charger_deactivated = true;
+	}
+	ret = run(data);
+	/* Vendor enumerate_allowed(): DCP owns D+/D- until the next detection. */
+	if (!usb->dcp) {
+		activate_ret = usb_gadget_activate(dwc->gadget);
+		if (activate_ret)
+			ret = activate_ret;
+		else
+			usb->charger_deactivated = false;
+	}
+put:
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+unlock:
+	mutex_unlock(&usb->bc_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(charlotte_usb_dpdm_run);
+
+static int charlotte_bc_run(void *data)
+{
+	struct charlotte_usb *usb = data;
+	int type = charlotte_bc_detect(usb);
+
+	usb->dcp = type == POWER_SUPPLY_USB_TYPE_DCP;
+	return type;
+}
+
+int charlotte_usb_bc12_detect(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!dwc)
+		return -EPROBE_DEFER;
+	ret = charlotte_usb_dpdm_run(dev, charlotte_bc_run,
+				     container_of(dwc, struct charlotte_usb, dwc));
+	dev_info(dev, "BC1.2 detection result=%d (SDP=%d CDP=%d DCP=%d)\n",
+		 ret, POWER_SUPPLY_USB_TYPE_SDP, POWER_SUPPLY_USB_TYPE_CDP,
+		 POWER_SUPPLY_USB_TYPE_DCP);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(charlotte_usb_bc12_detect);
 
 static int charlotte_usb_power_on(struct charlotte_usb *usb)
 {
@@ -220,6 +359,7 @@ static int charlotte_usb_probe(struct platform_device *pdev)
 	if (!usb)
 		return -ENOMEM;
 	usb->dwc.dev = dev;
+	mutex_init(&usb->bc_lock);
 	for (i = 0; i < NUM_BANKS; i++) {
 		usb->bank[i] = devm_platform_ioremap_resource_byname(pdev,
 							charlotte_bank_names[i]);
@@ -236,6 +376,7 @@ static int charlotte_usb_probe(struct platform_device *pdev)
 	data.ignore_clocks_and_resets = true;
 	ret = dwc3_core_probe(&data);
 	if (!ret) {
+		usb->ready = true;
 		/* v184: connect/pullup and UTMI state for the silent-host
 		 * problem (gadget ready but no host-side enumeration). */
 		dev_info(dev, "DCTL=0x%08x DSTS=0x%08x GUSB2PHYCFG=0x%08x\n",
@@ -254,7 +395,10 @@ static void charlotte_usb_remove(struct platform_device *pdev)
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct charlotte_usb *usb = container_of(dwc, struct charlotte_usb, dwc);
 
+	mutex_lock(&usb->bc_lock);
+	usb->ready = false;
 	dwc3_core_remove(dwc);
+	mutex_unlock(&usb->bc_lock);
 	charlotte_usb_power_off(usb);
 }
 

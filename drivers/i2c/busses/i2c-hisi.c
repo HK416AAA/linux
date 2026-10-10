@@ -9,9 +9,12 @@
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/of.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
@@ -20,6 +23,7 @@
 #define HISI_I2C_FRAME_CTRL		0x0000
 #define   HISI_I2C_FRAME_CTRL_SPEED_MODE	GENMASK(1, 0)
 #define   HISI_I2C_FRAME_CTRL_ADDR_TEN	BIT(2)
+#define   HISI_I2C_FRAME_CTRL_RESTART_EN	BIT(3)
 #define HISI_I2C_SLV_ADDR		0x0004
 #define   HISI_I2C_SLV_ADDR_VAL		GENMASK(9, 0)
 #define   HISI_I2C_SLV_ADDR_GC_S_MODE	BIT(10)
@@ -108,6 +112,13 @@ struct hisi_i2c_controller {
 	struct i2c_timings t;
 	u32 clk_rate_khz;
 	u32 spk_len;
+
+	/* Board-local mux handling until Charlotte pinctrl is available. */
+	void __iomem *mux;
+	void __iomem *func;
+	u32 saved_mux[2];
+	u32 saved_func[2];
+	struct i2c_bus_recovery_info recovery;
 };
 
 static void hisi_i2c_enable_int(struct hisi_i2c_controller *ctlr, u32 mask)
@@ -151,6 +162,8 @@ static void hisi_i2c_handle_errors(struct hisi_i2c_controller *ctlr)
 	}
 }
 
+static void hisi_i2c_xfer_msg(struct hisi_i2c_controller *ctlr);
+
 static int hisi_i2c_start_xfer(struct hisi_i2c_controller *ctlr)
 {
 	struct i2c_msg *msg = ctlr->msgs;
@@ -175,7 +188,17 @@ static int hisi_i2c_start_xfer(struct hisi_i2c_controller *ctlr)
 
 	hisi_i2c_clear_int(ctlr, HISI_I2C_INT_ALL);
 	hisi_i2c_clear_tx_int(ctlr, HISI_I2C_TX_AEMPTY_INT);
-	hisi_i2c_enable_int(ctlr, HISI_I2C_INT_ALL);
+	if (of_device_is_compatible(ctlr->dev->of_node, "hisilicon,charlotte-i2c-v400")) {
+		/* v400 does not raise TX_EMPTY for an initially empty FIFO.
+		 * Seed commands before unmasking IRQs, as the vendor driver does.
+		 * This also prevents IRQ and process context filling it together.
+		 */
+		hisi_i2c_xfer_msg(ctlr);
+		hisi_i2c_enable_int(ctlr, ctlr->msg_tx_idx == ctlr->msg_num ?
+			HISI_I2C_INT_ALL & ~HISI_I2C_INT_TX_EMPTY : HISI_I2C_INT_ALL);
+	} else {
+		hisi_i2c_enable_int(ctlr, HISI_I2C_INT_ALL);
+	}
 
 	return 0;
 }
@@ -440,11 +463,16 @@ static void hisi_i2c_configure_bus(struct hisi_i2c_controller *ctlr)
 	reg = readl(ctlr->iobase + HISI_I2C_FRAME_CTRL);
 	reg &= ~HISI_I2C_FRAME_CTRL_SPEED_MODE;
 	reg |= FIELD_PREP(HISI_I2C_FRAME_CTRL_SPEED_MODE, speed_mode);
+	if (of_device_is_compatible(ctlr->dev->of_node, "hisilicon,charlotte-i2c-v400"))
+		reg = FIELD_PREP(HISI_I2C_FRAME_CTRL_SPEED_MODE, speed_mode) |
+			HISI_I2C_FRAME_CTRL_RESTART_EN;
 	writel(reg, ctlr->iobase + HISI_I2C_FRAME_CTRL);
 
 	sda_hold_cnt = NSEC_TO_CYCLES(ctlr->t.sda_hold_ns, ctlr->clk_rate_khz);
 
 	reg = FIELD_PREP(HISI_I2C_SDA_HOLD_TX, sda_hold_cnt);
+	if (of_device_is_compatible(ctlr->dev->of_node, "hisilicon,charlotte-i2c-v400"))
+		reg |= FIELD_PREP(HISI_I2C_SDA_HOLD_RX, sda_hold_cnt);
 	writel(reg, ctlr->iobase + HISI_I2C_SDA_HOLD);
 
 	writel(ctlr->spk_len, ctlr->iobase + HISI_I2C_FS_SPK_LEN);
@@ -452,6 +480,133 @@ static void hisi_i2c_configure_bus(struct hisi_i2c_controller *ctlr)
 	reg = FIELD_PREP(HISI_I2C_FIFO_RX_AF_THRESH, HISI_I2C_RX_F_AF_THRESH);
 	reg |= FIELD_PREP(HISI_I2C_FIFO_TX_AE_THRESH, HISI_I2C_TX_F_AE_THRESH);
 	writel(reg, ctlr->iobase + HISI_I2C_FIFO_CTRL);
+}
+
+/* Charlotte I2C6 uses the same FIFO/command layout as Ascend910.
+ * The full CRG/pinctrl providers are not yet ported. Touch only this gate,
+ * reset and GPIO76/77 mux/pads, as in the stock board's I2C6 pin state.
+ */
+static int charlotte_i2c_prepare(struct platform_device *pdev,
+			       struct hisi_i2c_controller *ctlr)
+{
+	void __iomem *crg, *mux, *pad, *func;
+	struct resource *res;
+	u32 status;
+	int i, ret;
+
+	/* Shared CRG: USB also maps this bank. Do not reserve the whole bank
+	 * for I2C. Gate/reset writes are single-bit set/clear operations.
+	 */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return -EINVAL;
+	crg = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	if (!crg)
+		return -ENOMEM;
+	mux = devm_platform_ioremap_resource(pdev, 2);
+	if (IS_ERR(mux))
+		return PTR_ERR(mux);
+	pad = devm_platform_ioremap_resource(pdev, 3);
+	if (IS_ERR(pad))
+		return PTR_ERR(pad);
+	func = devm_platform_ioremap_resource(pdev, 4);
+	if (IS_ERR(func))
+		return PTR_ERR(func);
+	ctlr->mux = mux;
+	ctlr->func = func;
+	writel(BIT(30), crg + 0x10);
+	ret = readl_poll_timeout(crg + 0x18, status, status & BIT(30), 1, 1000);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "I2C6 gate not enabled\n");
+	writel(BIT(19), crg + 0x60);
+	ret = readl_poll_timeout(crg + 0x68, status, status & BIT(19), 1, 1000);
+	if (ret)
+		return ret;
+	writel(BIT(19), crg + 0x64);
+	ret = readl_poll_timeout(crg + 0x68, status, !(status & BIT(19)), 1, 1000);
+	if (ret)
+		return ret;
+	for (i = 0; i < 2; i++) {
+		status = readl(mux + i * 4);
+		writel((status & ~7) | 1, mux + i * 4);
+		status = readl(func + i * 4);
+		writel((status & ~7) | 1, func + i * 4);
+		status = readl(pad + i * 4);
+		writel((status & ~0x73) | 1, pad + i * 4);
+	}
+	return 0;
+}
+
+static void charlotte_i2c_recovery_prepare(struct i2c_adapter *adap)
+{
+	struct hisi_i2c_controller *ctlr = i2c_get_adapdata(adap);
+	int i;
+
+	/* Drop abandoned commands before borrowing the pins for recovery. */
+	writel(readl(ctlr->iobase + HISI_I2C_FIFO_CTRL) | 3,
+	       ctlr->iobase + HISI_I2C_FIFO_CTRL);
+	writel(readl(ctlr->iobase + HISI_I2C_FIFO_CTRL) & ~3,
+	       ctlr->iobase + HISI_I2C_FIFO_CTRL);
+	for (i = 0; i < 2; i++) {
+		ctlr->saved_mux[i] = readl(ctlr->mux + i * 4);
+		ctlr->saved_func[i] = readl(ctlr->func + i * 4);
+		writel(ctlr->saved_mux[i] & ~7, ctlr->mux + i * 4);
+		writel(ctlr->saved_func[i] & ~7, ctlr->func + i * 4);
+	}
+}
+
+static void charlotte_i2c_recovery_unprepare(struct i2c_adapter *adap)
+{
+	struct hisi_i2c_controller *ctlr = i2c_get_adapdata(adap);
+	int i;
+
+	gpiod_set_value_cansleep(ctlr->recovery.sda_gpiod, 1);
+	gpiod_set_value_cansleep(ctlr->recovery.scl_gpiod, 1);
+	for (i = 0; i < 2; i++) {
+		writel(ctlr->saved_mux[i], ctlr->mux + i * 4);
+		writel(ctlr->saved_func[i], ctlr->func + i * 4);
+	}
+}
+
+static int charlotte_i2c_get_scl(struct i2c_adapter *adap)
+{
+	return gpiod_get_value_cansleep(adap->bus_recovery_info->scl_gpiod);
+}
+
+static void charlotte_i2c_set_scl(struct i2c_adapter *adap, int value)
+{
+	gpiod_set_value_cansleep(adap->bus_recovery_info->scl_gpiod, value);
+}
+
+static int charlotte_i2c_get_sda(struct i2c_adapter *adap)
+{
+	return gpiod_get_value_cansleep(adap->bus_recovery_info->sda_gpiod);
+}
+
+static void charlotte_i2c_set_sda(struct i2c_adapter *adap, int value)
+{
+	gpiod_set_value_cansleep(adap->bus_recovery_info->sda_gpiod, value);
+}
+
+static int charlotte_i2c_init_recovery(struct hisi_i2c_controller *ctlr)
+{
+	struct i2c_bus_recovery_info *r = &ctlr->recovery;
+
+	r->scl_gpiod = devm_gpiod_get(ctlr->dev, "scl", GPIOD_OUT_HIGH_OPEN_DRAIN);
+	if (IS_ERR(r->scl_gpiod))
+		return dev_err_probe(ctlr->dev, PTR_ERR(r->scl_gpiod), "SCL recovery GPIO\n");
+	r->sda_gpiod = devm_gpiod_get(ctlr->dev, "sda", GPIOD_OUT_HIGH_OPEN_DRAIN);
+	if (IS_ERR(r->sda_gpiod))
+		return dev_err_probe(ctlr->dev, PTR_ERR(r->sda_gpiod), "SDA recovery GPIO\n");
+	r->recover_bus = i2c_generic_scl_recovery;
+	r->prepare_recovery = charlotte_i2c_recovery_prepare;
+	r->unprepare_recovery = charlotte_i2c_recovery_unprepare;
+	r->get_scl = charlotte_i2c_get_scl;
+	r->set_scl = charlotte_i2c_set_scl;
+	r->get_sda = charlotte_i2c_get_sda;
+	r->set_sda = charlotte_i2c_set_sda;
+	ctlr->adapter.bus_recovery_info = r;
+	return i2c_recover_bus(&ctlr->adapter);
 }
 
 static int hisi_i2c_probe(struct platform_device *pdev)
@@ -466,6 +621,12 @@ static int hisi_i2c_probe(struct platform_device *pdev)
 	ctlr = devm_kzalloc(dev, sizeof(*ctlr), GFP_KERNEL);
 	if (!ctlr)
 		return -ENOMEM;
+	ctlr->dev = dev;
+	if (of_device_is_compatible(dev->of_node, "hisilicon,charlotte-i2c-v400")) {
+		ret = charlotte_i2c_prepare(pdev, ctlr);
+		if (ret)
+			return ret;
+	}
 
 	ctlr->iobase = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(ctlr->iobase))
@@ -502,7 +663,13 @@ static int hisi_i2c_probe(struct platform_device *pdev)
 	adapter->owner = THIS_MODULE;
 	adapter->algo = &hisi_i2c_algo;
 	adapter->dev.parent = dev;
+	adapter->dev.of_node = dev->of_node;
 	i2c_set_adapdata(adapter, ctlr);
+	if (of_device_is_compatible(dev->of_node, "hisilicon,charlotte-i2c-v400")) {
+		ret = charlotte_i2c_init_recovery(ctlr);
+		if (ret)
+			return dev_err_probe(dev, ret, "I2C6 initial bus recovery failed\n");
+	}
 
 	ret = devm_i2c_add_adapter(dev, adapter);
 	if (ret)
@@ -523,6 +690,7 @@ MODULE_DEVICE_TABLE(acpi, hisi_i2c_acpi_ids);
 
 static const struct of_device_id hisi_i2c_dts_ids[] = {
 	{ .compatible = "hisilicon,ascend910-i2c", },
+	{ .compatible = "hisilicon,charlotte-i2c-v400", },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, hisi_i2c_dts_ids);
