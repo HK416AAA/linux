@@ -968,8 +968,9 @@ config INPUT_CHARLOTTE_POWERKEY
 	depends on OF && SPMI && GPIOLIB
 	depends on ARCH_HISI || COMPILE_TEST
 	help
-	  Report the primary PMIC power-key press/release interrupts on
-	  Huawei Charlotte devices. Firmware retains long-press reset control.
+	  Report the primary PMIC power-key press/release interrupts and
+	  optional volume keys on Huawei Charlotte devices. Firmware retains
+	  long-press reset control.
 
 config INPUT_HISI_POWERKEY
 	tristate "Hisilicon PMIC ONKEY support"

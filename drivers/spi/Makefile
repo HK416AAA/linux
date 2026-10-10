@@ -70,6 +70,7 @@ obj-$(CONFIG_SPI_FSL_SPI)		+= spi-fsl-spi.o
 obj-$(CONFIG_SPI_GPIO)			+= spi-gpio.o
 obj-$(CONFIG_SPI_GXP)			+= spi-gxp.o
 obj-$(CONFIG_SPI_HISI_KUNPENG)		+= spi-hisi-kunpeng.o
+obj-$(CONFIG_SPI_CHARLOTTE_V500)		+= spi-charlotte-v500.o
 obj-$(CONFIG_SPI_HISI_SFC_V3XX)		+= spi-hisi-sfc-v3xx.o
 obj-$(CONFIG_SPI_IMG_SPFI)		+= spi-img-spfi.o
 obj-$(CONFIG_SPI_IMX)			+= spi-imx.o

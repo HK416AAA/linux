@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Stock pmic_spmi.c / ponkey: SID9, IRQ0 0x2b3, mask0 0x290,
- * bit7 down / bit6 up. GPIO237 carries the active-low PMIC IRQ.
+ * bit7 down / bit6 up. Optional PMIC21v900 volume keys use IRQ3 bits0-3.
+ * GPIO237 carries the active-low PMIC IRQ.
  * This is the first primary-PMIC IRQ consumer in the Charlotte port. Like
  * vendor pmic_irq_prc(), mask unclaimed IRQs before enabling key events.
  * Other PMIC consumers will need a shared IRQ domain; fault/reset policy
@@ -111,7 +112,7 @@ static irqreturn_t charlotte_key_irq(int irq, void *data)
 		ret = spmi_ext_register_writel(key->pmic, VOLUME_STATUS, &volume, 1);
 		if (ret)
 			goto failed;
-		mod_delayed_work(system_wq, &key->volume_work,
+		mod_delayed_work(system_percpu_wq, &key->volume_work,
 				 msecs_to_jiffies(VOLUME_DEBOUNCE_MS));
 	}
 	pm_wakeup_event(key->input->dev.parent, 1000);
@@ -225,7 +226,7 @@ static int charlotte_key_probe(struct platform_device *pdev)
 		ret = spmi_ext_register_writel(key->pmic, VOLUME_MASK, &mask, 1);
 		if (ret)
 			return ret;
-		mod_delayed_work(system_wq, &key->volume_work,
+		mod_delayed_work(system_percpu_wq, &key->volume_work,
 				 msecs_to_jiffies(VOLUME_DEBOUNCE_MS));
 		dev_info(dev, "volume keys ready: IRQ3 bits0-3, debounce=%ums\n",
 			 VOLUME_DEBOUNCE_MS);

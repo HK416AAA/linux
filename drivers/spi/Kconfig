@@ -445,6 +445,13 @@ config SPI_GXP
 	  This enables support for the driver for GXP bus attached SPI
 	  controllers.
 
+config SPI_CHARLOTTE_V500
+	bool "Charlotte SPI3 v500 firmware handoff"
+	depends on ARCH_HISI && OF && GPIOLIB
+	help
+	  PIO and integrated SDMA on the TGR-W00 touch controller's SPI3 bus.
+	  Uses the firmware PLL/divider and board-specific pad configuration.
+
 config SPI_HISI_KUNPENG
 	tristate "HiSilicon SPI Controller for Kunpeng SoCs"
 	depends on (ARM64 && ACPI) || COMPILE_TEST

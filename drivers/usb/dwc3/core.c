@@ -2358,7 +2358,16 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 
 	if (!dev_is_pci(dwc->sysdev) &&
 	    DWC3_GHWPARAMS0_AWIDTH(dwc->hwparams.hwparams0) == 64) {
-		ret = dma_set_mask_and_coherent(dwc->sysdev, DMA_BIT_MASK(64));
+		u64 mask = DMA_BIT_MASK(64);
+
+		/* Charlotte's firmware DMA path has only been adapted for
+		 * low memory. Keep transfers below 4 GiB until the USB SMMU
+		 * is managed by Linux, even if the core advertises 64 bits.
+		 */
+		if (of_device_is_compatible(dev->of_node,
+					   "hisilicon,charlotte-dwc3"))
+			mask = DMA_BIT_MASK(32);
+		ret = dma_set_mask_and_coherent(dwc->sysdev, mask);
 		if (ret)
 			goto err_disable_clks;
 	}
