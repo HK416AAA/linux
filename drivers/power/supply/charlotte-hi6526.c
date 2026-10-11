@@ -315,7 +315,7 @@ static int hi6526_policy_check(struct charlotte_hi6526 *chg)
 	u16 reg = 0x2d0;
 	u8 mask = 0xf8;
 	u8 expected = (chg->input_ua == HI6526_BC12_INPUT_UA ?
-		       HI6526_BC12_INPUT_CODE : chg->fast ? HI6526_FAST_INPUT_CODE : 5) << 3;
+		       HI6526_BC12_INPUT_CODE : chg->fast ? hi6526_fast_input_code(chg) : 5) << 3;
 
 	ret = hi6526_read(chg, 0x2d0, &actual, 1);
 	if (ret)

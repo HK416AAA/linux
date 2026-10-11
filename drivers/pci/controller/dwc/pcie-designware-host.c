@@ -1154,7 +1154,11 @@ int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
 	 * the platform uses its own address translation component rather than
 	 * ATU, so we should not program the ATU here.
 	 */
-	if (pp->bridge->child_ops == &dw_child_pcie_ops || pp->ecam_enabled) {
+	/* A platform may wrap the generic config callbacks for power locking
+	 * while retaining the generic map_bus/iATU implementation.
+	 */
+	if ((pp->bridge->child_ops &&
+	     pp->bridge->child_ops->map_bus == dw_child_pcie_ops.map_bus) || pp->ecam_enabled) {
 		ret = dw_pcie_iatu_setup(pp);
 		if (ret)
 			return ret;

@@ -6,6 +6,14 @@
 
 menu "Firmware Drivers"
 
+config CHARLOTTE_FFA
+	tristate
+	depends on ARM64 && ARM_FFA_TRANSPORT
+	help
+	  Shared owner of the Charlotte platform FF-A partition, providing
+	  USB access configuration, PCIe access configuration and PHY eFuse
+	  reads. Peripheral drivers must not bind this partition separately.
+
 source "drivers/firmware/arm_scmi/Kconfig"
 
 config ARM_SCPI_PROTOCOL

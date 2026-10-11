@@ -7,9 +7,53 @@
 
 #include "charlotte.dtsi"
 
+&wifi_pcie {
+	status = "okay";
+};
+
 / {
 	model = "Huawei TGR-W00";
 	compatible = "hisilicon,charlotte";
+
+	hw_connectivity {
+		compatible = "huawei,hw_connectivity";
+		chip_type = "hisi";
+	};
+
+	wifi_customize {
+		compatible = "hi110x,customize";
+		ini_file_name = "/lib/firmware/hi11xx/cfg_tgr_w00_va.ini";
+	};
+
+	hi110x {
+		compatible = "hisilicon,hi110x", "hisilicon,hi1102";
+		hi110x,subchip_type = "hi1105";
+		hi110x,asic_version;
+		hi110x,power_prepare;
+		hi110x,tcxo_gpio_level = <1>;
+		huawei,pmu_clk32b = "clk_pmu32kb";
+		hi110x,gpio_power_on = <&wifi_gpio 15 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_wlan_power_on = <&touch_irq 14 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_bfgx_power_on = <&wifi_gpio 5 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_g_power_on = <&wifi_gpio 14 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_tcxo_freq_detect = <&wifi_gpio 10 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_ssi_clk = <&wifi_gpio 7 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_ssi_data = <&wifi_gpio 8 GPIO_ACTIVE_HIGH>;
+	};
+
+	hisi_wifi {
+		compatible = "hisilicon,hisi_wifi";
+		hi110x,pcie_rc_idx = <0>;
+		hi110x,gpio_sample_low = <0>;
+		hi110x,gpio_host_wakeup_wlan = <&touch_irq 13 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_wlan_wakeup_host = <&pmic_irq_gpio 15 GPIO_ACTIVE_HIGH>;
+	};
+
+	hisi_bfgx {
+		compatible = "hisilicon,hisi_bfgx";
+		hi110x,gpio_bfgx_wakeup_host = <&pmic_irq_gpio 16 GPIO_ACTIVE_HIGH>;
+		hi110x,uart_port = "/dev/ttyHW4";
+	};
 
 	/* Physical panel metadata from the live stock TGR LCD configuration.
 	 * The display hardware remains owned by the firmware handoff.

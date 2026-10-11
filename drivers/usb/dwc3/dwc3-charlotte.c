@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Charlotte USB2 peripheral initialization, following the vendor DT sequence. */
 
-#include <linux/arm_ffa.h>
 #include <linux/delay.h>
+#include <linux/firmware/charlotte-ffa.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
@@ -18,7 +18,6 @@
 #include "glue.h"
 #include "io.h"
 
-#define CHARLOTTE_USB_TZPC	0xc3002504U
 #define HSDT_PEREN0		0x000
 #define HSDT_PERDIS0		0x004
 #define HSDT_PERRSTEN0		0x020
@@ -57,66 +56,6 @@ struct charlotte_usb {
 	bool charger_deactivated;
 	bool dcp;
 };
-
-static DEFINE_MUTEX(charlotte_fw_lock);
-static struct ffa_device *charlotte_fw;
-
-static int charlotte_ffa_probe(struct ffa_device *fdev)
-{
-	fdev->ops->msg_ops->mode_32bit_set(fdev);
-	mutex_lock(&charlotte_fw_lock);
-	charlotte_fw = fdev;
-	mutex_unlock(&charlotte_fw_lock);
-	dev_info(&fdev->dev, "Charlotte USB platform service available\n");
-	return 0;
-}
-
-static void charlotte_ffa_remove(struct ffa_device *fdev)
-{
-	mutex_lock(&charlotte_fw_lock);
-	charlotte_fw = NULL;
-	mutex_unlock(&charlotte_fw_lock);
-}
-
-static const struct ffa_device_id charlotte_ffa_ids[] = {
-	{ .uuid = { .b = { 0x33, 0x5f, 0xe7, 0xf9, 0x82, 0x4f, 0xca, 0xa1,
-			    0x02, 0xc8, 0xe6, 0x98, 0xb4, 0xec, 0x20, 0x0f } } },
-	{ }
-};
-MODULE_DEVICE_TABLE(ffa, charlotte_ffa_ids);
-
-static struct ffa_driver charlotte_ffa_driver = {
-	.name = "charlotte-usb-firmware",
-	.probe = charlotte_ffa_probe,
-	.remove = charlotte_ffa_remove,
-	.id_table = charlotte_ffa_ids,
-};
-
-static int charlotte_usb_grant_access(struct device *dev)
-{
-	struct ffa_send_direct_data args = { .data0 = CHARLOTTE_USB_TZPC };
-	struct device_link *link;
-	int ret;
-
-	mutex_lock(&charlotte_fw_lock);
-	if (!charlotte_fw) {
-		ret = -EPROBE_DEFER;
-		goto out;
-	}
-	link = device_link_add(dev, &charlotte_fw->dev,
-			       DL_FLAG_AUTOREMOVE_CONSUMER);
-	if (!link) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	/* The vendor uses a 32-bit FF-A direct request, not a legacy SMC. */
-	ret = charlotte_fw->ops->msg_ops->sync_send_receive(charlotte_fw, &args);
-	if (!ret)
-		dev_info(dev, "USB_TZPC FF-A response %#lx\n", args.data0);
-out:
-	mutex_unlock(&charlotte_fw_lock);
-	return ret;
-}
 
 static void charlotte_usb_update_bits(struct charlotte_usb *usb,
 				     enum charlotte_usb_bank bank, u32 offset,
@@ -352,7 +291,7 @@ static int charlotte_usb_probe(struct platform_device *pdev)
 	struct charlotte_usb *usb;
 	int i, ret;
 
-	ret = charlotte_usb_grant_access(dev);
+	ret = charlotte_ffa_usb_access(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "USB firmware access configuration failed\n");
 	usb = devm_kzalloc(dev, sizeof(*usb), GFP_KERNEL);
@@ -449,25 +388,7 @@ static struct platform_driver charlotte_usb_driver = {
 	},
 };
 
-static int __init charlotte_usb_init(void)
-{
-	int ret = ffa_register(&charlotte_ffa_driver);
-
-	if (ret)
-		return ret;
-	ret = platform_driver_register(&charlotte_usb_driver);
-	if (ret)
-		ffa_unregister(&charlotte_ffa_driver);
-	return ret;
-}
-module_init(charlotte_usb_init);
-
-static void __exit charlotte_usb_exit(void)
-{
-	platform_driver_unregister(&charlotte_usb_driver);
-	ffa_unregister(&charlotte_ffa_driver);
-}
-module_exit(charlotte_usb_exit);
+module_platform_driver(charlotte_usb_driver);
 
 MODULE_DESCRIPTION("Charlotte USB2 peripheral platform driver");
 MODULE_LICENSE("GPL");

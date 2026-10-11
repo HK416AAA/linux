@@ -114,6 +114,7 @@ config USB_DWC3_CHARLOTTE
 	depends on OF && ARM64
 	depends on ARCH_HISI || COMPILE_TEST
 	select ARM_FFA_TRANSPORT
+	select CHARLOTTE_FFA
 	help
 	  Initialize the Charlotte USB controller and PHY resources, including
 	  the platform firmware's FF-A USB access configuration.

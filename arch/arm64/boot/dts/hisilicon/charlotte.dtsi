@@ -257,7 +257,7 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			#address-cells = <0>;
-			gpio-reserved-ranges = <0 13>, <14 18>;
+			gpio-reserved-ranges = <0 13>, <14 1>, <17 15>;
 		};
 
 		powerhold: poweroff@fb22a000 {
@@ -288,7 +288,56 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			#address-cells = <0>;
-			gpio-reserved-ranges = <0 15>, <16 14>, <31 1>;
+			gpio-reserved-ranges = <0 13>, <16 14>, <31 1>;
+		};
+
+		/* Stock Hi1105 chip power and TCXO frequency strap. */
+		wifi_gpio: gpio@ff806000 {
+			compatible = "hisilicon,charlotte-gpio-v500";
+			reg = <0 0xff806000 0 0x1000>;
+			interrupts = <GIC_SPI 571 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			#address-cells = <0>;
+			gpio-reserved-ranges = <0 5>, <6 1>, <9 1>, <11 3>, <16 16>;
+		};
+
+		wifi_pcie: pcie@f8000000 {
+			compatible = "hisilicon,charlotte-pcie";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0 0xf8000000 0 0x400000>,
+			      <0 0xee0a3000 0 0x1000>,
+			      <0 0xee0a0000 0 0x3000>,
+			      <0 0xf8400000 0 0x2000>,
+			      <0 0xee262000 0 0x1000>,
+			      <0 0xffb81000 0 0x1000>,
+			      <0 0xee263000 0 0x1000>,
+			      <0 0xefb02000 0 0x1000>;
+			reg-names = "dbi", "apb", "phy", "config", "hsdt-crg",
+				    "pmctrl", "fnpll", "aux-crg";
+			phy_layout_info = <0 0 0x2000>;
+			ranges = <0x02000000 0 0xf8500000 0 0xf8500000 0 0x01d00000>;
+			bus-range = <0 0xff>;
+			num-lanes = <1>;
+			max-link-speed = <2>;
+			interrupts = <GIC_SPI 92 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "linkdown";
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &gic 0 0 GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &gic 0 0 GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &gic 0 0 GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &gic 0 0 GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>;
+			chip-power-gpios = <&wifi_gpio 15 GPIO_ACTIVE_HIGH>;
+			wlan-power-gpios = <&touch_irq 14 GPIO_ACTIVE_HIGH>;
+			tcxo-gpios = <&wifi_gpio 10 GPIO_ACTIVE_HIGH>;
+			hisilicon,pmic = <&main_pmic>;
+			/* Bring-up only until the transport owns the GPIO/clock lifecycle. */
+			status = "disabled";
 		};
 
 		touch_reset: gpio@efb06000 {

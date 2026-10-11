@@ -54,6 +54,19 @@
 #define HWSCP_IBOUND		0xb2
 #define HWSCP_VSET		0xb8
 #define HWSCP_ISSET		0xcb
+#define HI6526_SCP_REQUEST_MA	3000
+
+static u8 hi6526_fast_input_code(struct charlotte_hi6526 *chg)
+{
+	return chg->protocol == HI6526_PROTOCOL_SCP ?
+		HI6526_SCP_REQUEST_MA / 100 : HI6526_FAST_INPUT_CODE;
+}
+
+static int hi6526_fast_input_ua(struct charlotte_hi6526 *chg)
+{
+	return chg->protocol == HI6526_PROTOCOL_SCP ?
+		HI6526_SCP_REQUEST_MA * 1000 : HI6526_FAST_INPUT_UA;
+}
 
 static bool hi6526_protocol_can_probe(int uv, int temp)
 {
@@ -419,7 +432,7 @@ static int hi6526_adapter_identify(struct charlotte_hi6526 *chg)
 		if (ret)
 			return ret;
 		chg->adapter_max_mw = (value & 0x7f) * ((value & BIT(7)) ? 1000 : 100);
-		if (min_ma > 1500)
+		if (min_ma > HI6526_SCP_REQUEST_MA)
 			return -EOPNOTSUPP;
 		return 0;
 	}
@@ -560,10 +573,11 @@ static int hi6526_adapter_start(struct charlotte_hi6526 *chg)
 		0xe3, 0xe4, 0xe5,
 	};
 	u8 value;
-	int ret;
+	int ret, request_ma = chg->protocol == HI6526_PROTOCOL_SCP ?
+		HI6526_SCP_REQUEST_MA : 1500;
 
 	if (chg->adapter_min_mv > 9000 || chg->adapter_max_mv < 9000 ||
-	    chg->adapter_max_ma < 1500 || chg->adapter_max_mw < 13500 ||
+	    chg->adapter_max_ma < request_ma || chg->adapter_max_mw < 9 * request_ma ||
 	    (chg->protocol == HI6526_PROTOCOL_SCP && !(chg->adapter_type & BIT(3))))
 		return -EOPNOTSUPP;
 	ret = hi6526_buck_voltage(chg, true);
@@ -581,10 +595,10 @@ static int hi6526_adapter_start(struct charlotte_hi6526 *chg)
 		ret = hi6526_adapter_write16(chg, HWSCP_VBOUND, 9000);
 		if (ret)
 			return ret;
-		ret = hi6526_adapter_write16(chg, HWSCP_IBOUND, 1500);
+		ret = hi6526_adapter_write16(chg, HWSCP_IBOUND, HI6526_SCP_REQUEST_MA);
 		if (ret)
 			return ret;
-		ret = hi6526_adapter_write(chg, HWSCP_ISSET, 1500 / 50);
+		ret = hi6526_adapter_write(chg, HWSCP_ISSET, HI6526_SCP_REQUEST_MA / 50);
 		if (ret)
 			return ret;
 		ret = hi6526_adapter_read(chg, HWSCP_CTRL1, &value);
@@ -682,13 +696,13 @@ static int hi6526_adapter_start(struct charlotte_hi6526 *chg)
 		}
 		msleep(20);
 	}
-	ret = hi6526_verify_update(chg, 0x2d0, 0xf8, HI6526_FAST_INPUT_CODE << 3);
+	ret = hi6526_verify_update(chg, 0x2d0, 0xf8, hi6526_fast_input_code(chg) << 3);
 	if (ret)
 		return ret;
 	ret = hi6526_verify_update(chg, 0x282, 0x1f, HI6526_FAST_CHARGE_CODE);
 	if (ret)
 		return ret;
-	chg->input_ua = HI6526_FAST_INPUT_UA;
+	chg->input_ua = hi6526_fast_input_ua(chg);
 	chg->charge_ua = HI6526_FAST_CHARGE_UA;
 	chg->fast = true;
 	return 0;
@@ -865,7 +879,7 @@ static int hi6526_protocol_keepalive(struct charlotte_hi6526 *chg)
 	/* Drop indication can reduce the advertised budget; fall back and recheck later. */
 	if (value & BIT(0))
 		return -EAGAIN;
-	return hi6526_adapter_write(chg, HWSCP_ISSET, 1500 / 50);
+	return hi6526_adapter_write(chg, HWSCP_ISSET, HI6526_SCP_REQUEST_MA / 50);
 }
 
 #endif
