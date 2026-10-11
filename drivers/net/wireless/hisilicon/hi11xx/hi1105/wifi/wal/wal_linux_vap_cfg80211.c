@@ -395,20 +395,34 @@ OAL_STATIC int32_t wal_cfg80211_start_ap_set_beacon_event(oal_wiphy_stru *wiphy,
  *   作    者  : wifi
  *   修改内容  : 新生成函数
  */
-OAL_STATIC int32_t wal_cfg80211_set_auth_mode(oal_net_device_stru *pst_netdev, uint8_t en_auth_algs)
+OAL_STATIC int32_t wal_cfg80211_set_auth_mode(oal_net_device_stru *pst_netdev,
+    enum nl80211_auth_type auth_type)
 {
     wal_msg_write_stru st_write_msg;
     int32_t l_ret;
+    uint32_t en_auth_algs;
 
-    if ((en_auth_algs != WLAN_WITP_AUTH_OPEN_SYSTEM) &&
-        (en_auth_algs != WLAN_WITP_AUTH_SHARED_KEY)
+    /* The firmware enum is independent of nl80211. Linux added EPPKE and
+     * IEEE8021X before AUTOMATIC; casting the kernel value now rejects AP
+     * startup or interprets EPPKE as the vendor TBPEKE authentication mode.
+     */
+    switch (auth_type) {
+    case NL80211_AUTHTYPE_OPEN_SYSTEM:
+        en_auth_algs = WLAN_WITP_AUTH_OPEN_SYSTEM;
+        break;
+    case NL80211_AUTHTYPE_SHARED_KEY:
+        en_auth_algs = WLAN_WITP_AUTH_SHARED_KEY;
+        break;
+    case NL80211_AUTHTYPE_AUTOMATIC:
+        en_auth_algs = WLAN_WITP_AUTH_AUTOMATIC;
+        break;
 #ifdef _PRE_WLAN_FEATURE_SAE
-        && (en_auth_algs != WLAN_WITP_AUTH_SAE)
-        && (en_auth_algs != WLAN_WITP_AUTH_TBPEKE)
+    case NL80211_AUTHTYPE_SAE:
+        en_auth_algs = WLAN_WITP_AUTH_SAE;
+        break;
 #endif
-        && (en_auth_algs != WLAN_WITP_AUTH_AUTOMATIC)) {
-        oam_warning_log1(0, OAM_SF_ANY, "{wal_cfg80211_set_auth_mode::en_auth_algs error[%d].}", en_auth_algs);
-        return -OAL_EFAIL;
+    default:
+        return -EOPNOTSUPP;
     }
 
     wal_write_msg_hdr_init(&st_write_msg, WLAN_CFGID_AUTH_MODE, sizeof(uint32_t));
