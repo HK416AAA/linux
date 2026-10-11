@@ -204,6 +204,10 @@ enum gnss_sync_version_enum {
 struct hisi_bt_dev {
     struct hci_dev *hdev;
     struct task_struct *bt_recv_task;
+#ifdef CONFIG_CHARLOTTE_HI11XX_BT
+    struct sk_buff *rx_skb;
+    struct mutex rx_mutex;
+#endif
 };
 #endif
 

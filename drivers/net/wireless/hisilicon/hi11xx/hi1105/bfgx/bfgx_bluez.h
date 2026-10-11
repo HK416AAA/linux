@@ -19,4 +19,8 @@ int32_t hw_bt_open(struct inode *inode, struct file *filp);
 
 extern struct bt_data_combination g_bt_data_combination;
 
+#ifdef CONFIG_CHARLOTTE_HI11XX_BT
+void charlotte_bt_unregister(struct ps_core_s *core);
+#endif
+
 #endif

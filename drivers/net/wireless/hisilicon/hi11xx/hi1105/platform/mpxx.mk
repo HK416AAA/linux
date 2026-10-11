@@ -151,6 +151,9 @@ bfgx-objs += gps_refclk_src_3.o
 endif
 endif
 bfgx-objs := $(addprefix ../bfgx/,$(bfgx-objs))
+ifeq ($(CONFIG_CHARLOTTE_HI11XX_BT),y)
+bfgx-objs += ../bfgx/bfgx_charlotte_bluez.o
+endif
 
 ifeq ($(CONFIG_PANGU_WIFI_DEVICE_HI110X), y)
 board-mp13-objs := board_mp13_kunpeng.o

@@ -12,4 +12,11 @@ config CHARLOTTE_HI11XX_WIFI
 	  Work in progress port of the TGR-W00 vendor Hi11xx WLAN driver.
 	  Requires the Charlotte PCIe host and board power implementation.
 	  Leave disabled until the platform dependencies have been validated.
+
+config CHARLOTTE_HI11XX_BT
+	bool "Charlotte Hi11xx Bluetooth HCI transport"
+	depends on CHARLOTTE_HI11XX_WIFI && BT=y
+	help
+	  Connect the MP15 BFGX UART transport to the native Bluetooth stack.
+	  Requires UART4 and the same board firmware as the WLAN driver.
 endif

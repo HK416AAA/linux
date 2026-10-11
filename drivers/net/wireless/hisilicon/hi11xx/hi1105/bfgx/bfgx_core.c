@@ -26,6 +26,9 @@
 #include "bfgx_data_parse.h"
 #include "plat_exception_rst.h"
 #include "bfgx_core.h"
+#ifdef CONFIG_CHARLOTTE_HI11XX_BT
+#include "bfgx_bluez.h"
+#endif
 
 #define BFGX_HEART_BEAT_TIME      3000  /* bfgx心跳超时时间为3秒钟 */
 
@@ -705,6 +708,9 @@ STATIC void ps_remove(struct platform_device *pdev)
         return;
     }
 
+#ifdef CONFIG_CHARLOTTE_HI11XX_BT
+    charlotte_bt_unregister(ps_plat_d->core_data);
+#endif
     bt_cali_data_exit(ps_plat_d->core_data);
     ps_core_debug_res_remove(ps_plat_d);
     /* TTY ldisc cleanup */
