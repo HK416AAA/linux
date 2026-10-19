@@ -18,6 +18,7 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -128,6 +129,9 @@ struct uart_v500_port {
 	u32				fifosize;
 	u32				int_msk;
 	u32				old_status;
+	bool				cts_active_low;
+	bool				auto_rts;
+	void __iomem			*crg;
 };
 
 static struct uart_driver uart_v500_driver;
@@ -142,6 +146,59 @@ static void uart_v500_write(struct uart_v500_port *uap, u32 val, u32 reg)
 static u32 uart_v500_read(struct uart_v500_port *uap, u32 reg)
 {
 	return readl_relaxed(uap->port.membase + reg);
+}
+
+static u32 uart_v500_cts(struct uart_v500_port *uap)
+{
+	u32 status = uart_v500_read(uap, UART_V500_STAT);
+
+	if (uap->cts_active_low)
+		status ^= UART_V500_STAT_CTS;
+	return status & UART_V500_STAT_CTS;
+}
+
+/* UART4's clock and pad providers have not yet been ported. Touch only
+ * its fields, using the stock Charlotte CRG and GPIO41--44 pin definitions.
+ */
+static int uart_v500_charlotte_prepare(struct platform_device *pdev,
+				       struct uart_v500_port *uap)
+{
+	void __iomem *mux, *pads;
+	struct resource *res;
+	u32 val, offset;
+	unsigned int i;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return -EINVAL;
+	uap->crg = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+	if (!res)
+		return -EINVAL;
+	mux = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 3);
+	if (!res)
+		return -EINVAL;
+	pads = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	if (!uap->crg || !mux || !pads)
+		return -ENOMEM;
+
+	for (i = 0; i < 4; i++) {
+		offset = 0x9c + 4 * i;
+		writel((readl(mux + offset) & ~7) | 1, mux + offset);
+		writel((readl(pads + offset) & ~7) | 1, pads + offset);
+		val = readl(pads + 0x800 + offset);
+		writel((val & ~0x73) | 0x20 | (i % 2 ? 0 : 1),
+		       pads + 0x800 + offset);
+	}
+	/* Keep the shared SPLL source frequency; select /5 then UART4 /2. */
+	writel(BIT(26) | BIT(10), uap->crg + 0xf8);
+	writel(BIT(27) | BIT(11), uap->crg + 0xf4);
+	writel(0xf0000000 | 0x1000, uap->crg + 0xb0);
+	writel(BIT(20) | BIT(4), uap->crg + 0xac);
+	writel(BIT(14), uap->crg + 0x20);
+	return readl_poll_timeout(uap->crg + 0x28, val, val & BIT(14),
+				 1, 1000);
 }
 
 static void uart_v500_drain_tx(struct uart_v500_port *uap)
@@ -225,7 +282,7 @@ static void uart_v500_modem_status(struct uart_v500_port *uap)
 {
 	u32 status, delta;
 
-	status = uart_v500_read(uap, UART_V500_STAT) & UART_V500_STAT_CTS;
+	status = uart_v500_cts(uap);
 	delta = status ^ uap->old_status;
 	uap->old_status = status;
 
@@ -296,7 +353,7 @@ static unsigned int uart_v500_get_mctrl(struct uart_port *port)
 		container_of(port, struct uart_v500_port, port);
 	unsigned int result = 0;
 
-	if (uart_v500_read(uap, UART_V500_STAT) & UART_V500_STAT_CTS)
+	if (uart_v500_cts(uap))
 		result |= TIOCM_CTS;
 
 	return result;
@@ -311,6 +368,9 @@ static void uart_v500_set_mctrl(struct uart_port *port, unsigned int mctrl)
 		uart_v500_write(uap, UART_V500_CFG_LOOP_EN, UART_V500_CONFIG);
 	else
 		uart_v500_write(uap, UART_V500_CFG_LOOP_DIS, UART_V500_CONFIG);
+	if (uap->auto_rts)
+		uart_v500_write(uap, mctrl & TIOCM_RTS ? UART_V500_CFG_RTS_EN :
+				UART_V500_CFG_RTS_DIS, UART_V500_CONFIG);
 }
 
 static void uart_v500_stop_tx_port(struct uart_port *port)
@@ -429,10 +489,15 @@ static void uart_v500_set_termios(struct uart_port *port,
 	if (termios->c_cflag & CRTSCTS) {
 		uart_v500_write(uap, UART_V500_CFG_RTS_EN |
 				UART_V500_CFG_CTS_EN, UART_V500_CONFIG);
+		port->status |= UPSTAT_AUTOCTS | UPSTAT_AUTORTS;
 	} else {
 		uart_v500_write(uap, UART_V500_CFG_RTS_DIS |
 				UART_V500_CFG_CTS_DIS, UART_V500_CONFIG);
+		port->status &= ~(UPSTAT_AUTOCTS | UPSTAT_AUTORTS);
 	}
+	uap->auto_rts = !!(termios->c_cflag & CRTSCTS);
+	if (UART_ENABLE_MS(port, termios->c_cflag))
+		uart_v500_enable_ms(port);
 
 	port->read_status_mask = UART_V500_DR_OE | UART_V500_DR_DATA;
 	if (termios->c_iflag & INPCK)
@@ -467,6 +532,20 @@ static int uart_v500_startup(struct uart_port *port)
 	struct uart_v500_port *uap =
 		container_of(port, struct uart_v500_port, port);
 	int ret;
+	u32 val;
+
+	if (uap->crg) {
+		writel(BIT(14), uap->crg + 0x78);
+		ret = readl_poll_timeout(uap->crg + 0x80, val,
+					 val & BIT(14), 1, 1000);
+		if (ret)
+			return ret;
+		writel(BIT(14), uap->crg + 0x7c);
+		ret = readl_poll_timeout(uap->crg + 0x80, val,
+					 !(val & BIT(14)), 1, 1000);
+		if (ret)
+			return ret;
+	}
 
 	ret = request_irq(port->irq, uart_v500_int, 0, DRV_NAME, uap);
 	if (ret)
@@ -485,8 +564,7 @@ static int uart_v500_startup(struct uart_port *port)
 			UART_V500_CFG_TX_EN | UART_V500_CFG_FIFO_EN,
 			UART_V500_CONFIG);
 
-	uap->old_status = uart_v500_read(uap, UART_V500_STAT) &
-		UART_V500_STAT_CTS;
+	uap->old_status = uart_v500_cts(uap);
 
 	return 0;
 }
@@ -787,6 +865,7 @@ static int uart_v500_probe(struct platform_device *pdev)
 	uap->fifosize = UART_V500_FIFO_SIZE_DEF;
 
 	uap->port.uartclk = UART_V500_DEFAULT_CLK;
+	uap->cts_active_low = of_property_read_bool(np, "hisilicon,cts-active-low");
 	of_property_read_u64(np, "clock-rate", &rate);
 	if (rate)
 		uap->port.uartclk = rate;
@@ -798,6 +877,11 @@ static int uart_v500_probe(struct platform_device *pdev)
 	}
 	if (of_property_read_u32(np, "fifosize", &val) == 0 && val)
 		uap->port.fifosize = uap->fifosize = val;
+	if (of_device_is_compatible(np, "hisilicon,charlotte-uart4")) {
+		ret = uart_v500_charlotte_prepare(pdev, uap);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret, "UART4 clock/pads failed\n");
+	}
 
 	/* Silence any interrupts left pending by the firmware */
 	uart_v500_write(uap, UART_V500_MSK_INT_ALL, UART_V500_INT_MSK);

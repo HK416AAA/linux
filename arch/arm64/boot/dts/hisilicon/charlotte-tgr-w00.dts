@@ -11,6 +11,14 @@
 	status = "okay";
 };
 
+&uart4 {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
 / {
 	model = "Huawei TGR-W00";
 	compatible = "hisilicon,charlotte";
@@ -69,6 +77,57 @@
 
 	framebuffer@34380000 {
 		panel = <&tgr_panel>;
+	};
+
+	reserved-memory {
+		/* Reusable scanout allocations, independent of the general 32 MiB
+		 * CMA pool. Keep DMA below 4 GiB for the handoff diagnostic stage.
+		 */
+		dpu_cma: dpu-cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			/* Login greeter and user compositor can each keep three
+			 * full-size BOs alive during the session transition.
+			 */
+			size = <0 0x10000000>;
+			alignment = <0 0x00200000>;
+			alloc-ranges = <0 0x3c000000 0 0xa4000000>;
+		};
+	};
+
+	/* E880 DPU/DSI0 instance and SPI 480 are present together in the
+	 * stock composer_manager and dsi@E8800000 nodes (not the E890 DPU).
+	 * probe_only=1 retains simpledrm for explicit bounded diagnostics.
+	 */
+	dpu: display-controller@e8800000 {
+		compatible = "hisilicon,charlotte-dpu-handoff";
+		reg = <0 0xe8800000 0 0x100000>;
+		interrupts = <GIC_SPI 480 IRQ_TYPE_LEVEL_HIGH>;
+		memory-region = <&dpu_cma>;
+		backlight = <&tgr_backlight>;
+	};
+
+	/* Stock TGR backlight bus; reset bit14/gate bit31 and GPIO230/231.
+	 * LED on/off retains the firmware's brightness and IC setup.
+	 */
+	i2c7: i2c@ff88f000 {
+		compatible = "hisilicon,charlotte-i2c7-v400";
+		reg = <0 0xff88f000 0 0x1000>,
+		      <0 0xffb85000 0 0x1000>,
+		      <0 0xfb228794 0 8>,
+		      <0 0xfb229794 0 8>;
+		reg-names = "controller", "crg", "iomux", "pad";
+		interrupts = <GIC_SPI 360 IRQ_TYPE_LEVEL_HIGH>;
+		clk_rate = <0 112000000>;
+		clock-frequency = <400000>;
+		i2c-sda-hold-time-ns = <554>;
+		i2c-digital-filter-width-ns = <9>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		tgr_backlight: backlight@3c {
+			compatible = "richtek,rt4539";
+			reg = <0x3c>;
+		};
 	};
 
 	chosen {

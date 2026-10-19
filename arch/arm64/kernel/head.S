@@ -411,12 +411,27 @@ SYM_FUNC_START_LOCAL(__primary_switched)
 	bl	finalise_el2			// Prefer VHE if possible
 	CHARLOTTE_MAGIC_PM 7
 
-	/* v54 lesson (do not retry blindly): an M-free SCTLR_EL1 write
-	 * setting only C|I, issued HERE (post-MMU, post-finalise_el2),
-	 * kills the CPU instantly and silently -- magic7 fires, magic8
-	 * never does, and no exception reaches the prz dumper.  The v28
-	 * "M-free writes pass" model holds pre-MMU only.  Caches stay
-	 * off; boot just runs slow until an hhee-aware path is found. */
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	/* Unlike the old v54 experiment, preserve M and every existing
+	 * control bit. Record actual hardware readback, since
+	 * hhee may reject or discard the trapped SCTLR write.
+	 */
+	adr_l	x0, _text
+	adr_l	x1, _end
+	bl	dcache_clean_inval_poc
+	ic	iallu
+	dsb	sy
+	isb
+	mrs	x0, sctlr_el1
+	str_l	x0, charlotte_boot_sctlr_before, x1
+	orr	x0, x0, #SCTLR_ELx_C
+	orr	x0, x0, #SCTLR_ELx_I
+	msr	sctlr_el1, x0
+	isb
+	mrs	x0, sctlr_el1
+	str_l	x0, charlotte_boot_sctlr_after, x1
+	CHARLOTTE_MAGIC_PM 8
+#endif
 	ldp	x29, x30, [sp], #16
 	bl	start_kernel
 SYM_FUNC_END(__primary_switched)
@@ -569,17 +584,26 @@ SYM_CODE_START(charlotte_cycle_pen)
 	/* v152: pen shrunk to mark + CPU_OFF (the v113 suspend/timer
 	 * dance never woke once; 140B of idmap space reclaimed for
 	 * the judge scanner). */
-	movz	x1, #0x01f0
-	movk	x1, #0x2fcb, lsl #16
+	adrp	x19, charlotte_cycle_probes
+	add	x19, x19, :lo12:charlotte_cycle_probes
 	mrs	x9, mpidr_el1
-	ubfx	x9, x9, #8, #4		// Aff1 (slot index)
-	add	x1, x1, x9, lsl #2
-	mov	w10, #0xfeed
-	orr	w10, w10, w9
-	str	w10, [x1]			// pen entered
+	ubfx	x10, x9, #8, #4
+	and	x9, x9, #1
+	add	x9, x9, x10, lsl #1		// Aff1*2 + Aff0
+	add	x19, x19, x9, lsl #7		// 128-byte private cacheline
+	mov	x10, #1
+	str	x10, [x19]			// pen entered
+	dsb	sy
 	movz	x0, #0x0002
 	movk	x0, #0x8400, lsl #16		// PSCI CPU_OFF
+	mov	x1, #0x10000			// power down, same as cpu_psci_cpu_die
+	mov	x2, xzr
+	mov	x3, xzr
 	hvc	#0
+	str	x0, [x19, #8]			// CPU_OFF must not return
+	mov	x10, #2
+	str	x10, [x19]
+	dsb	sy
 4:	wfe
 	b	4b
 SYM_CODE_END(charlotte_cycle_pen)
@@ -665,6 +689,18 @@ alternative_else_nop_endif
 	movz	w9, #0xF111
 	str	w9, [x7, #88]			// F1: trap returned
 	isb
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	/* Join the cached primary before reading any shared kernel data.
+	 * Keep the separate M transition required by Charlotte firmware.
+	 */
+	ic	iallu
+	dsb	sy
+	mrs	x0, sctlr_el1
+	orr	x0, x0, #SCTLR_ELx_C
+	orr	x0, x0, #SCTLR_ELx_I
+	msr	sctlr_el1, x0
+	isb
+#endif
 	movz	w9, #0xF222
 	str	w9, [x7, #92]			// F2: post-isb
 	dsb	sy

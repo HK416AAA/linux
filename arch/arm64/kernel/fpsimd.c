@@ -6,6 +6,7 @@
  * Author: Catalin Marinas <catalin.marinas@arm.com>
  */
 
+#include <linux/charlotte-cpu-diag.h>
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/bottom_half.h>
@@ -1787,14 +1788,35 @@ void fpsimd_restore_current_state(void)
 		return;
 	}
 
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	/* Synchronize the trapped access-control state before loading FP. */
+	dsb(sy);
+	(void)read_sysreg(cpacr_el1);
+	isb();
+#endif
+	charlotte_cpu_diag(201, 0, 0);
 	get_cpu_fpsimd_context();
+	charlotte_cpu_diag(202, 0, 0);
 
 	if (test_and_clear_thread_flag(TIF_FOREIGN_FPSTATE)) {
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+		dsb(sy);
+		(void)read_sysreg(cpacr_el1);
+		isb();
+#endif
+		charlotte_cpu_diag(203, 0, 0);
 		task_fpsimd_load();
+		charlotte_cpu_diag(204, 0, 0);
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+		/* Finish the firmware-mediated FP state load before EL0 entry. */
+		dsb(sy);
+		isb();
+#endif
 		fpsimd_bind_task_to_cpu();
 	}
 
 	put_cpu_fpsimd_context();
+	charlotte_cpu_diag(205, 0, 0);
 }
 
 void fpsimd_update_current_state(struct user_fpsimd_state const *state)

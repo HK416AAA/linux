@@ -1616,13 +1616,6 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
-	/* charlotte v193: pin PID 1 (and everything it execs) to the
-	 * cold-path boot CPU.  hhee denies EL0 instruction fetch (S2
-	 * permission, FSC 0x30-0x33) on other CPUs -- v192 placed this
-	 * before kernel_init_freeable(), which resets the affinity to
-	 * cpu_all_mask and re-enabled the IA storm. */
-	set_cpus_allowed_ptr(current, cpumask_of(0));
-
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)

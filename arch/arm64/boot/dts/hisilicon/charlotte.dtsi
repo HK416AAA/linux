@@ -13,6 +13,34 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	gpu_power: gpu-power {
+		compatible = "hisilicon,charlotte-gpu-power";
+		regulator-name = "g3d";
+	};
+
+	/* Stock TGR uses HiSilicon HVGR TV200, with six separate IRQ lines.
+	 * Power is an IP vote to the platform FF-A partition, not a fixed rail.
+	 * The vendor system-cache extension is disabled during initial bring-up.
+	 */
+	gpu: gpu@e9fc0000 {
+		compatible = "hisi,hvgr-tv200", "hisi,hvgr";
+		reg = <0 0xe9fc0000 0 0x40000>;
+		interrupts = <GIC_SPI 550 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 551 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 552 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 553 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 627 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 628 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "FCP", "GPU", "JOB", "MMU", "CQ", "CC";
+		gpu-supply = <&gpu_power>;
+		system-coherency = <31>;
+		crg-reset = <0xffb85000 0x1000 0xd18 0x07800000
+			     0xd1c 0x07800000>;
+		prot_enhance = <0>;
+		protect_space = <0x10f40000 0x400000>;
+		status = "disabled";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -382,6 +410,20 @@
 			interrupts = <GIC_SPI 134 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
+		uart4: serial@ff881000 {
+			compatible = "hisilicon,charlotte-uart4", "hisilicon,uart";
+			reg = <0 0xff881000 0 0x1000>,
+			      <0 0xffb85000 0 0x1000>,
+			      <0 0xff800000 0 0x1000>,
+			      <0 0xff801000 0 0x1000>;
+			reg-names = "uart", "peri-crg", "mux", "pads";
+			interrupts = <GIC_SPI 396 IRQ_TYPE_LEVEL_HIGH>;
+			/* SPLL / 5 / 2, as rounded by the vendor clock driver. */
+			clock-rate = <0 167116800>;
+			hisilicon,cts-active-low;
+			status = "disabled";
+		};
+
 		uart6: serial@ffb82000 {
 			compatible = "hisilicon,uart";
 			reg = <0x0 0xffb82000 0x0 0x1000>;
@@ -417,6 +459,7 @@
 
 	aliases {
 		serial0 = &uart6;
+		serial4 = &uart4;
 	};
 
 	chosen {

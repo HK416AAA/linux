@@ -6,6 +6,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/charlotte-cpu-diag.h>
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/sched.h>
@@ -364,9 +365,22 @@ void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm)
 	ttbr1 &= ~TTBRx_EL1_ASID_MASK;
 	ttbr1 |= FIELD_PREP(TTBRx_EL1_ASID_MASK, asid);
 
+	charlotte_cpu_diag(101, ttbr0, ttbr1);
 	cpu_set_reserved_ttbr0_nosync();
+	charlotte_cpu_diag(102, ttbr0, ttbr1);
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	/* Complete each trapped register transition before the next one. */
+	dsb(sy);
+	isb();
+#endif
 	write_sysreg(ttbr1, ttbr1_el1);
+	charlotte_cpu_diag(103, ttbr0, ttbr1);
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	dsb(sy);
+	isb();
+#endif
 	write_sysreg(ttbr0, ttbr0_el1);
+	charlotte_cpu_diag(104, ttbr0, ttbr1);
 	isb();
 	post_ttbr_update_workaround();
 }

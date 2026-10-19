@@ -8,6 +8,7 @@ config CHARLOTTE_HI11XX_WIFI
 	bool "Charlotte Hi11xx vendor Wi-Fi port (experimental)"
 	depends on ARM64 && PCI && MMC && GPIOLIB && CFG80211=y
 	depends on PCIE_CHARLOTTE
+	select CHARLOTTE_SECUREC
 	help
 	  Work in progress port of the TGR-W00 vendor Hi11xx WLAN driver.
 	  Requires the Charlotte PCIe host and board power implementation.

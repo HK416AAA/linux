@@ -4,7 +4,10 @@ CONFIG_AUDIT=y
 CONFIG_NO_HZ_IDLE=y
 CONFIG_HIGH_RES_TIMERS=y
 CONFIG_BPF_SYSCALL=y
-CONFIG_BPF_JIT=y
+# Firmware adds PXNTable to new kernel tables; use the BPF interpreter.
+# CONFIG_BPF_JIT is not set
+CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC=y
+CONFIG_ARM64_CHARLOTTE_BOOT_CACHE=y
 CONFIG_PREEMPT=y
 CONFIG_IRQ_TIME_ACCOUNTING=y
 CONFIG_BSD_PROCESS_ACCT=y
@@ -178,9 +181,9 @@ CONFIG_HSR=m
 CONFIG_QRTR_SMD=m
 CONFIG_QRTR_TUN=m
 CONFIG_CAN=m
-CONFIG_BT=m
-CONFIG_BT_HIDP=m
-# CONFIG_BT_LE is not set
+CONFIG_BT=y
+CONFIG_BT_HIDP=y
+CONFIG_BT_LE=y
 CONFIG_BT_LEDS=y
 # CONFIG_BT_DEBUGFS is not set
 CONFIG_BT_HCIBTUSB=m
@@ -194,10 +197,10 @@ CONFIG_BT_MRVL=m
 CONFIG_BT_MRVL_SDIO=m
 CONFIG_BT_QCOMSMD=m
 CONFIG_BT_NXPUART=m
-CONFIG_CFG80211=m
+CONFIG_CFG80211=y
 CONFIG_MAC80211=m
 CONFIG_MAC80211_LEDS=y
-CONFIG_RFKILL=m
+CONFIG_RFKILL=y
 CONFIG_RFKILL_GPIO=m
 CONFIG_NET_9P=m
 CONFIG_NET_9P_VIRTIO=m
@@ -1932,6 +1935,11 @@ CONFIG_CONFIGFS_FS=y
 CONFIG_EFIVAR_FS=y
 CONFIG_UBIFS_FS=m
 CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_FILE_CACHE=y
+CONFIG_SQUASHFS_LZ4=y
+CONFIG_SQUASHFS_LZO=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_SQUASHFS_ZSTD=y
 CONFIG_PSTORE=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_RAM=y
@@ -2019,7 +2027,7 @@ CONFIG_USB_DWC3_CHARLOTTE=y
 # CONFIG_ARM_PMU is not set
 # CONFIG_ARM_PMUV3 is not set
 # CONFIG_ARM_PMU_ACPI is not set
-CONFIG_INITRAMFS_SOURCE="../tools/charlotte-initramfs/charlotte-initramfs.cpio.gz"
+CONFIG_INITRAMFS_SOURCE="../tools/ubuntu-initramfs-maker/charlotte-initramfs/charlotte-initramfs.cpio.gz"
 CONFIG_INITRAMFS_FORCE=y
 CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 loglevel=5 nokaslr debug.exception-trace=1 id_aa64isar0.atomic=0 charlotte_keepalive.timeout=300 g_cdc.host_addr=02:00:ca:00:00:01 g_cdc.dev_addr=02:00:ca:00:00:02 charlotte_cpu_diag.enabled=0"
 CONFIG_CMDLINE_FORCE=y
@@ -2032,6 +2040,10 @@ CONFIG_ARM64_PAGE_SIZE_4KB=y
 # Firmware does not support hardware AF/dirty updates (IFSC 0x31 at EL0).
 # Use software access-flag faults, as in the vendor Charlotte configuration.
 # CONFIG_ARM64_HW_AFDBM is not set
+# Keep TCR stable across A510/Taishan and the firmware MMU handoff.
+# MTE changes TCR on A510; E0PD changes it after the firmware snapshot.
+# CONFIG_ARM64_MTE is not set
+# CONFIG_ARM64_E0PD is not set
 # Restrict LSE in the CPU feature framework, including EL0 HWCAP/CPUID.
 # The boot-time id_aa64isar0.atomic=0 override keeps kernel and libc on LL/SC.
 
@@ -2047,3 +2059,16 @@ CONFIG_USB_CDC_COMPOSITE=y
 CONFIG_GPIO_CHARLOTTE_V500=y
 CONFIG_SPI_CHARLOTTE_V500=y
 CONFIG_TOUCHSCREEN_CHARLOTTE_THP=y
+CONFIG_BT_RFCOMM=y
+CONFIG_BT_RFCOMM_TTY=y
+CONFIG_BT_BNEP=y
+CONFIG_BT_BNEP_MC_FILTER=y
+CONFIG_BT_BNEP_PROTO_FILTER=y
+CONFIG_UHID=y
+CONFIG_CHARLOTTE_HI11XX_BT=y
+
+# Experimental HVGR v200 vendor CQ ABI; desktop Mesa support is separate.
+CONFIG_CHARLOTTE_HVGR=y
+CONFIG_EROFS_FS=y
+CONFIG_EROFS_FS_ZIP_LZMA=y
+CONFIG_EROFS_FS_ZIP_DEFLATE=y

@@ -29,6 +29,7 @@
 #include <linux/pkeys.h>
 #include <linux/mm_inline.h>
 #include <linux/pagewalk.h>
+#include <linux/of_fdt.h>
 #include <linux/stop_machine.h>
 
 #include <asm/barrier.h>
@@ -56,6 +57,24 @@ EXPORT_SYMBOL(kimage_voffset);
 u32 __boot_cpu_mode[] = { BOOT_CPU_MODE_EL2, BOOT_CPU_MODE_EL1 };
 
 static bool rodata_is_rw __ro_after_init = true;
+
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+static bool charlotte_pgtable_sync __ro_after_init;
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+u64 charlotte_boot_sctlr_before __initdata;
+u64 charlotte_boot_sctlr_after __initdata;
+#endif
+
+void charlotte_sync_pmd_store(pmd_t *pmdp)
+{
+	if (!charlotte_pgtable_sync || (read_sysreg(sctlr_el1) & SCTLR_ELx_C))
+		return;
+
+	/* EL2's emulated store may still reside in a dirty cache line. */
+	dcache_clean_inval_poc((unsigned long)pmdp,
+			       (unsigned long)(pmdp + 1));
+}
+#endif
 
 /*
  * The booting CPU updates the failed status @__early_cpu_boot_status,
@@ -1484,6 +1503,18 @@ static void __init create_idmap(void)
 
 void __init paging_init(void)
 {
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	charlotte_pgtable_sync = of_flat_dt_is_compatible(of_get_flat_dt_root(),
+							"hisilicon,charlotte");
+	if (charlotte_pgtable_sync)
+		pr_info("charlotte-pt: uncached EL1 PMD store synchronization enabled\n");
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	if (charlotte_pgtable_sync)
+		pr_info("charlotte-cache: before=%#llx after=%#llx current=%#llx pfr0=%#llx\n",
+			charlotte_boot_sctlr_before, charlotte_boot_sctlr_after,
+			read_sysreg(sctlr_el1), read_sysreg(id_aa64pfr0_el1));
+#endif
+#endif
 	map_mem();
 
 	memblock_allow_resize();

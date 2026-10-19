@@ -36,6 +36,7 @@
 #include <linux/kprobes.h>
 #include <linux/kvm_host.h>
 #include <linux/nmi.h>
+#include <linux/psci.h>
 
 #include <asm/alternative.h>
 #include <asm/atomic.h>
@@ -122,6 +123,16 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	secondary_data.task = idle;
 	update_cpu_boot_status(CPU_MMU_OFF);
 
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	/* The firmware enters secondaries with C=0. Publish the rebuilt
+	 * idmap and the handoff before PSCI, until the secondary enables C.
+	 */
+	if (system_state < SYSTEM_RUNNING)
+		dcache_clean_poc((unsigned long)_text, (unsigned long)_end);
+	dcache_clean_poc((unsigned long)&secondary_data,
+			 (unsigned long)(&secondary_data + 1));
+#endif
+
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	/* v109: cores with Aff1 >= 4 arrive "managed" in hhee with
 	 * stock-era snapshots, so their first M=1 write is judged and
@@ -130,7 +141,11 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	 * hotplug lifecycle does, then bring them in for real. */
 	if (cpu >= 4) {
 		extern int charlotte_cpu_cycle(unsigned int cpu);
-		charlotte_cpu_cycle(cpu);
+		int cycle_ret = charlotte_cpu_cycle(cpu);
+
+		if (cycle_ret)
+			pr_warn("charlotte-cycle: CPU%u pre-cycle failed (%d)\n",
+				cpu, cycle_ret);
 	}
 #endif
 	/* Now bring the CPU into our world */
@@ -233,6 +248,11 @@ asmlinkage notrace void secondary_start_kernel(void)
 	struct mm_struct *mm = &init_mm;
 	const struct cpu_operations *ops;
 	unsigned int cpu = smp_processor_id();
+
+#ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
+	pr_info("charlotte-cache: secondary CPU%u SCTLR=%#llx\n",
+		cpu, read_sysreg(sctlr_el1));
+#endif
 
 
 	/*
@@ -1406,29 +1426,54 @@ bool cpus_are_stuck_in_kernel(void)
 /* psci conduit: DT hvc fids, direct asm */
 extern char charlotte_cycle_pen[];
 
-/* PSCI v0.1 conduit is hvc with DT fids: cpu_on 0xc4000003. */
-static void charlotte_hvc_cpu_on(unsigned long fid, u64 target,
-				 u64 entry)
-{
-	asm volatile("mov x0, %0\n"
-		     "mov x1, %1\n"
-		     "mov x2, %2\n"
-		     "hvc #0"
-		     :
-		     : "r"((unsigned long)fid), "r"(target), "r"(entry)
-		     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-		       "x8", "x9", "x10", "x11", "x12", "x13", "x14",
-		       "x15", "x16", "x17", "memory");
-}
+/* Each cacheline belongs to one hardware thread, including Aff0. The
+ * trampoline accesses this array with the MMU/cache off; publish the reset
+ * before CPU_ON and invalidate our clean copy before reading its result.
+ */
+struct charlotte_cycle_probe {
+	u64 stage;
+	s64 off_ret;
+	u8 padding[112];
+};
+
+struct charlotte_cycle_probe charlotte_cycle_probes[16] __aligned(128);
 
 int charlotte_cpu_cycle(unsigned int cpu)
 {
 	u64 mpidr = cpu_logical_map(cpu);
 	unsigned long entry = (unsigned long)__pa_symbol(charlotte_cycle_pen);
+	unsigned int slot = ((mpidr >> 8) & 0xf) * 2 + (mpidr & 1);
+	struct charlotte_cycle_probe *probe;
+	unsigned long start;
+	u64 stage;
+	s64 off_ret;
+	int ret;
+	extern void charlotte_ckpt_hex(const char *tag, unsigned long long v);
 
-	/* park the core: it immediately CPU_OFFs itself */
-	charlotte_hvc_cpu_on(0xc4000003, mpidr, entry);
+	if (!psci_ops.cpu_on || slot >= ARRAY_SIZE(charlotte_cycle_probes))
+		return -EINVAL;
+	probe = &charlotte_cycle_probes[slot];
+	start = (unsigned long)probe;
+	memset(probe, 0, sizeof(*probe));
+	dcache_clean_inval_poc(start, start + sizeof(*probe));
+
+	/* Use the regular PSCI wrapper: DT conduit/FID, context ID zero, and
+	 * Linux errno conversion, just like the real secondary CPU_ON.
+	 */
+	ret = psci_ops.cpu_on(mpidr, entry);
+	charlotte_ckpt_hex("E:CPU_CYCLE ret ", ((u64)cpu << 32) | (u32)ret);
+	if (ret)
+		return ret;
 	mdelay(200);
+	dcache_inval_poc(start, start + sizeof(*probe));
+	stage = READ_ONCE(probe->stage);
+	off_ret = READ_ONCE(probe->off_ret);
+	charlotte_ckpt_hex("E:CPU_CYCLE stage ", ((u64)cpu << 32) | stage);
+	charlotte_ckpt_hex("E:CPU_CYCLE off ", ((u64)cpu << 32) | (u32)off_ret);
+	pr_info("charlotte-cycle: CPU%u entry=%#llx stage=%llu off-return=%lld\n",
+		cpu, (u64)entry, stage, off_ret);
+	if (stage != 1)
+		return stage == 2 ? -EIO : -ETIMEDOUT;
 	return 0;
 }
 #endif

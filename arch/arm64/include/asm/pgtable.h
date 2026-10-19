@@ -816,6 +816,12 @@ extern pgd_t reserved_pg_dir[];
 
 extern void set_swapper_pgd(pgd_t *pgdp, pgd_t pgd);
 
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+void charlotte_sync_pmd_store(pmd_t *pmdp);
+#else
+static inline void charlotte_sync_pmd_store(pmd_t *pmdp) { }
+#endif
+
 static inline bool in_swapper_pgdir(void *addr)
 {
 	return ((unsigned long)addr & PAGE_MASK) ==
@@ -832,6 +838,7 @@ static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 #endif /* __PAGETABLE_PMD_FOLDED */
 
 	WRITE_ONCE(*pmdp, pmd);
+	charlotte_sync_pmd_store(pmdp);
 
 	if (pmd_valid(pmd))
 		queue_pte_barriers();

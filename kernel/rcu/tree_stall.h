@@ -7,6 +7,7 @@
  * Author: Paul E. McKenney <paulmck@linux.ibm.com>
  */
 
+#include <linux/charlotte-cpu-diag.h>
 #include <linux/console.h>
 #include <linux/kvm_para.h>
 #include <linux/rcu_notifier.h>
@@ -395,6 +396,7 @@ static int rcu_print_task_stall(struct rcu_node *rnp, unsigned long flags)
  */
 static void rcu_dump_cpu_stacks(unsigned long gp_seq)
 {
+	charlotte_cpu_diag_dump();
 	int cpu;
 	unsigned long flags;
 	struct rcu_node *rnp;

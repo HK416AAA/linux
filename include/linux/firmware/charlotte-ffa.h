@@ -6,4 +6,5 @@ struct device;
 int charlotte_ffa_usb_access(struct device *dev);
 int charlotte_ffa_pcie_access(u32 rc_id);
 int charlotte_ffa_pcie_phy_trim(u32 *value);
+int charlotte_ffa_gpu_power(struct device *dev, bool enable);
 #endif

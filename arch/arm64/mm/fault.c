@@ -7,6 +7,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/charlotte-cpu-diag.h>
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
 #include <linux/bpf_defs.h>
@@ -992,17 +993,8 @@ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 	const struct fault_info *inf = esr_to_fault_info(esr);
 	unsigned long addr = untagged_addr(far);
 
-	{
-		/* charlotte v186: rate-limited userspace IA/DA trace into
-		 * the pstore ramlog (PID 1 IA storm diagnostics). */
-		static atomic_t ua_limit = ATOMIC_INIT(64);
-
-		if (user_mode(regs) &&
-		    atomic_dec_if_positive(&ua_limit) >= 0)
-			charlotte_ua_trace(far, esr, regs,
-				ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW ?
-					"IAB" : "DAB");
-	}
+	charlotte_cpu_diag(401, regs->pc, esr);
+	charlotte_cpu_diag(402, far, regs->pstate);
 
 	if (!inf->fn(far, esr, regs))
 		return;

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_CHARLOTTE_DPU
+	tristate "Charlotte DPU v700 firmware-handoff KMS"
+	depends on DRM && OF && ARM64 && I2C
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Native atomic KMS and DMA-buffer scanout for the DPU v700 on
+	  Huawei TGR-W00. Retains the firmware's DSI/DSC/panel initialization.
+	  Only the existing 1840x2800 scanout mode is supported initially.
+	  The probe_only=1 parameter inspects the handoff without register
+	  writes, interrupts or KMS takeover. Explicit debugfs diagnostics are
+	  bounded and restore the interrupt mask. Build this driver into the
+	  kernel on TGR: loadable module execution is not functional there yet.

@@ -630,3 +630,8 @@ config UNION_FIND
 
 config MIN_HEAP
 	bool
+
+config CHARLOTTE_SECUREC
+	bool
+	help
+	  Checked C helpers shared by the Charlotte Hi1105 and HVGR ports.

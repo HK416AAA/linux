@@ -1,1 +1,1 @@
-obj-y += charlotte-nve.o securec/ hi1105/
+obj-y += charlotte-nve.o hi1105/

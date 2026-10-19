@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config CHARLOTTE_HVGR
+	bool "Charlotte HVGR v200 GPU (experimental)"
+	depends on ARM64 && OF && REGULATOR && CHARLOTTE_FFA
+	select HISI_GPU
+	select HVGR_EXPERT
+	select HVGR_V2XX
+	select CRC16
+	select DMA_SHARED_BUFFER
+	select SYNC_FILE
+	select CHARLOTTE_SECUREC
+	help
+	  Experimental port of the GPL HVGR v200 vendor command queue driver.
+	  Uses the original device ABI, not the Panfrost/Panthor DRM ABI.
+
+config HISI_GPU
+	bool
+config HVGR_EXPERT
+	bool
+config HVGR_V2XX
+	bool
+config HVGR_PLATFORM_NAME
+	string
+	default "p0000301"

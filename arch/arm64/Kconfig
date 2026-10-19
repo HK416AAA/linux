@@ -1980,6 +1980,26 @@ endif # ARMV8_DEPRECATED
 
 endif # COMPAT
 
+config ARM64_CHARLOTTE_PGTABLE_SYNC
+	bool "Synchronize Charlotte firmware page-table stores"
+	depends on ARCH_HISI
+	help
+	  Charlotte firmware can emulate a kernel page-table store through a
+	  cached EL2 mapping while EL1 runs with its data cache disabled.
+	  Clean and invalidate the entry after a PMD store so that EL1 reads
+	  observe the updated descriptor. This applies only on Charlotte and
+	  only when SCTLR_EL1.C is clear.
+
+config ARM64_CHARLOTTE_BOOT_CACHE
+	bool "Enable Charlotte CPU caches"
+	depends on ARM64_CHARLOTTE_PGTABLE_SYNC
+	help
+	  Enable the boot CPU instruction and data caches after MMU setup,
+	  preserving the existing SCTLR_EL1 control bits required by hhee.
+	  Publish the initial secondary handoff before PSCI CPU_ON and enable
+	  secondary caches after the firmware-required MMU transition. Keep
+	  firmware-mediated address-space and FP state transitions ordered.
+
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM

@@ -5,6 +5,7 @@
  * Copyright (C) 2019 ARM Ltd.
  */
 
+#include <linux/charlotte-cpu-diag.h>
 #include <linux/context_tracking.h>
 #include <linux/irq-entry-common.h>
 #include <linux/kasan.h>
@@ -109,6 +110,7 @@ static __always_inline void arm64_syscall_exit_to_user_mode(struct pt_regs *regs
 	local_daif_mask();
 	sme_exit_to_user_mode();
 	mte_check_tfsr_exit();
+	charlotte_cpu_diag(301, regs->pc, regs->regs[0]);
 	exit_to_user_mode();
 }
 
@@ -124,6 +126,7 @@ static __always_inline void arm64_exit_to_user_mode(struct pt_regs *regs)
 	local_daif_mask();
 	sme_exit_to_user_mode();
 	mte_check_tfsr_exit();
+	charlotte_cpu_diag(301, regs->pc, regs->regs[0]);
 	exit_to_user_mode();
 }
 
@@ -771,6 +774,8 @@ static void noinstr el0_fpac(struct pt_regs *regs, unsigned long esr)
 asmlinkage void noinstr el0t_64_sync_handler(struct pt_regs *regs)
 {
 	unsigned long esr = read_sysreg(esr_el1);
+
+	charlotte_cpu_diag(302, regs->pc, esr);
 
 	switch (ESR_ELx_EC(esr)) {
 	case ESR_ELx_EC_SVC64:

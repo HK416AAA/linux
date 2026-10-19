@@ -13,6 +13,8 @@
 #define EFUSE_READ      0xc3001900
 #define EFUSE_ITEM_INFO 0xc3001902
 #define EFUSE_COMBO2_PHY 0x00030025
+#define IP_REGULATOR     0xc3000700
+#define GPU_REGULATOR_ID 13
 
 static DEFINE_MUTEX(charlotte_ffa_lock);
 static struct ffa_device *charlotte_ffa_dev;
@@ -58,6 +60,20 @@ int charlotte_ffa_usb_access(struct device *dev)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(charlotte_ffa_usb_access);
+
+/* Stock ip@13 uses the platform service, while GPU protected-mode commands
+ * retain their separate SMC conduit. Share the USB/PCIe transaction lock.
+ */
+int charlotte_ffa_gpu_power(struct device *dev, bool enable)
+{
+	struct ffa_send_direct_data args = {
+		.data0 = IP_REGULATOR, .data1 = GPU_REGULATOR_ID,
+		.data2 = enable,
+	};
+
+	return charlotte_ffa_call(dev, &args);
+}
+EXPORT_SYMBOL_GPL(charlotte_ffa_gpu_power);
 
 int charlotte_ffa_pcie_access(u32 rc_id)
 {

@@ -33,6 +33,7 @@
 #include <linux/panic_notifier.h>
 #include <linux/printk.h>
 #include <linux/reboot.h>
+#include <linux/timekeeping.h>
 #include <linux/timer.h>
 
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
@@ -204,7 +205,12 @@ static void keepalive_tick(struct timer_list *t)
 	if (READ_ONCE(panic_seen) || READ_ONCE(poweroff_seen))
 		return;
 
-	if (limit && (u64)tick_count * KICK_PERIOD_MS >= (u64)limit * 1000) {
+	/* Match the absolute boot-time threshold used by the diagnostic scripts.
+	 * Counting callbacks extends the window whenever timer delivery is late.
+	 */
+	if (limit && ktime_get_boottime_seconds() >= limit) {
+		pr_warn("charlotte-keepalive: recovery window expired; stop feeding, hardware recovery within %us\n",
+			timeout);
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 		charlotte_bbox_checkpoint("E:KA_STOP\n");
 #endif
@@ -293,6 +299,9 @@ static int __init charlotte_keepalive_init(void)
 
 	pr_info("charlotte-keepalive: armed (wdt %us, kick %ums, mbx5 chn%u)\n",
 		timeout, KICK_PERIOD_MS, MBX5_CHN);
+	if (stop_after)
+		pr_info("charlotte-keepalive: diagnostic stop-feeding at boot time %us\n",
+			stop_after);
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	charlotte_bbox_checkpoint("E:KEEPALIVE_ARMED\n");
 #endif
