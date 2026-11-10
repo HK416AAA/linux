@@ -639,9 +639,20 @@
 			no-map;
 		};
 
-		/* Ramoops: keep mapped so the console log stays readable. */
-		pstore-mem@2fc40000 {
+		/* Ramoops: keep mapped so the console log stays readable.
+		 * Upstream binds ramoops as a /reserved-memory child carrying
+		 * compatible+reg directly; fs/pstore/ram.c reads the reg
+		 * (platform_get_resource), not memory-region.  Sizes fit the
+		 * 1 MiB window: console 512 KiB + record 128 KiB + pmsg 128 KiB.
+		 */
+		pstore_mem: ramoops@2fc40000 {
+			compatible = "ramoops";
 			reg = <0x0 0x2fc40000 0x0 0x100000>;
+			record-size  = <0x20000>;
+			console-size = <0x80000>;
+			pmsg-size    = <0x20000>;
+			ftrace-size  = <0x0>;
+			ecc-size     = <0x0>;
 		};
 
 		npu-ai-ts-fw@2fd40000 {

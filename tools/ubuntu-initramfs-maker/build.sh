@@ -92,6 +92,81 @@ PermitRootLogin yes
 PasswordAuthentication yes
 SSHD
 
+# 3b. USB composite gadget: ACM console (ttyGS0) + ECM network (usb0).
+#     The kernel has USB_CONFIGFS_* built in, but userspace must create the
+#     configfs hierarchy and bind a UDC before ttyGS0/usb0 exist.  This is
+#     the only usable console/network path when no UART is wired.
+cat > /usr/local/sbin/usb-gadget-setup <<'GADGET'
+#!/bin/sh
+# Bind a composite USB gadget: ACM console (ttyGS0) + ECM net (usb0).
+set -eu
+
+GADGET=/sys/kernel/config/usb_gadget/charlotte
+CFG="$GADGET/configs/c.1"
+STR="$GADGET/strings/0x409"
+
+modprobe libcomposite 2>/dev/null || true
+modprobe usb_f_acm 2>/dev/null || true
+modprobe usb_f_ecm 2>/dev/null || true
+
+if [ ! -d "$GADGET" ]; then
+	mkdir -p "$GADGET"
+	echo 0x18d1 > "$GADGET/idVendor"
+	echo 0x4ee7 > "$GADGET/idProduct"
+	echo 0x0100 > "$GADGET/bcdDevice"
+	echo 0x0200 > "$GADGET/bcdUSB"
+
+	mkdir -p "$STR"
+	echo "charlotte-mro" > "$STR/serialnumber"
+	echo "MonkeyCode" > "$STR/manufacturer"
+	echo "Kirin 9010 Ubuntu" > "$STR/product"
+
+	mkdir -p "$GADGET/functions/acm.gs0"
+	mkdir -p "$GADGET/functions/ecm.usb0"
+	echo "02:00:ca:00:00:02" > "$GADGET/functions/ecm.usb0/dev_addr" 2>/dev/null || true
+	echo "02:00:ca:00:00:01" > "$GADGET/functions/ecm.usb0/host_addr" 2>/dev/null || true
+
+	mkdir -p "$CFG/strings/0x409"
+	echo "acm+ecm" > "$CFG/strings/0x409/configuration"
+	echo 500 > "$CFG/MaxPower"
+	ln -sf "$GADGET/functions/acm.gs0" "$CFG/acm.gs0"
+	ln -sf "$GADGET/functions/ecm.usb0" "$CFG/ecm.usb0"
+fi
+
+# DWC3 may probe after systemd reaches multi-user; wait for a UDC.
+i=0
+while [ "$i" -lt 30 ] && ! ls /sys/class/udc/* >/dev/null 2>&1; do
+	i=$((i + 1))
+	sleep 1
+done
+
+UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1 || true)
+if [ -z "$UDC" ]; then
+	echo "usb-gadget: no UDC present, dwc3 has not probed" >&2
+	exit 1
+fi
+echo "usb-gadget: binding UDC $UDC"
+echo "$UDC" > "$GADGET/UDC"
+GADGET
+
+chmod 0755 /usr/local/sbin/usb-gadget-setup
+
+cat > /etc/systemd/system/usb-gadget.service <<'UNIT'
+[Unit]
+Description=USB composite gadget (ACM console + ECM network)
+After=sys-kernel-config.mount
+Wants=sys-kernel-config.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb-gadget-setup
+TimeoutStartSec=45
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'GETTY'
 [Service]
 ExecStart=
@@ -104,6 +179,7 @@ systemctl enable ssh.service
 systemctl enable getty@tty1.service
 systemctl enable serial-getty@ttyHW0.service
 systemctl enable serial-getty@ttyGS0.service
+systemctl enable usb-gadget.service
 systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 
 systemd-machine-id-setup
@@ -115,6 +191,7 @@ ln -snf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 /usr/sbin/sshd -t
 for unit in ssh.service getty@tty1.service \
 	serial-getty@ttyHW0.service serial-getty@ttyGS0.service \
+	usb-gadget.service \
 	systemd-networkd.service systemd-resolved.service; do
 	systemctl is-enabled --quiet "$unit"
 done
