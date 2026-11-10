@@ -122,6 +122,45 @@
 			alignment = <0 0x00200000>;
 			alloc-ranges = <0 0x3c000000 0 0xa4000000>;
 		};
+
+		/* MRO-W00 secure firmware layout from the live MRO FDT.  The
+		 * shared SoC dtsi still carries the TGR-W00 addresses.
+		 */
+		crypto-core@14000000 {
+			reg = <0x0 0x14000000 0x0 0x380000>;
+			no-map;
+		};
+
+		supersonic@2c200000 {
+			reg = <0x0 0x2c200000 0x0 0x9b0000>;
+			no-map;
+		};
+
+		fingerprint-dma@2cbb0000 {
+			reg = <0x0 0x2cbb0000 0x0 0x50000>;
+			no-map;
+		};
+
+		s4-bl31-ex@18300000 {
+			reg = <0x0 0x18300000 0x0 0x80000>;
+			no-map;
+		};
+
+		s4-ns-mem@30740000 {
+			reg = <0x0 0x30740000 0x0 0x180000>;
+			no-map;
+		};
+
+		/* Live MRO FDT places secure OS at 0x14600000+0x3200000 and
+		 * TEE at 0x17800000+0xb00000.
+		 */
+		secos@14600000 {
+			reg = <0x0 0x14600000 0x0 0x3200000>;
+		};
+
+		thee@17600000 {
+			reg = <0x0 0x17800000 0x0 0xb00000>;
+		};
 	};
 
 	/* E880 DPU/DSI0 instance and SPI 480 are present together in the
