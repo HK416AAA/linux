@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Huawei MRO-W00, Hisilicon Kirin 9010W (charlotte)
+ *
+ * MRO-W00 is the Kirin 9010W variant of the 12.2-inch MatePad Pro board
+ * family.  The SoC-internal blocks, UART, PCIe/WiFi, UFS, USB and display
+ * handoff are shared with TGR-W00; only board identity, battery capacity
+ * and the WiFi calibration file differ.
+ */
+
+/dts-v1/;
+
+#include "charlotte.dtsi"
+
+&wifi_pcie {
+	status = "okay";
+};
+
+&uart4 {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+/* MRO-W00 uses the 10100 mAh dual-cell pack. */
+&battery {
+	charge-full-design-microamp-hours = <10100000>;
+};
+
+/ {
+	model = "Huawei MRO-W00";
+	compatible = "hisilicon,charlotte";
+
+	hw_connectivity {
+		compatible = "huawei,hw_connectivity";
+		chip_type = "hisi";
+	};
+
+	wifi_customize {
+		compatible = "hi110x,customize";
+		ini_file_name = "/lib/firmware/hi11xx/cfg_mro_w00_va.ini";
+	};
+
+	hi110x {
+		compatible = "hisilicon,hi110x", "hisilicon,hi1102";
+		hi110x,subchip_type = "hi1105";
+		hi110x,asic_version;
+		hi110x,power_prepare;
+		hi110x,tcxo_gpio_level = <1>;
+		huawei,pmu_clk32b = "clk_pmu32kb";
+		hi110x,gpio_power_on = <&wifi_gpio 15 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_wlan_power_on = <&touch_irq 14 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_bfgx_power_on = <&wifi_gpio 5 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_g_power_on = <&wifi_gpio 14 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_tcxo_freq_detect = <&wifi_gpio 10 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_ssi_clk = <&wifi_gpio 7 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_ssi_data = <&wifi_gpio 8 GPIO_ACTIVE_HIGH>;
+	};
+
+	hisi_wifi {
+		compatible = "hisilicon,hisi_wifi";
+		hi110x,pcie_rc_idx = <0>;
+		hi110x,gpio_sample_low = <0>;
+		hi110x,gpio_host_wakeup_wlan = <&touch_irq 13 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_wlan_wakeup_host = <&pmic_irq_gpio 15 GPIO_ACTIVE_HIGH>;
+	};
+
+	hisi_bfgx {
+		compatible = "hisilicon,hisi_bfgx";
+		hi110x,gpio_bfgx_wakeup_host = <&pmic_irq_gpio 16 GPIO_ACTIVE_HIGH>;
+		hi110x,uart_port = "/dev/ttyHW4";
+	};
+
+	/* Physical panel metadata for the shared 12.2-inch 3:2 panel.
+	 * The display hardware remains owned by the firmware handoff.
+	 */
+	mro_panel: panel {
+		/* Metadata only: no autonomous panel driver is available yet.
+		 * Prevent fw_devlink waiting for a supplier that will not bind.
+		 */
+		status = "disabled";
+		width-mm = <173>;
+		height-mm = <258>;
+	};
+
+	framebuffer@34380000 {
+		panel = <&mro_panel>;
+	};
+
+	reserved-memory {
+		/* Reusable scanout allocations, independent of the general 32 MiB
+		 * CMA pool. Keep DMA below 4 GiB for the handoff diagnostic stage.
+		 */
+		dpu_cma: dpu-cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			/* Login greeter and user compositor can each keep three
+			 * full-size BOs alive during the session transition.
+			 */
+			size = <0 0x10000000>;
+			alignment = <0 0x00200000>;
+			alloc-ranges = <0 0x3c000000 0 0xa4000000>;
+		};
+	};
+
+	/* E880 DPU/DSI0 instance and SPI 480 are present together in the
+	 * stock composer_manager and dsi@E8800000 nodes (not the E890 DPU).
+	 * probe_only=1 retains simpledrm for explicit bounded diagnostics.
+	 */
+	dpu: display-controller@e8800000 {
+		compatible = "hisilicon,charlotte-dpu-handoff";
+		reg = <0 0xe8800000 0 0x100000>;
+		interrupts = <GIC_SPI 480 IRQ_TYPE_LEVEL_HIGH>;
+		memory-region = <&dpu_cma>;
+		backlight = <&mro_backlight>;
+	};
+
+	/* Stock TGR backlight bus; reset bit14/gate bit31 and GPIO230/231.
+	 * LED on/off retains the firmware's brightness and IC setup.
+	 */
+	i2c7: i2c@ff88f000 {
+		compatible = "hisilicon,charlotte-i2c7-v400";
+		reg = <0 0xff88f000 0 0x1000>,
+		      <0 0xffb85000 0 0x1000>,
+		      <0 0xfb228794 0 8>,
+		      <0 0xfb229794 0 8>;
+		reg-names = "controller", "crg", "iomux", "pad";
+		interrupts = <GIC_SPI 360 IRQ_TYPE_LEVEL_HIGH>;
+		clk_rate = <0 112000000>;
+		clock-frequency = <400000>;
+		i2c-sda-hold-time-ns = <554>;
+		i2c-digital-filter-width-ns = <9>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		mro_backlight: backlight@3c {
+			compatible = "richtek,rt4539";
+			reg = <0x3c>;
+		};
+	};
+
+	chosen {
+		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 ignore_loglevel loglevel=8 nokaslr";
+		stdout-path = "serial0:115200n8";
+		linux,initrd-start = <0x0 0x66800000>;
+		linux,initrd-end = <0x0 0x66800000>;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/* Safe 8 GiB subset of the MRO-W00 memory map.  MRO-W00 ships
+		 * with 12 or 16 GiB; the additional banks live above the ranges
+		 * described here and are left unused until a live MRO FDT dump
+		 * confirms their exact layout.  The first 4 MiB exclusion and
+		 * all firmware reservations match the TGR-W00 handoff.
+		 */
+		reg = <0x0 0x00400000 0x0 0xdfc00000>,
+		      <0x1 0x00000000 0x1 0x00000000>,
+		      <0x8 0x00000000 0x0 0x20000000>;
+	};
+};
