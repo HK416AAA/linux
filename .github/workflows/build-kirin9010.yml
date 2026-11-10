@@ -34,10 +34,7 @@ jobs:
 
       - name: Build Image and device trees
         run: |
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" \
-            Image \
-            arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb \
-            arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs
 
       - name: Collect artifacts
         run: |
