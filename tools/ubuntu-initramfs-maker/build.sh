@@ -63,9 +63,17 @@ echo 'root:charlotte' | chpasswd
 mkdir -p /etc/systemd/network /etc/ssh/sshd_config.d /run/sshd
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 
+cat > /etc/systemd/network/10-usb0.link <<'LINK'
+[Match]
+OriginalName=usb0
+
+[Link]
+Name=usb0
+LINK
+
 cat > /etc/systemd/network/10-usb0.network <<'NET'
 [Match]
-Name=usb0
+Name=usb0 enx*
 
 [Network]
 Address=10.0.0.2/24
