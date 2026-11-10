@@ -14,6 +14,21 @@
 
 &wifi_pcie {
 	status = "okay";
+	/* Stock MRO-W00 drives the Hi1105 main rail from bank 3 pin 10. */
+	chip-power-gpios = <&wifi_power_gpio 10 GPIO_ACTIVE_HIGH>;
+};
+
+&soc {
+	/* Hi1105 chip power enable.  The live MRO-W00 tree exposes only
+	 * line 10 of this bank; every other line stays firmware-owned.
+	 */
+	wifi_power_gpio: gpio@ee267000 {
+		compatible = "hisilicon,charlotte-gpio-v500";
+		reg = <0 0xee267000 0 0x1000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-reserved-ranges = <0 10>, <11 21>;
+	};
 };
 
 &uart4 {
@@ -32,6 +47,12 @@
 / {
 	model = "Huawei MRO-W00";
 	compatible = "hisilicon,charlotte";
+	hisi,boardname = "MRO_W00_VA";
+	hisi,product_name = "MRO-W00";
+	hisi,boardid = <0x1 0x3 0x1 0x3 0x2>;
+	hisi,chipid = <0x6 0xb 0x0 0x1>;
+	hisi,chiptype = "KirinT91_csv2";
+	hisi,platformid = "118";
 
 	hw_connectivity {
 		compatible = "huawei,hw_connectivity";
@@ -50,11 +71,9 @@
 		hi110x,power_prepare;
 		hi110x,tcxo_gpio_level = <1>;
 		huawei,pmu_clk32b = "clk_pmu32kb";
-		hi110x,gpio_power_on = <&wifi_gpio 15 GPIO_ACTIVE_HIGH>;
+		hi110x,gpio_power_on = <&wifi_power_gpio 10 GPIO_ACTIVE_HIGH>;
 		hi110x,gpio_wlan_power_on = <&touch_irq 14 GPIO_ACTIVE_HIGH>;
 		hi110x,gpio_bfgx_power_on = <&wifi_gpio 5 GPIO_ACTIVE_HIGH>;
-		hi110x,gpio_g_power_on = <&wifi_gpio 14 GPIO_ACTIVE_HIGH>;
-		hi110x,gpio_tcxo_freq_detect = <&wifi_gpio 10 GPIO_ACTIVE_HIGH>;
 		hi110x,gpio_ssi_clk = <&wifi_gpio 7 GPIO_ACTIVE_HIGH>;
 		hi110x,gpio_ssi_data = <&wifi_gpio 8 GPIO_ACTIVE_HIGH>;
 	};
@@ -143,20 +162,24 @@
 	chosen {
 		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 ignore_loglevel loglevel=8 nokaslr";
 		stdout-path = "serial0:115200n8";
-		linux,initrd-start = <0x0 0x66800000>;
-		linux,initrd-end = <0x0 0x66800000>;
 	};
 
+	/* Live MRO-W00 (12 GiB) FDT: one NUMA node below 4 GiB plus the
+	 * 32-32.5 GiB bank, and a second node for 8-14 GiB.  Keep the first
+	 * 4 MiB out of the usable map; the firmware reservations in the SoC
+	 * dtsi cover the rest of the holes.
+	 */
 	memory@0 {
 		device_type = "memory";
-		/* Safe 8 GiB subset of the MRO-W00 memory map.  MRO-W00 ships
-		 * with 12 or 16 GiB; the additional banks live above the ranges
-		 * described here and are left unused until a live MRO FDT dump
-		 * confirms their exact layout.  The first 4 MiB exclusion and
-		 * all firmware reservations match the TGR-W00 handoff.
-		 */
 		reg = <0x0 0x00400000 0x0 0xdfc00000>,
-		      <0x1 0x00000000 0x1 0x00000000>,
+		      <0x1 0x00000000 0x0 0x80000000>,
 		      <0x8 0x00000000 0x0 0x20000000>;
+		numa-node-id = <0>;
+	};
+
+	memory@1 {
+		device_type = "memory";
+		reg = <0x2 0x00000000 0x1 0x80000000>;
+		numa-node-id = <1>;
 	};
 };
