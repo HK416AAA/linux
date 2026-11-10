@@ -1,0 +1,69 @@
+name: Build Kirin 9010 Ubuntu userspace
+
+on:
+  push:
+    branches:
+      - 261110-feat-kirin9010-ubuntu
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            device-tree-compiler cpio gzip xz-utils kmod \
+            debootstrap qemu-user-static binfmt-support
+
+      - name: Enable arm64 binfmt
+        run: |
+          sudo update-binfmts --enable qemu-aarch64 || true
+          sudo systemctl restart systemd-binfmt || true
+          ls /proc/sys/fs/binfmt_misc/ || true
+
+      - name: Build kernel and modules
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- charlotte_mro_defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs modules
+          echo "KERNEL_RELEASE=$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)" >> "$GITHUB_ENV"
+
+      - name: Build Ubuntu initramfs
+        run: |
+          sudo -E env \
+            KERNEL_SRC="$PWD" \
+            KERNEL_RELEASE="$KERNEL_RELEASE" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            tools/ubuntu-initramfs-maker/build.sh
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp arch/arm64/boot/Image out/Image-7.3-mro-w00
+          cp arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb out/
+          cp arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb out/
+          cp System.map "out/System.map-$KERNEL_RELEASE"
+          cp .config out/config-mro-w00
+          cp tools/ubuntu-initramfs-maker/out/* out/
+          (cd out && sha256sum * > SHA256SUMS.txt && ls -l)
+
+      - name: Upload userspace artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kirin9010-ubuntu-${{ github.sha }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
