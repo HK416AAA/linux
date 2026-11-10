@@ -125,6 +125,13 @@ make -C "$KERNEL_SRC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
 	INSTALL_MOD_PATH="$ROOTFS" modules_install
 depmod -b "$ROOTFS" "$KERNEL_RELEASE"
 
+# 4b. Install the MRO-W00/W09 stock WiFi calibration files.  The kernel
+#     requests /lib/firmware/hi11xx/cfg_mro_w00_va.ini from the board DTS.
+install -D -m 0644 "$HERE/firmware/cfg_mro_w00_va.ini" \
+	"$ROOTFS/lib/firmware/hi11xx/cfg_mro_w00_va.ini"
+install -D -m 0644 "$HERE/firmware/cfg_mro_w00_vb.ini" \
+	"$ROOTFS/lib/firmware/hi11xx/cfg_mro_w00_vb.ini"
+
 # 5. Publish the initramfs and a standalone module tree.
 tar -C "$ROOTFS/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
 (cd "$ROOTFS" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "$OUT/$IMAGE_NAME.cpio.gz"
