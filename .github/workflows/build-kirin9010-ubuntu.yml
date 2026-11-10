@@ -47,7 +47,7 @@ jobs:
             KERNEL_RELEASE="$KERNEL_RELEASE" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            tools/ubuntu-initramfs-maker/build.sh
+            bash tools/ubuntu-initramfs-maker/build.sh
 
       - name: Collect artifacts
         run: |
