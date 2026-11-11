@@ -386,6 +386,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			}
 			early_memunmap(em, 0x4000);
 		} else {
+			if (em)
+				charlotte_ckpt_hex("E:FDT_EMBED_MAGIC ",
+						   (u64)be32_to_cpup(em));
+			else
+				charlotte_ckpt("E:FDT_EMBED_MAP_FAIL\n");
 			charlotte_ckpt("E:FDT_RESCUE_FAIL\n");
 			if (em)
 				early_memunmap(em, 0x4000);
