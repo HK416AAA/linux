@@ -22,8 +22,12 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          # The image ships most of these already; the cross toolchain and
+          # dtc come from apt.  Cap the update so a slow mirror cannot
+          # hold the job open for the whole workflow timeout.
+          sudo timeout 180 apt-get -o Acquire::http::Timeout=10 \
+            -o Acquire::https::Timeout=10 -o Acquire::Retries=1 update || true
+          sudo DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y \
             build-essential bc bison flex libssl-dev libelf-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             device-tree-compiler cpio rsync xz-utils
