@@ -207,6 +207,10 @@ mkdir -p "$LOG"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id)
 
+if ! grep -q ' /sys/fs/pstore ' /proc/mounts 2>/dev/null; then
+	mount -t pstore pstore /sys/fs/pstore 2>/dev/null || true
+fi
+
 if [ -s /sys/kernel/charlotte_previous_ramlog ]; then
 	cp /sys/kernel/charlotte_previous_ramlog \
 		"$LOG/previous-$stamp-$boot.log" || true
@@ -294,7 +298,7 @@ cat > /etc/systemd/system/uart-log-archive.service <<'UNIT'
 [Unit]
 Description=Archive previous-boot UART/pstore console log
 After=local-fs.target
-Before=serial-getty@ttyHW0.service serial-getty@ttyGS0.service
+Before=systemd-pstore.service serial-getty@ttyHW0.service serial-getty@ttyGS0.service
 Wants=local-fs.target
 
 [Service]
@@ -376,6 +380,7 @@ exec script -q -f -O "/var/log/uart/session-$(date -u +%Y%m%dT%H%M%SZ)-${_uart_t
 SESSION
 chmod 0644 /etc/profile.d/uart-session-log.sh
 
+systemctl mask systemd-pstore.service 2>/dev/null || true
 systemctl enable uart-log-archive.service
 systemctl enable uart-boot-snapshot.service
 systemctl enable uart-shutdown-snapshot.service
