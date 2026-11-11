@@ -316,6 +316,25 @@ u64 cpu_logical_map(unsigned int cpu)
 	return __cpu_logical_map[cpu];
 }
 
+static u64 __init charlotte_fdt_initrd(void *blob, const char *prop, u64 dflt)
+{
+	int chosen, len;
+	const void *p;
+
+	if (!blob)
+		return dflt;
+	chosen = fdt_path_offset(blob, "/chosen");
+	if (chosen < 0)
+		return dflt;
+	p = fdt_getprop(blob, chosen, prop, &len);
+	if (!p || len < 4)
+		return dflt;
+	if (len >= 8)
+		return ((u64)be32_to_cpup(p) << 32) |
+		       be32_to_cpup((const u32 *)p + 1);
+	return be32_to_cpup(p);
+}
+
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
 	setup_initial_init_mm(_text, _etext, _edata, _end);
@@ -357,26 +376,50 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 		/* v166b: prefer the EMBEDDED tree again -- the BL FDT is
 		 * the full stock tree (its dwc3 probe SError-panics the
 		 * boot at dwc3_core_probe+0xa94, and none of our DT
-		 * edits ever applied on it).  The ramdisk pointers: the
-		 * stock DTB is far too big to libfdt-walk through the
-		 * early fixmap, but BootImgDxe loads the ramdisk at the
-		 * FIXED address from our own boot image header (see
-		 * tools/repack_bootimg.py): 0x66800000 + size 0x3322bb.
-		 * Write those constants into the placeholder slots and
-		 * switch. */
+		 * edits ever applied on it).  The ramdisk pointers are
+		 * taken from the bootloader tree: BootImgDxe has already
+		 * patched linux,initrd-start/end there for the ramdisk it
+		 * loaded, and the ramdisk size varies per boot image, so
+		 * hardcoded constants are wrong.  fixmap_remap_fdt() can
+		 * map the full stock tree (it is below MAX_FDT_SIZE) and
+		 * libfdt can read the two properties directly.  Write
+		 * those values into the placeholder slots and switch. */
 	{
 		phys_addr_t embed_pa2 = __pa_symbol(_end);
 		void *em = early_memremap(embed_pa2, 0x4000);
+		u64 istart = 0x66800000ULL;
+		u64 iend = 0x66800000ULL + 0x3322bbULL;
+		int bl_size = 0;
+		void *bl = fixmap_remap_fdt(__fdt_pointer, &bl_size,
+					    PAGE_KERNEL_RO);
 		bool ok = false;
+
+		if (bl) {
+			istart = charlotte_fdt_initrd(bl, "linux,initrd-start",
+						      istart);
+			iend = charlotte_fdt_initrd(bl, "linux,initrd-end",
+						    iend);
+			charlotte_ckpt_hex("E:FDT_INITRD_BL ", istart);
+			charlotte_ckpt_hex("E:FDT_INITRD_BE ", iend);
+		}
 
 		if (em && be32_to_cpup(em) == 0xd00dfeed) {
 			int eo = fdt_path_offset(em, "/chosen");
+			int es = -1, ee = -1;
 
-			if (eo >= 0 &&
-			    fdt_setprop_u64(em, eo, "linux,initrd-start", 0x66800000ULL) == 0 &&
-			    fdt_setprop_u64(em, eo, "linux,initrd-end", 0x66800000ULL + 0x3322bbULL) == 0) {
-				charlotte_ckpt_hex("E:FDT_INITRD ", 0x66800000ULL);
+			if (eo >= 0) {
+				es = fdt_setprop_u64(em, eo, "linux,initrd-start",
+						     istart);
+				ee = fdt_setprop_u64(em, eo, "linux,initrd-end",
+						     iend);
+			}
+			if (eo >= 0 && es == 0 && ee == 0) {
+				charlotte_ckpt_hex("E:FDT_INITRD ", istart);
 				ok = true;
+			} else if (eo >= 0) {
+				charlotte_ckpt_hex("E:FDT_SETPROP ",
+						   ((u64)(u32)es << 32) |
+						   (u32)ee);
 			}
 			if (ok) {
 				__fdt_pointer = embed_pa2;
