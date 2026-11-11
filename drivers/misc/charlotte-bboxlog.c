@@ -49,13 +49,22 @@
 #include <asm/ptrace.h>
 
 #define RAMLOG_PA	(0x2fc40000UL + 0x60000UL)
-/* Second copy in the first dmesg record.  The stock kernel exposes it as
- * /sys/fs/pstore/dmesg-ramoops-0, which its console backend does not touch
- * on a normal boot (only an oops writes a new record).  The console zone is
- * overwritten by the recovering stock boot long before a human can read it. */
+/* Copies in the ramoops zones.  The stock fallback kernel has no pstore
+ * (init's "mount -t pstore" fails with ENODEV), so these are read either by
+ * a later mainline boot through /sys/fs/pstore, or by dumping the whole
+ * 1 MiB reserved region from the stock shell:
+ *   dd if=/dev/mem bs=4096 skip=$((0x2fc40000/4096)) count=256 | strings
+ * The stock fallback never writes these zones, so the text survives the
+ * warm reset even though the stock console would otherwise erase it. */
 #define RAMLOG_DM_PA	0x2fc40000UL
 #define RAMLOG_DM_CAP	0x20000U	/* record-size */
+#define RAMLOG_DM_CNT	3		/* record0..record2 */
 #define RAMLOG_DM_ASCII	8U		/* "====0.0\n" dmesg header */
+#define RAMLOG_PM_PA	(0x2fc40000UL + 0xE0000UL)
+#define RAMLOG_PM_CAP	0x20000U	/* pmsg zone */
+#define RAMLOG_CT_PA	(0x2fc40000UL + 0x60000UL + 0x7F000UL)
+#define RAMLOG_CT_CAP	0x1000U		/* tail of the console zone */
+#define RAMLOG_CT_MAGIC	"CHRLOT\n"
 #define RAMLOG_SIG	0x43474244U
 #define RAMLOG_CAP	0x12000U	/* C log area; record0 mirror maps separately */
 #define RAMLOG_HDR	12U		/* sig + start + size */
@@ -72,7 +81,9 @@ static u32 woff;
 static u32 dropped;
 static bool banner_done;
 static void __iomem *ramlog_map;
-static void __iomem *ramlog_dm_map;
+static void __iomem *ramlog_dm_map[RAMLOG_DM_CNT];
+static void __iomem *ramlog_pm_map;
+static void __iomem *ramlog_ct_map;
 static DEFINE_RAW_SPINLOCK(ramlog_lock);
 /* Snapshot before this boot writes its first byte over the preceding boot. */
 static u8 previous_ramlog[0x10000];
@@ -84,14 +95,14 @@ static void ramlog_emit(const char *s, size_t n)
 	bool armed = state == ST_ARMED;
 	unsigned long flags = 0, p;
 	size_t start;
-	void __iomem *m, *dm;
+	void __iomem *m;
+	int i;
 
 	if (state == ST_TRANS)
 		return;
 	m = armed ? ramlog_map : early_memremap(RAMLOG_PA, RAMLOG_CAP);
 	if (!m)
 		return;
-	dm = armed ? ramlog_dm_map : early_memremap(RAMLOG_DM_PA, RAMLOG_DM_CAP);
 	if (!previous_saved) {
 		memcpy_fromio(previous_ramlog, m, sizeof(previous_ramlog));
 		previous_saved = true;
@@ -116,12 +127,20 @@ static void ramlog_emit(const char *s, size_t n)
 		asm volatile("dc cvac, %0" :: "r"(p) : "memory");
 	asm volatile("dsb sy" ::: "memory");
 
-	/* Mirror into the first dmesg record so the recovering stock kernel
-	 * can hand it out as /sys/fs/pstore/dmesg-ramoops-0.  A dmesg record
-	 * is a persistent_ram buffer at offset 0 (sig/start/size) whose data
-	 * must start with the ASCII "====<sec>.<usec>\n" header, otherwise
-	 * ramoops_read_kmsg_hdr() rejects and zaps the whole zone. */
-	if (dm) {
+	/* Copy the same text into every ramoops zone the vendor tree has
+	 * reserved (dmesg record0..2, console, pmsg).  The stock fallback
+	 * kernel has no pstore at all (init's mount fails with ENODEV), so
+	 * these copies exist for two readers: a later mainline boot, and a
+	 * raw /dev/mem dump of 0x2fc40000 in the stock shell.  Each dmesg
+	 * record needs the persistent_ram header plus the ASCII
+	 * "====<sec>.<usec>\n" header, or ramoops zaps the zone. */
+	for (i = 0; i < RAMLOG_DM_CNT; i++) {
+		void __iomem *dm = armed ? ramlog_dm_map[i] :
+			early_memremap(RAMLOG_DM_PA + (u32)i * RAMLOG_DM_CAP,
+				       RAMLOG_DM_CAP);
+
+		if (!dm)
+			continue;
 		memcpy_fromio(dm + RAMLOG_HDR + RAMLOG_DM_ASCII,
 			      m + RAMLOG_HDR, woff);
 		memcpy(dm + RAMLOG_HDR, "====0.0\n", RAMLOG_DM_ASCII);
@@ -133,15 +152,52 @@ static void ramlog_emit(const char *s, size_t n)
 		     p += 64)
 			asm volatile("dc cvac, %0" :: "r"(p) : "memory");
 		asm volatile("dsb sy" ::: "memory");
+		if (!armed)
+			early_memunmap(dm, RAMLOG_DM_CAP);
+	}
+
+	{
+		void __iomem *pm = armed ? ramlog_pm_map :
+			early_memremap(RAMLOG_PM_PA, RAMLOG_PM_CAP);
+
+		if (pm) {
+			memcpy_fromio(pm + RAMLOG_HDR, m + RAMLOG_HDR, woff);
+			iowrite32(0, pm + 4);
+			iowrite32(woff, pm + 8);
+			iowrite32(RAMLOG_SIG, pm);
+			for (p = (unsigned long)pm & ~63UL;
+			     p < (unsigned long)(pm + RAMLOG_HDR + woff); p += 64)
+				asm volatile("dc cvac, %0" :: "r"(p) : "memory");
+			asm volatile("dsb sy" ::: "memory");
+			if (!armed)
+				early_memunmap(pm, RAMLOG_PM_CAP);
+		}
+	}
+
+	{
+		void __iomem *ct = armed ? ramlog_ct_map :
+			early_memremap(RAMLOG_CT_PA, RAMLOG_CT_CAP);
+		size_t cn = woff > (RAMLOG_CT_CAP - sizeof(RAMLOG_CT_MAGIC)) ?
+			RAMLOG_CT_CAP - sizeof(RAMLOG_CT_MAGIC) : woff;
+
+		if (ct) {
+			memcpy(ct, RAMLOG_CT_MAGIC, sizeof(RAMLOG_CT_MAGIC) - 1);
+			memcpy_fromio(ct + sizeof(RAMLOG_CT_MAGIC) - 1,
+				      m + RAMLOG_HDR + woff - cn, cn);
+			for (p = (unsigned long)ct & ~63UL;
+			     p < (unsigned long)(ct + sizeof(RAMLOG_CT_MAGIC) - 1 + cn);
+			     p += 64)
+				asm volatile("dc cvac, %0" :: "r"(p) : "memory");
+			asm volatile("dsb sy" ::: "memory");
+			if (!armed)
+				early_memunmap(ct, RAMLOG_CT_CAP);
+		}
 	}
 
 	if (armed)
 		raw_spin_unlock_irqrestore(&ramlog_lock, flags);
-	else {
+	else
 		early_memunmap(m, RAMLOG_CAP);
-		if (dm)
-			early_memunmap(dm, RAMLOG_DM_CAP);
-	}
 }
 
 static void ramlog_line(const char *tag)
@@ -409,6 +465,7 @@ void charlotte_ramlog_mirror_console(const char *s, unsigned int n)
 
 static int __init ramlog_arm(void)
 {
+	int i;
 	void __iomem *m = early_memremap(RAMLOG_PA, RAMLOG_CAP);
 
 	if (m) {
@@ -436,9 +493,18 @@ static int __init ramlog_arm(void)
 		state = ST_TRANS;
 		return -ENOMEM;
 	}
-	ramlog_dm_map = memremap(RAMLOG_DM_PA, RAMLOG_DM_CAP, MEMREMAP_WB);
-	if (!ramlog_dm_map)
-		pr_warn("charlotte-ramlog: dmesg mirror mapping failed\n");
+	for (i = 0; i < RAMLOG_DM_CNT; i++) {
+		ramlog_dm_map[i] = memremap(RAMLOG_DM_PA + (u32)i * RAMLOG_DM_CAP,
+					    RAMLOG_DM_CAP, MEMREMAP_WB);
+		if (!ramlog_dm_map[i])
+			pr_warn("charlotte-ramlog: dmesg%d mirror map failed\n", i);
+	}
+	ramlog_pm_map = memremap(RAMLOG_PM_PA, RAMLOG_PM_CAP, MEMREMAP_WB);
+	if (!ramlog_pm_map)
+		pr_warn("charlotte-ramlog: pmsg mirror map failed\n");
+	ramlog_ct_map = memremap(RAMLOG_CT_PA, RAMLOG_CT_CAP, MEMREMAP_WB);
+	if (!ramlog_ct_map)
+		pr_warn("charlotte-ramlog: console tail map failed\n");
 	state = ST_ARMED;
 	if (dropped) {
 		char note[48];
