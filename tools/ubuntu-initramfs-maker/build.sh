@@ -167,6 +167,119 @@ TimeoutStartSec=45
 WantedBy=multi-user.target
 UNIT
 
+# 3c. Persistent logging for the UART/kernel console.
+#     ttyHW0 is the debug UART (uart6 @0xffb82000, console=ttyHW0).  The
+#     kernel mirrors every printk into the ramoops console zone and keeps a
+#     64 KiB snapshot of the previous boot in /sys/kernel/charlotte_previous_ramlog.
+#     Archive those plus the current dmesg into /var/log/uart on the ext4
+#     root, and make journald store kernel logs on disk as well.
+cat > /etc/systemd/journald.conf.d/10-persistent.conf <<'JOURNAL'
+[Journal]
+Storage=persistent
+SystemMaxUse=256M
+RuntimeMaxUse=64M
+JOURNAL
+
+mkdir -p /usr/local/sbin
+
+cat > /usr/local/sbin/uart-log-archive <<'ARCHIVE'
+#!/bin/sh
+set -eu
+LOG=/var/log/uart
+KEEP=30
+mkdir -p "$LOG"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id)
+
+if [ -s /sys/kernel/charlotte_previous_ramlog ]; then
+	cp /sys/kernel/charlotte_previous_ramlog \
+		"$LOG/previous-$stamp-$boot.log" || true
+fi
+for f in /sys/fs/pstore/*; do
+	[ -f "$f" ] || continue
+	cp "$f" "$LOG/$(basename "$f")-$stamp.log" || true
+done
+dmesg > "$LOG/dmesg-$stamp-$boot.log" 2>/dev/null || true
+
+prev=$(ls -1t "$LOG"/previous-*.log 2>/dev/null | head -n 1 || true)
+[ -n "$prev" ] && ln -sfn "$(basename "$prev")" "$LOG/previous-boot.log"
+pstore=$(ls -1t "$LOG"/console-ramoops-*.log 2>/dev/null | head -n 1 || true)
+[ -n "$pstore" ] && ln -sfn "$(basename "$pstore")" "$LOG/console-last-boot.log"
+
+find "$LOG" -maxdepth 1 -type f -name '*.log' -mtime +14 -delete 2>/dev/null || true
+for pat in previous- console-ramoops- dmesg-; do
+	ls -1t "$LOG"/"$pat"*.log 2>/dev/null |
+		tail -n +$((KEEP + 1)) | xargs -r rm -f
+done
+exit 0
+ARCHIVE
+
+cat > /usr/local/sbin/uart-dmesg-snapshot <<'SNAPSHOT'
+#!/bin/sh
+set -eu
+LOG=/var/log/uart
+mkdir -p "$LOG"
+tmp="$LOG/.dmesg-latest.$$"
+dmesg > "$tmp" 2>/dev/null || true
+mv "$tmp" "$LOG/dmesg-latest.log"
+SNAPSHOT
+
+chmod 0755 /usr/local/sbin/uart-log-archive /usr/local/sbin/uart-dmesg-snapshot
+
+cat > /etc/systemd/system/uart-log-archive.service <<'UNIT'
+[Unit]
+Description=Archive previous-boot UART/pstore console log
+After=local-fs.target
+Before=serial-getty@ttyHW0.service serial-getty@ttyGS0.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/uart-log-archive
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/uart-dmesg-snapshot.service <<'UNIT'
+[Unit]
+Description=Snapshot kernel/UART console log to /var/log/uart
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/uart-dmesg-snapshot
+UNIT
+
+cat > /etc/systemd/system/uart-dmesg-snapshot.timer <<'UNIT'
+[Unit]
+Description=Periodically snapshot kernel/UART console log
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+cat > /etc/profile.d/uart-session-log.sh <<'SESSION'
+[ -n "${UART_SESSION_LOGGED:-}" ] && return 0
+_uart_tty=$(tty 2>/dev/null) || return 0
+case "$_uart_tty" in
+/dev/ttyHW*|/dev/ttyGS*) ;;
+*) return 0 ;;
+esac
+mkdir -p /var/log/uart
+UART_SESSION_LOGGED=1
+export UART_SESSION_LOGGED
+exec script -q -f -O "/var/log/uart/session-$(date -u +%Y%m%dT%H%M%SZ)-${_uart_tty##*/}.log"
+SESSION
+chmod 0644 /etc/profile.d/uart-session-log.sh
+
+systemctl enable uart-log-archive.service
+systemctl enable uart-dmesg-snapshot.timer
+
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'GETTY'
 [Service]
 ExecStart=
@@ -191,7 +304,7 @@ ln -snf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 /usr/sbin/sshd -t
 for unit in ssh.service getty@tty1.service \
 	serial-getty@ttyHW0.service serial-getty@ttyGS0.service \
-	usb-gadget.service \
+	usb-gadget.service uart-log-archive.service uart-dmesg-snapshot.timer \
 	systemd-networkd.service systemd-resolved.service; do
 	systemctl is-enabled --quiet "$unit"
 done
