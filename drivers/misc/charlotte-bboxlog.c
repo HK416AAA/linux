@@ -59,10 +59,15 @@
  * 1 MiB reserved region from the stock shell:
  *   dd if=/dev/mem bs=4096 skip=$((0x2fc40000/4096)) count=256 | strings
  * The stock fallback never writes these zones, so the text survives the
- * warm reset even though the stock console would otherwise erase it. */
+ * warm reset even though the stock console would otherwise erase it.
+ * Only dmesg record0 and the console tail have mirror buffers.  Records
+ * 1/2 and pmsg are wiped once at arm time so that copies left by earlier
+ * builds do not show up as extra pstore files; pmsg is left for the real
+ * /dev/pmsg0 writer. */
 #define RAMLOG_DM_PA	0x2fc40000UL
 #define RAMLOG_DM_CAP	0x20000U	/* record-size */
 #define RAMLOG_DM_CNT	3		/* record0..record2 */
+#define RAMLOG_DM_MIRROR 1		/* only record0 carries the ramlog */
 #define RAMLOG_DM_ASCII	8U		/* "====0.0\n" dmesg header */
 #define RAMLOG_PM_PA	(0x2fc40000UL + 0xE0000UL)
 #define RAMLOG_PM_CAP	0x20000U	/* pmsg zone */
@@ -92,6 +97,14 @@ static DEFINE_RAW_SPINLOCK(ramlog_lock);
 /* Snapshot before this boot writes its first byte over the preceding boot. */
 static u8 previous_ramlog[0x10000];
 static bool previous_saved;
+
+static void ramlog_wipe_zone(void __iomem *m)
+{
+	if (!m)
+		return;
+	iowrite32(0, m);
+	asm volatile("dc cvac, %0" :: "r"(m) : "memory");
+}
 
 static void ramlog_emit(const char *s, size_t n)
 {
@@ -131,14 +144,13 @@ static void ramlog_emit(const char *s, size_t n)
 		asm volatile("dc cvac, %0" :: "r"(p) : "memory");
 	asm volatile("dsb sy" ::: "memory");
 
-	/* Copy the same text into every ramoops zone the vendor tree has
-	 * reserved (dmesg record0..2, console, pmsg).  The stock fallback
-	 * kernel has no pstore at all (init's mount fails with ENODEV), so
-	 * these copies exist for two readers: a later mainline boot, and a
-	 * raw /dev/mem dump of 0x2fc40000 in the stock shell.  Each dmesg
-	 * record needs the persistent_ram header plus the ASCII
-	 * "====<sec>.<usec>\n" header, or ramoops zaps the zone. */
-	for (i = 0; i < RAMLOG_DM_CNT; i++) {
+	/* Copy the text into dmesg record0 and the console tail only.  The
+	 * stock fallback kernel has no pstore at all (init's mount fails
+	 * with ENODEV), so these copies exist for two readers: a later
+	 * mainline boot, and a raw /dev/mem dump of 0x2fc40000 in the stock
+	 * shell.  The dmesg record needs the persistent_ram header plus the
+	 * ASCII "====<sec>.<usec>\n" header, or ramoops zaps the zone. */
+	for (i = 0; i < RAMLOG_DM_MIRROR; i++) {
 		void __iomem *dm = armed ? ramlog_dm_map[i] :
 			early_memremap(RAMLOG_DM_PA + (u32)i * RAMLOG_DM_CAP,
 				       RAMLOG_DM_CAP);
@@ -158,24 +170,6 @@ static void ramlog_emit(const char *s, size_t n)
 		asm volatile("dsb sy" ::: "memory");
 		if (!armed)
 			early_memunmap(dm, RAMLOG_DM_CAP);
-	}
-
-	{
-		void __iomem *pm = armed ? ramlog_pm_map :
-			early_memremap(RAMLOG_PM_PA, RAMLOG_PM_CAP);
-
-		if (pm) {
-			memcpy_fromio(pm + RAMLOG_HDR, m + RAMLOG_HDR, woff);
-			iowrite32(0, pm + 4);
-			iowrite32(woff, pm + 8);
-			iowrite32(RAMLOG_SIG, pm);
-			for (p = (unsigned long)pm & ~63UL;
-			     p < (unsigned long)(pm + RAMLOG_HDR + woff); p += 64)
-				asm volatile("dc cvac, %0" :: "r"(p) : "memory");
-			asm volatile("dsb sy" ::: "memory");
-			if (!armed)
-				early_memunmap(pm, RAMLOG_PM_CAP);
-		}
 	}
 
 	{
@@ -509,6 +503,10 @@ static int __init ramlog_arm(void)
 	ramlog_ct_map = memremap(RAMLOG_CT_PA, RAMLOG_CT_CAP, MEMREMAP_WB);
 	if (!ramlog_ct_map)
 		pr_warn("charlotte-ramlog: console tail map failed\n");
+	for (i = RAMLOG_DM_MIRROR; i < RAMLOG_DM_CNT; i++)
+		ramlog_wipe_zone(ramlog_dm_map[i]);
+	ramlog_wipe_zone(ramlog_pm_map);
+	asm volatile("dsb sy" ::: "memory");
 	state = ST_ARMED;
 	if (dropped) {
 		char note[48];

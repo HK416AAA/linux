@@ -1220,6 +1220,16 @@ static void __init map_mem(void)
 	BUILD_BUG_ON(pgd_index(direct_map_end - 1) == pgd_index(direct_map_end) &&
 		     pgd_index(_PAGE_OFFSET(VA_BITS_MIN)) != PTRS_PER_PGD - 1);
 
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	/*
+	 * On charlotte the hierarchical PMD_TABLE_PXN ends up covering the
+	 * module init text; set_memory_x() only clears the leaf PXN, so the
+	 * range stays non-executable.  Keep NX on the leaf descriptors only.
+	 */
+	if (charlotte_pgtable_sync)
+		flags &= ~NO_EXEC_MAPPINGS;
+#endif
+
 	arm64_kfence_map_pool();
 
 	linear_map_requires_bbml3 = !force_pte_mapping() && can_set_direct_map();
