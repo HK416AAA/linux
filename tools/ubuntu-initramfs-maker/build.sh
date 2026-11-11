@@ -173,6 +173,7 @@ UNIT
 #     64 KiB snapshot of the previous boot in /sys/kernel/charlotte_previous_ramlog.
 #     Archive those plus the current dmesg into /var/log/uart on the ext4
 #     root, and make journald store kernel logs on disk as well.
+mkdir -p /etc/systemd/journald.conf.d /etc/tmpfiles.d
 cat > /etc/systemd/journald.conf.d/10-persistent.conf <<'JOURNAL'
 [Journal]
 Storage=persistent
