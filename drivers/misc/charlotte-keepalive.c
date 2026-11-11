@@ -75,6 +75,13 @@ void charlotte_bbox_checkpoint(const char *s);
 
 /* vendor default-timeout = 24 s; kick period = timeout/2/3 = 4 s */
 #define KICK_PERIOD_MS		4000
+/* Short reset window for the pre-initcall phase.  setup_arch() hands off
+ * long before do_initcalls() arms the periodic timer, so a hang there would
+ * otherwise keep the board alive forever and lose the pstore copy. */
+#define BOOT_WDT_TIMEOUT	60
+/* If userspace never starts, stop feeding so the hardware resets the board
+ * and the ramlog in DRAM survives the warm reboot. */
+#define BOOT_DEADLINE_SEC	120
 
 static void __iomem *wdt_base;
 static void __iomem *ipc_base;
@@ -82,9 +89,15 @@ static struct timer_list keepalive_timer;
 static unsigned long mbx5_sent, mbx5_busy, wdt_kicks;
 static bool panic_seen;
 static bool poweroff_seen;
+static bool boot_ok;
+
+void charlotte_boot_ok(void)
+{
+	WRITE_ONCE(boot_ok, true);
+}
 
 /* Keep feeding on healthy boots; allow several minutes for panic capture. */
-static unsigned int timeout = 300;
+static unsigned int timeout = 120;
 module_param(timeout, uint, 0444);
 MODULE_PARM_DESC(timeout, "Local watchdog and LPM3 recovery timeout in seconds");
 
@@ -205,6 +218,16 @@ static void keepalive_tick(struct timer_list *t)
 	if (READ_ONCE(panic_seen) || READ_ONCE(poweroff_seen))
 		return;
 
+	if (!READ_ONCE(boot_ok) &&
+	    ktime_get_boottime_seconds() >= BOOT_DEADLINE_SEC) {
+		pr_warn("charlotte-keepalive: userspace not reached in %us; stop feeding, hardware recovery within %us\n",
+			BOOT_DEADLINE_SEC, timeout);
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+		charlotte_bbox_checkpoint("E:BOOT_TIMEOUT\n");
+#endif
+		return;
+	}
+
 	/* Match the absolute boot-time threshold used by the diagnostic scripts.
 	 * Counting callbacks extends the window whenever timer delivery is late.
 	 */
@@ -251,7 +274,7 @@ void charlotte_keepalive_early_poke(void)
 
 	w = early_ioremap(WDT_BASE, 0x100);
 	if (w) {
-		wdt_configure(w, timeout);
+		wdt_configure(w, BOOT_WDT_TIMEOUT);
 		early_iounmap(w, 0x100);
 	}
 

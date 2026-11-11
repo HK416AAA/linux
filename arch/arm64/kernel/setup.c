@@ -61,6 +61,9 @@
 void charlotte_ckpt(const char *tag);
 void charlotte_ckpt_hex(const char *tag, unsigned long long v);
 #endif
+#ifdef CONFIG_CHARLOTTE_KEEPALIVE
+void charlotte_keepalive_early_poke(void);
+#endif
 
 static int num_standard_resources;
 static struct resource *standard_resources;
@@ -345,6 +348,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	early_fixmap_init();
 	early_ioremap_init();
+#ifdef CONFIG_CHARLOTTE_KEEPALIVE
+	/* Arm the V500 watchdog before touching the FDT: a hang in this
+	 * function must reset the board so the pstore copy survives. */
+	charlotte_keepalive_early_poke();
+#endif
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	/* First checkpoint: early_memremap is only valid from here on.
 	 * (Calling it any earlier returns slot_virt[] == 0, i.e. a
@@ -413,6 +421,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 					 bl_size, PAGE_SIZE);
 			for (i = 0; i < n; i++)
 				clear_fixmap(FIX_FDT - i);
+			charlotte_ckpt("E:FDT_CLEARED\n");
 		}
 
 		if (em && be32_to_cpup(em) == 0xd00dfeed) {

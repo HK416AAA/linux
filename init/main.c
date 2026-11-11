@@ -124,6 +124,9 @@
 void charlotte_keepalive_early_poke(void);
 void charlotte_ckpt(const char *tag);
 #endif
+#ifdef CONFIG_CHARLOTTE_KEEPALIVE
+void charlotte_boot_ok(void);
+#endif
 
 static int kernel_init(void *);
 
@@ -1615,6 +1618,12 @@ static int __ref kernel_init(void *unused)
 	rcu_end_inkernel_boot();
 
 	do_sysctl_args();
+
+#ifdef CONFIG_CHARLOTTE_KEEPALIVE
+	/* From here on the boot CPU only has userspace left to run; let the
+	 * keepalive keep feeding the V500 watchdog. */
+	charlotte_boot_ok();
+#endif
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);

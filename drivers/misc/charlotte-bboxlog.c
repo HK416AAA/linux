@@ -49,6 +49,13 @@
 #include <asm/ptrace.h>
 
 #define RAMLOG_PA	(0x2fc40000UL + 0x60000UL)
+/* Second copy in the first dmesg record.  The stock kernel exposes it as
+ * /sys/fs/pstore/dmesg-ramoops-0, which its console backend does not touch
+ * on a normal boot (only an oops writes a new record).  The console zone is
+ * overwritten by the recovering stock boot long before a human can read it. */
+#define RAMLOG_DM_PA	0x2fc40000UL
+#define RAMLOG_DM_CAP	0x20000U	/* record-size */
+#define RAMLOG_DM_ASCII	8U		/* "====0.0\n" dmesg header */
 #define RAMLOG_SIG	0x43474244U
 #define RAMLOG_CAP	0x12000U	/* C log area; record0 mirror maps separately */
 #define RAMLOG_HDR	12U		/* sig + start + size */
@@ -65,6 +72,7 @@ static u32 woff;
 static u32 dropped;
 static bool banner_done;
 static void __iomem *ramlog_map;
+static void __iomem *ramlog_dm_map;
 static DEFINE_RAW_SPINLOCK(ramlog_lock);
 /* Snapshot before this boot writes its first byte over the preceding boot. */
 static u8 previous_ramlog[0x10000];
@@ -76,13 +84,14 @@ static void ramlog_emit(const char *s, size_t n)
 	bool armed = state == ST_ARMED;
 	unsigned long flags = 0, p;
 	size_t start;
-	void __iomem *m;
+	void __iomem *m, *dm;
 
 	if (state == ST_TRANS)
 		return;
 	m = armed ? ramlog_map : early_memremap(RAMLOG_PA, RAMLOG_CAP);
 	if (!m)
 		return;
+	dm = armed ? ramlog_dm_map : early_memremap(RAMLOG_DM_PA, RAMLOG_DM_CAP);
 	if (!previous_saved) {
 		memcpy_fromio(previous_ramlog, m, sizeof(previous_ramlog));
 		previous_saved = true;
@@ -106,10 +115,33 @@ static void ramlog_emit(const char *s, size_t n)
 	     n && p < (unsigned long)(m + RAMLOG_HDR + woff); p += 64)
 		asm volatile("dc cvac, %0" :: "r"(p) : "memory");
 	asm volatile("dsb sy" ::: "memory");
+
+	/* Mirror into the first dmesg record so the recovering stock kernel
+	 * can hand it out as /sys/fs/pstore/dmesg-ramoops-0.  A dmesg record
+	 * is a persistent_ram buffer at offset 0 (sig/start/size) whose data
+	 * must start with the ASCII "====<sec>.<usec>\n" header, otherwise
+	 * ramoops_read_kmsg_hdr() rejects and zaps the whole zone. */
+	if (dm) {
+		memcpy_fromio(dm + RAMLOG_HDR + RAMLOG_DM_ASCII,
+			      m + RAMLOG_HDR, woff);
+		memcpy(dm + RAMLOG_HDR, "====0.0\n", RAMLOG_DM_ASCII);
+		iowrite32(0, dm + 4);
+		iowrite32(RAMLOG_DM_ASCII + woff, dm + 8);
+		iowrite32(RAMLOG_SIG, dm);
+		for (p = (unsigned long)dm & ~63UL;
+		     p < (unsigned long)(dm + RAMLOG_HDR + RAMLOG_DM_ASCII + woff);
+		     p += 64)
+			asm volatile("dc cvac, %0" :: "r"(p) : "memory");
+		asm volatile("dsb sy" ::: "memory");
+	}
+
 	if (armed)
 		raw_spin_unlock_irqrestore(&ramlog_lock, flags);
-	else
+	else {
 		early_memunmap(m, RAMLOG_CAP);
+		if (dm)
+			early_memunmap(dm, RAMLOG_DM_CAP);
+	}
 }
 
 static void ramlog_line(const char *tag)
@@ -404,6 +436,9 @@ static int __init ramlog_arm(void)
 		state = ST_TRANS;
 		return -ENOMEM;
 	}
+	ramlog_dm_map = memremap(RAMLOG_DM_PA, RAMLOG_DM_CAP, MEMREMAP_WB);
+	if (!ramlog_dm_map)
+		pr_warn("charlotte-ramlog: dmesg mirror mapping failed\n");
 	state = ST_ARMED;
 	if (dropped) {
 		char note[48];
