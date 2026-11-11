@@ -201,6 +201,10 @@
 	chosen {
 		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=tty0 console=ttyHW0,115200 ignore_loglevel loglevel=8 log_buf_len=4M nokaslr";
 		stdout-path = "serial0:115200n8";
+		/* Placeholders for setup.c to overwrite in place; adding new
+		 * properties on the flat blob fails without string space. */
+		linux,initrd-start = <0x0 0x66800000>;
+		linux,initrd-end = <0x0 0x66800000>;
 	};
 
 	/* Live MRO-W00 (12 GiB) FDT: one NUMA node below 4 GiB plus the
