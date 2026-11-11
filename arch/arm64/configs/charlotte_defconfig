@@ -2029,7 +2029,7 @@ CONFIG_USB_DWC3_CHARLOTTE=y
 # CONFIG_ARM_PMU_ACPI is not set
 CONFIG_INITRAMFS_SOURCE="../tools/ubuntu-initramfs-maker/charlotte-initramfs/charlotte-initramfs.cpio.gz"
 CONFIG_INITRAMFS_FORCE=y
-CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=ttyHW0,115200 console=tty0 loglevel=5 nokaslr debug.exception-trace=1 id_aa64isar0.atomic=0 charlotte_keepalive.timeout=300 g_cdc.host_addr=02:00:ca:00:00:01 g_cdc.dev_addr=02:00:ca:00:00:02 charlotte_cpu_diag.enabled=0"
+CONFIG_CMDLINE="earlycon=uart_v500,mmio32,0xffb82000 console=tty0 console=ttyHW0,115200 loglevel=5 nokaslr debug.exception-trace=1 id_aa64isar0.atomic=0 charlotte_keepalive.timeout=300 g_cdc.host_addr=02:00:ca:00:00:01 g_cdc.dev_addr=02:00:ca:00:00:02 charlotte_cpu_diag.enabled=0"
 CONFIG_CMDLINE_FORCE=y
 CONFIG_ARM64_VA_BITS_39=y
 CONFIG_ARM64_PAGE_SIZE_4KB=y
