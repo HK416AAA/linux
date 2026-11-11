@@ -1622,6 +1622,9 @@ static int __ref kernel_init(void *unused)
 #ifdef CONFIG_CHARLOTTE_KEEPALIVE
 	/* From here on the boot CPU only has userspace left to run; let the
 	 * keepalive keep feeding the V500 watchdog. */
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	charlotte_ckpt("E:RUN_INIT\n");
+#endif
 	charlotte_boot_ok();
 #endif
 

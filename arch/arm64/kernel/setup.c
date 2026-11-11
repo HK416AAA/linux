@@ -409,6 +409,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 						      istart);
 			iend = charlotte_fdt_initrd(bl, "linux,initrd-end",
 						    iend);
+			/* Some bootloaders log/provide the ramdisk length
+			 * instead of the absolute end address.  An end below
+			 * the start is only meaningful as a length. */
+			if (iend && iend <= istart)
+				iend += istart;
 			charlotte_ckpt_hex("E:FDT_INITRD_BL ", istart);
 			charlotte_ckpt_hex("E:FDT_INITRD_BE ", iend);
 
