@@ -23,8 +23,12 @@ jobs:
       - name: Install build dependencies
         run: |
           # The image ships most of these already; the cross toolchain and
-          # dtc come from apt.  Cap the update so a slow mirror cannot
-          # hold the job open for the whole workflow timeout.
+          # dtc come from apt.  The hosted runner's resolver has been
+          # failing on the Ubuntu mirrors, so pin the canonical addresses
+          # for this step; drop the pins once the resolver recovers.
+          echo "91.189.91.83 archive.ubuntu.com" | sudo tee -a /etc/hosts
+          echo "91.189.92.23 security.ubuntu.com" | sudo tee -a /etc/hosts
+          echo "91.189.91.83 azure.archive.ubuntu.com" | sudo tee -a /etc/hosts
           sudo timeout 180 apt-get -o Acquire::http::Timeout=10 \
             -o Acquire::https::Timeout=10 -o Acquire::Retries=1 update || true
           sudo DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y \
