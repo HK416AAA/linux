@@ -123,6 +123,7 @@
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 void charlotte_keepalive_early_poke(void);
 void charlotte_ckpt(const char *tag);
+void charlotte_ramlog_flush_partition(void);
 #endif
 #ifdef CONFIG_CHARLOTTE_KEEPALIVE
 void charlotte_boot_ok(void);
@@ -1626,6 +1627,9 @@ static int __ref kernel_init(void *unused)
 	charlotte_ckpt("E:RUN_INIT\n");
 #endif
 	charlotte_boot_ok();
+#endif
+#ifdef CONFIG_CHARLOTTE_BBOXLOG
+	charlotte_ramlog_flush_partition();
 #endif
 
 	if (ramdisk_execute_command) {

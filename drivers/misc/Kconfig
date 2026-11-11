@@ -610,6 +610,28 @@ config CHARLOTTE_BBOXLOG
 	  reserved memory so they survive LPM3 resets and can be read
 	  from the vendor last_kmsg after re-flashing stock.
 
+config CHARLOTTE_BBOXLOG_PART
+	string "Partition for the persistent ramlog copy"
+	depends on CHARLOTTE_BBOXLOG
+	default "dfx"
+	help
+	  GPT partition name that receives a copy of the kernel ramlog
+	  before userspace starts.  The copy sits at the end of the
+	  partition and carries a CHRLOG01 magic so the stock shell can
+	  find it with "dd if=/dev/block/by-name/<part> | strings".
+	  Use an empty string to disable the partition copy.
+
+config CHARLOTTE_BBOXLOG_PART_TAIL_KB
+	int "Persistent ramlog copy size (KiB)"
+	depends on CHARLOTTE_BBOXLOG
+	range 16 4096
+	default 128
+	help
+	  Size of the tail region reserved at the end of the partition.
+	  The writer refuses to touch a tail region that holds data not
+	  written by this driver, so a vendor log already stored there
+	  is left intact.
+
 endmenu
 
 config CHARLOTTE_KEEPALIVE

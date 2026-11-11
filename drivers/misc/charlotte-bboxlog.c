@@ -31,6 +31,10 @@
 
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/blkdev.h>
+#include <linux/crc32.h>
+#include <linux/fs.h>
+#include <linux/ktime.h>
 #include <linux/io.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/kernel.h>
@@ -535,6 +539,149 @@ static int __init ramlog_notify(void)
 	return 0;
 }
 late_initcall(ramlog_notify);
+
+/* ------------------------------------------------------------------ partition
+ *
+ * The stock fallback kernel has no pstore, so a RAM-only copy needs
+ * /dev/mem access.  Also keep a copy on a real partition that survives a
+ * cold reset and is readable with plain "dd if=/dev/block/by-name/<part>".
+ * The copy lives in the last PART_TAIL_KB of the partition, starts with
+ * CHRLOG01 + len + crc + boot time, and is only written when that tail
+ * region is blank or already ours.  A vendor log stored there is left
+ * untouched.
+ */
+#define RAMLOG_PART_MAGIC	"CHRLOG01"
+#define RAMLOG_PART_TAIL_KB	CONFIG_CHARLOTTE_BBOXLOG_PART_TAIL_KB
+#define RAMLOG_PART_TAIL	(RAMLOG_PART_TAIL_KB * 1024U)
+#define RAMLOG_PART_MAXLOG	(RAMLOG_CAP - RAMLOG_HDR)
+
+struct ramlog_part_hdr {
+	char magic[8];
+	__le32 len;
+	__le32 crc;
+	__le64 seq;
+	__le64 ktime;
+} __packed;
+
+static char ramlog_part_buf[RAMLOG_PART_TAIL] __aligned(4096);
+static u64 ramlog_part_seq;
+static dev_t ramlog_part_devt;
+
+static int ramlog_part_match(struct device *dev, void *data)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	const char *want = data;
+	struct block_device *bdev = disk->part0;
+
+	if (bdev && bdev->bd_meta_info && bdev->bd_meta_info->volname[0] &&
+	    !strcmp(bdev->bd_meta_info->volname, want)) {
+		ramlog_part_devt = disk_devt(disk);
+		return 1;
+	}
+	return 0;
+}
+
+static bool ramlog_part_tail_usable(const u8 *buf, size_t n)
+{
+	bool zero = true, erased = true;
+	size_t i;
+
+	if (!memcmp(buf, RAMLOG_PART_MAGIC, 8))
+		return true;
+	for (i = 0; i < n; i++) {
+		if (buf[i])
+			zero = false;
+		if (buf[i] != 0xff)
+			erased = false;
+		if (!zero && !erased)
+			return false;
+	}
+	return true;
+}
+
+void charlotte_ramlog_flush_partition(void)
+{
+	const char *part = CONFIG_CHARLOTTE_BBOXLOG_PART;
+	struct ramlog_part_hdr *hdr = (void *)ramlog_part_buf;
+	struct file *f;
+	loff_t size, pos;
+	unsigned long flags;
+	u32 len, crc;
+	ssize_t n;
+	int ret;
+
+	if (!part[0] || state != ST_ARMED || !ramlog_map)
+		return;
+
+	ramlog_part_devt = 0;
+	class_for_each_device(&block_class, NULL, part, ramlog_part_match);
+	if (!ramlog_part_devt) {
+		pr_warn("charlotte-ramlog: partition %s not found\n", part);
+		return;
+	}
+
+	f = bdev_file_open_by_dev(ramlog_part_devt, BLK_OPEN_READ | BLK_OPEN_WRITE,
+				  NULL, NULL);
+	if (IS_ERR(f)) {
+		pr_warn("charlotte-ramlog: cannot open %s: %ld\n", part,
+			PTR_ERR(f));
+		return;
+	}
+	size = bdev_nr_bytes(file_bdev(f));
+	if (size < (loff_t)RAMLOG_PART_TAIL + SZ_1M) {
+		pr_warn("charlotte-ramlog: %s too small (%lld)\n", part, size);
+		goto out;
+	}
+	pos = size - RAMLOG_PART_TAIL;
+
+	n = kernel_read(f, ramlog_part_buf, RAMLOG_PART_TAIL, &pos);
+	if (n != RAMLOG_PART_TAIL) {
+		pr_warn("charlotte-ramlog: %s tail read %zd\n", part, n);
+		goto out;
+	}
+	if (!ramlog_part_tail_usable((u8 *)ramlog_part_buf, RAMLOG_PART_TAIL)) {
+		pr_warn("charlotte-ramlog: %s tail holds other data, skip\n",
+			part);
+		goto out;
+	}
+
+	if (!memcmp(hdr->magic, RAMLOG_PART_MAGIC, 8))
+		ramlog_part_seq = le64_to_cpu(hdr->seq) + 1;
+	else
+		ramlog_part_seq = 1;
+
+	raw_spin_lock_irqsave(&ramlog_lock, flags);
+	len = woff;
+	if (len > RAMLOG_PART_MAXLOG)
+		len = RAMLOG_PART_MAXLOG;
+	if (len > RAMLOG_PART_TAIL - sizeof(*hdr))
+		len = RAMLOG_PART_TAIL - sizeof(*hdr);
+	memcpy_fromio(ramlog_part_buf + sizeof(*hdr),
+		      ramlog_map + RAMLOG_HDR, len);
+	raw_spin_unlock_irqrestore(&ramlog_lock, flags);
+
+	memcpy(hdr->magic, RAMLOG_PART_MAGIC, 8);
+	hdr->len = cpu_to_le32(len);
+	hdr->seq = cpu_to_le64(ramlog_part_seq);
+	hdr->ktime = cpu_to_le64(ktime_get_boottime());
+	crc = crc32_le(0, ramlog_part_buf + sizeof(*hdr), len);
+	hdr->crc = cpu_to_le32(crc);
+
+	pos = size - RAMLOG_PART_TAIL;
+	n = kernel_write(f, ramlog_part_buf, sizeof(*hdr) + len, &pos);
+	if (n != (ssize_t)(sizeof(*hdr) + len)) {
+		pr_warn("charlotte-ramlog: %s tail write %zd\n", part, n);
+		goto out;
+	}
+	ret = vfs_fsync(f, 1);
+	if (ret)
+		pr_warn("charlotte-ramlog: %s fsync %d\n", part, ret);
+	else
+		pr_info("charlotte-ramlog: %u bytes copied to %s tail\n",
+			len, part);
+out:
+	fput(f);
+}
 
 static ssize_t charlotte_stage_store(struct kobject *kobj,
 				     struct kobj_attribute *attr,
