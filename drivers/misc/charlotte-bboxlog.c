@@ -413,6 +413,8 @@ static int __init ramlog_arm(void)
 		ramlog_line(note);
 	}
 	ramlog_line("E:RAMLOG_ARMED\n");
+	pr_info("charlotte-ramlog: armed at 0x%lx, previous=%s, dropped=%u\n",
+		RAMLOG_PA, previous_saved ? "saved" : "empty", dropped);
 	return 0;
 }
 early_initcall(ramlog_arm);
@@ -432,6 +434,33 @@ static int __init ramlog_notify(void)
 	return 0;
 }
 late_initcall(ramlog_notify);
+
+static ssize_t charlotte_stage_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	char note[128];
+	size_t n = count;
+
+	if (n > sizeof(note) - 2)
+		n = sizeof(note) - 2;
+	memcpy(note, buf, n);
+	while (n && (note[n - 1] == '\n' || note[n - 1] == '\r'))
+		n--;
+	note[n++] = '\n';
+	note[n] = '\0';
+	ramlog_line(note);
+	return count;
+}
+
+static struct kobj_attribute charlotte_stage_attr =
+	__ATTR(charlotte_stage, 0200, NULL, charlotte_stage_store);
+
+static int __init ramlog_stage_export(void)
+{
+	return sysfs_create_file(kernel_kobj, &charlotte_stage_attr.attr);
+}
+late_initcall(ramlog_stage_export);
 
 static BIN_ATTR_SIMPLE_ADMIN_RO(charlotte_previous_ramlog);
 

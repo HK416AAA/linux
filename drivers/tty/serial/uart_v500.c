@@ -733,6 +733,10 @@ static int uart_v500_console_setup(struct console *co, char *options)
 
 	int ret = uart_set_options(&uap->port, co, baud, parity, bits, flow);
 
+	if (!ret)
+		pr_info("ttyHW%d console at %d%c%d\n", co->index, baud, parity,
+			bits);
+
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	/* The real console is up from here; stop mirroring earlycon to
 	 * avoid duplicating every printk line in the ramlog. */
@@ -896,6 +900,10 @@ static int uart_v500_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, uap);
+
+	dev_info(&pdev->dev, "ttyHW%d at 0x%llx irq %d uartclk %lu\n",
+		 index, (unsigned long long)res->start, uap->port.irq,
+		 uap->port.uartclk);
 
 	return 0;
 }

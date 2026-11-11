@@ -178,9 +178,25 @@ cat > /etc/systemd/journald.conf.d/10-persistent.conf <<'JOURNAL'
 Storage=persistent
 SystemMaxUse=256M
 RuntimeMaxUse=64M
+ForwardToKMsg=yes
+MaxLevelKMsg=notice
 JOURNAL
 
 mkdir -p /usr/local/sbin
+
+cat > /usr/local/sbin/charlotte-stage <<'STAGE'
+#!/bin/sh
+msg="$*"
+[ -n "$msg" ] || exit 0
+line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $msg"
+if [ -w /sys/kernel/charlotte_stage ]; then
+	printf '%s\n' "$line" > /sys/kernel/charlotte_stage 2>/dev/null || true
+fi
+if [ -w /dev/pmsg0 ]; then
+	printf '%s\n' "$line" > /dev/pmsg0 2>/dev/null || true
+fi
+exit 0
+STAGE
 
 cat > /usr/local/sbin/uart-log-archive <<'ARCHIVE'
 #!/bin/sh
@@ -200,6 +216,16 @@ for f in /sys/fs/pstore/*; do
 	cp "$f" "$LOG/$(basename "$f")-$stamp.log" || true
 done
 dmesg > "$LOG/dmesg-$stamp-$boot.log" 2>/dev/null || true
+{
+	printf 'cmdline: '
+	cat /proc/cmdline 2>/dev/null || true
+	printf '\nbootargs: '
+	tr -d '\0' < /proc/device-tree/chosen/bootargs 2>/dev/null || true
+	printf '\nmodel: '
+	tr -d '\0' < /proc/device-tree/model 2>/dev/null || true
+	printf '\n'
+} > "$LOG/cmdline-$stamp-$boot.log" 2>/dev/null || true
+/usr/local/sbin/charlotte-stage "archived pstore for $boot"
 
 prev=$(ls -1t "$LOG"/previous-*.log 2>/dev/null | head -n 1 || true)
 [ -n "$prev" ] && ln -sfn "$(basename "$prev")" "$LOG/previous-boot.log"
@@ -224,7 +250,45 @@ dmesg > "$tmp" 2>/dev/null || true
 mv "$tmp" "$LOG/dmesg-latest.log"
 SNAPSHOT
 
-chmod 0755 /usr/local/sbin/uart-log-archive /usr/local/sbin/uart-dmesg-snapshot
+cat > /usr/local/sbin/uart-boot-snapshot <<'BOOT'
+#!/bin/sh
+set -u
+LOG=/var/log/uart
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+mkdir -p "$LOG"
+file="$LOG/boot-$stamp-$boot.log"
+{
+	printf 'boot %s %s\n' "$stamp" "$boot"
+	printf 'model: '
+	tr -d '\0' < /proc/device-tree/model 2>/dev/null || true
+	printf '\nbootargs: '
+	tr -d '\0' < /proc/device-tree/chosen/bootargs 2>/dev/null || true
+	printf '\ncmdline: '
+	cat /proc/cmdline 2>/dev/null || true
+	printf '\n'
+	dmesg 2>/dev/null || true
+} > "$file" 2>/dev/null || true
+ln -sfn "$(basename "$file")" "$LOG/boot-last.log" 2>/dev/null || true
+/usr/local/sbin/charlotte-stage "userspace boot snapshot"
+exit 0
+BOOT
+
+cat > /usr/local/sbin/uart-shutdown-snapshot <<'SHUTDOWN'
+#!/bin/sh
+LOG=/var/log/uart
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$LOG" 2>/dev/null || true
+dmesg > "$LOG/shutdown-$stamp.log" 2>/dev/null || true
+/usr/local/sbin/charlotte-stage "userspace shutdown"
+exit 0
+SHUTDOWN
+
+chmod 0755 /usr/local/sbin/charlotte-stage \
+	/usr/local/sbin/uart-log-archive \
+	/usr/local/sbin/uart-dmesg-snapshot \
+	/usr/local/sbin/uart-boot-snapshot \
+	/usr/local/sbin/uart-shutdown-snapshot
 
 cat > /etc/systemd/system/uart-log-archive.service <<'UNIT'
 [Unit]
@@ -263,6 +327,41 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 UNIT
 
+cat > /etc/systemd/system/uart-boot-snapshot.service <<'UNIT'
+[Unit]
+Description=Snapshot early boot UART/pstore state to /var/log/uart
+After=local-fs.target
+Before=serial-getty@ttyHW0.service serial-getty@ttyGS0.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/uart-boot-snapshot
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/uart-shutdown-snapshot.service <<'UNIT'
+[Unit]
+Description=Snapshot final UART/pstore state before poweroff
+DefaultDependencies=no
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/uart-shutdown-snapshot
+
+[Install]
+WantedBy=shutdown.target
+UNIT
+
+cat > /etc/tmpfiles.d/uart-log.conf <<'TMPFILES'
+d /var/log/uart 0755 root root -
+TMPFILES
+
 cat > /etc/profile.d/uart-session-log.sh <<'SESSION'
 [ -n "${UART_SESSION_LOGGED:-}" ] && return 0
 _uart_tty=$(tty 2>/dev/null) || return 0
@@ -278,6 +377,8 @@ SESSION
 chmod 0644 /etc/profile.d/uart-session-log.sh
 
 systemctl enable uart-log-archive.service
+systemctl enable uart-boot-snapshot.service
+systemctl enable uart-shutdown-snapshot.service
 systemctl enable uart-dmesg-snapshot.timer
 
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'GETTY'
@@ -304,7 +405,8 @@ ln -snf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 /usr/sbin/sshd -t
 for unit in ssh.service getty@tty1.service \
 	serial-getty@ttyHW0.service serial-getty@ttyGS0.service \
-	usb-gadget.service uart-log-archive.service uart-dmesg-snapshot.timer \
+	usb-gadget.service uart-log-archive.service uart-boot-snapshot.service \
+	uart-shutdown-snapshot.service uart-dmesg-snapshot.timer \
 	systemd-networkd.service systemd-resolved.service; do
 	systemctl is-enabled --quiet "$unit"
 done
