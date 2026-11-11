@@ -36,6 +36,20 @@ jobs:
         run: |
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs
 
+      - name: Embed device tree into Image
+        run: |
+          mkdir -p out
+          python3 tools/charlotte/embed_dtb.py \
+            --image arch/arm64/boot/Image \
+            --dtb arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb \
+            --out out/Image-7.3-mro-w00-dtb > out/Image-7.3-mro-w00-dtb.info.txt
+          cat out/Image-7.3-mro-w00-dtb.info.txt
+          python3 tools/charlotte/embed_dtb.py \
+            --image arch/arm64/boot/Image \
+            --dtb arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb \
+            --out out/Image-7.3-tgr-w00-dtb > out/Image-7.3-tgr-w00-dtb.info.txt
+          cat out/Image-7.3-tgr-w00-dtb.info.txt
+
       - name: Collect artifacts
         run: |
           mkdir -p out
