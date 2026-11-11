@@ -395,12 +395,24 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 		bool ok = false;
 
 		if (bl) {
+			int i, n;
+
 			istart = charlotte_fdt_initrd(bl, "linux,initrd-start",
 						      istart);
 			iend = charlotte_fdt_initrd(bl, "linux,initrd-end",
 						    iend);
 			charlotte_ckpt_hex("E:FDT_INITRD_BL ", istart);
 			charlotte_ckpt_hex("E:FDT_INITRD_BE ", iend);
+
+			/* Drop the bootloader-tree mapping before
+			 * setup_machine_fdt() remaps the same fixmap slot
+			 * at the embedded tree's physical address.
+			 * init_pte() BUGs when a live PTE changes PFN,
+			 * so the old entries must be cleared first. */
+			n = DIV_ROUND_UP((__fdt_pointer & (PAGE_SIZE - 1)) +
+					 bl_size, PAGE_SIZE);
+			for (i = 0; i < n; i++)
+				clear_fixmap(FIX_FDT - i);
 		}
 
 		if (em && be32_to_cpup(em) == 0xd00dfeed) {
