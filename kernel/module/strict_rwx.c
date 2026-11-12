@@ -36,8 +36,6 @@ int module_enable_text_rox(const struct module *mod)
 		const struct module_memory *mem = &mod->mem[type];
 		int ret;
 
-		charlotte_dump_table_pxn("pre-rox", (unsigned long)mem->base,
-					 mem->size);
 		if (mem->is_rox)
 			ret = execmem_restore_rox(mem->base, mem->size);
 		else if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX))
@@ -46,7 +44,6 @@ int module_enable_text_rox(const struct module *mod)
 			ret = module_set_memory(mod, type, set_memory_x);
 		if (ret)
 			return ret;
-		charlotte_clear_table_pxn((unsigned long)mem->base, mem->size);
 	}
 	return 0;
 }

@@ -43,11 +43,9 @@
 #include <asm/kvm_host.h>
 #include <asm/memory.h>
 #include <asm/numa.h>
-#include <asm/pgtable-hwdef.h>
 #include <asm/rsi.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
-#include <asm/set_memory.h>
 #include <linux/sizes.h>
 #include <asm/tlb.h>
 #include <asm/alternative.h>
@@ -517,9 +515,6 @@ struct execmem_info __init *execmem_arch_setup(void)
 {
 	unsigned long fallback_start = 0, fallback_end = 0;
 	unsigned long start = 0, end = 0;
-#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	bool charlotte_clean_range = false;
-#endif
 
 	module_init_limits();
 
@@ -539,16 +534,6 @@ struct execmem_info __init *execmem_arch_setup(void)
 		start = module_plt_base;
 		end = module_plt_base + SZ_2G;
 	}
-
-#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	charlotte_clean_range = charlotte_exec_window(&start, &end);
-	if (charlotte_clean_range) {
-		fallback_start = 0;
-		fallback_end = 0;
-		pr_info("charlotte-pt: execmem range %#lx..%#lx\n",
-			start, end);
-	}
-#endif
 
 	execmem_info = (struct execmem_info){
 		.ranges = {
@@ -574,19 +559,6 @@ struct execmem_info __init *execmem_arch_setup(void)
 			},
 		},
 	};
-
-#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	/*
-	 * Kprobes and BPF also need executable memory; keep them out of the
-	 * firmware-poisoned vmalloc windows as well.
-	 */
-	if (charlotte_clean_range) {
-		execmem_info.ranges[EXECMEM_KPROBES].start = start;
-		execmem_info.ranges[EXECMEM_KPROBES].end = end;
-		execmem_info.ranges[EXECMEM_BPF].start = start;
-		execmem_info.ranges[EXECMEM_BPF].end = end;
-	}
-#endif
 
 	return &execmem_info;
 }

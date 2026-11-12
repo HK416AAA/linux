@@ -818,10 +818,8 @@ extern void set_swapper_pgd(pgd_t *pgdp, pgd_t pgd);
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
 void charlotte_sync_pmd_store(pmd_t *pmdp);
-void charlotte_sync_table_store(void *p);
 #else
 static inline void charlotte_sync_pmd_store(pmd_t *pmdp) { }
-static inline void charlotte_sync_table_store(void *p) { }
 #endif
 
 static inline bool in_swapper_pgdir(void *addr)
