@@ -236,7 +236,7 @@ static int alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
 		pmdval_t pmdval = PMD_TYPE_TABLE | PMD_TABLE_UXN | PMD_TABLE_AF;
 		phys_addr_t pte_phys;
 
-		if (flags & NO_EXEC_MAPPINGS)
+		if ((flags & NO_EXEC_MAPPINGS) && !charlotte_skip_table_pxn())
 			pmdval |= PMD_TABLE_PXN;
 		BUG_ON(!pgtable_alloc);
 		pte_phys = pgtable_alloc(PGTABLE_LEVEL_PTE);
@@ -348,7 +348,7 @@ static int alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
 		pudval_t pudval = PUD_TYPE_TABLE | PUD_TABLE_UXN | PUD_TABLE_AF;
 		phys_addr_t pmd_phys;
 
-		if (flags & NO_EXEC_MAPPINGS)
+		if ((flags & NO_EXEC_MAPPINGS) && !charlotte_skip_table_pxn())
 			pudval |= PUD_TABLE_PXN;
 		BUG_ON(!pgtable_alloc);
 		pmd_phys = pgtable_alloc(PGTABLE_LEVEL_PMD);
@@ -402,7 +402,7 @@ static int alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 		p4dval_t p4dval = P4D_TYPE_TABLE | P4D_TABLE_UXN | P4D_TABLE_AF;
 		phys_addr_t pud_phys;
 
-		if (flags & NO_EXEC_MAPPINGS)
+		if ((flags & NO_EXEC_MAPPINGS) && !charlotte_skip_table_pxn())
 			p4dval |= P4D_TABLE_PXN;
 		BUG_ON(!pgtable_alloc);
 		pud_phys = pgtable_alloc(PGTABLE_LEVEL_PUD);
@@ -469,7 +469,7 @@ static int alloc_init_p4d(pgd_t *pgdp, unsigned long addr, unsigned long end,
 		pgdval_t pgdval = PGD_TYPE_TABLE | PGD_TABLE_UXN | PGD_TABLE_AF;
 		phys_addr_t p4d_phys;
 
-		if (flags & NO_EXEC_MAPPINGS)
+		if ((flags & NO_EXEC_MAPPINGS) && !charlotte_skip_table_pxn())
 			pgdval |= PGD_TABLE_PXN;
 		BUG_ON(!pgtable_alloc);
 		p4d_phys = pgtable_alloc(PGTABLE_LEVEL_P4D);
