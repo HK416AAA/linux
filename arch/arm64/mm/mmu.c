@@ -86,6 +86,44 @@ static bool charlotte_skip_table_pxn(void)
 }
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
+{
+	p4d_t *p4dp;
+	pud_t *pudp;
+
+	*pgdp = pgd_offset_k(addr);
+	*pmdp = NULL;
+	if (!(pgd_val(**pgdp) & PTE_VALID))
+		return;
+	p4dp = p4d_offset(*pgdp, addr);
+	pudp = pud_offset(p4dp, addr);
+	if (pud_present(*pudp) && !pud_leaf(*pudp))
+		*pmdp = pmd_offset(pudp, addr);
+}
+
+void charlotte_dump_table_pxn(const char *tag, unsigned long start,
+			      unsigned long size)
+{
+	unsigned long addr, end = start + size;
+
+	if (!charlotte_pgtable_sync || !start || !size)
+		return;
+
+	for (addr = start & PGDIR_MASK; addr < end; addr += PGDIR_SIZE) {
+		pgd_t *pgdp;
+		pmd_t *pmdp;
+		pgdval_t pgdval;
+		pmdval_t pmdval;
+
+		charlotte_pt_of(addr, &pgdp, &pmdp);
+		pgdval = pgd_val(*pgdp);
+		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
+		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx\n",
+			tag, (void *)addr, (unsigned long long)pgdval,
+			(unsigned long long)pmdval);
+	}
+}
+
 /*
  * The firmware on charlotte prepopulates top-level entries with PXNTable
  * (and APTable) for some vmalloc ranges, so pud_populate() sees a present
@@ -99,40 +137,32 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 	unsigned long addr, end = start + size;
 	bool changed = false;
 
-	if (!charlotte_pgtable_sync || !size)
+	if (!charlotte_pgtable_sync || !start || !size)
 		return;
 
 	for (addr = start & PGDIR_MASK; addr < end; addr += PGDIR_SIZE) {
-		pgd_t *pgdp = pgd_offset_k(addr);
-		p4d_t *p4dp;
-		pud_t *pudp;
+		pgd_t *pgdp;
 		pmd_t *pmdp;
 		pgdval_t pgdval, pmdval;
 
-		if (!pgd_present(*pgdp))
-			continue;
-
+		charlotte_pt_of(addr, &pgdp, &pmdp);
 		pgdval = pgd_val(*pgdp);
-		p4dp = p4d_offset(pgdp, addr);
-		pudp = pud_offset(p4dp, addr);
-
-		pmdval = 0;
-		pmdp = NULL;
-		if (pud_present(*pudp) && !pud_leaf(*pudp)) {
-			pmdp = pmd_offset(pudp, addr);
-			pmdval = pmd_table(*pmdp) ? pmd_val(*pmdp) : 0;
-		}
-		pr_info("charlotte-pt: pxn walk %px pgd=%016llx pmd=%016llx\n",
-			(void *)addr, (unsigned long long)pgdval,
-			(unsigned long long)pmdval);
-
+		if (!(pgdval & PTE_VALID))
+			continue;
+		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
 		if (pgdval & PGD_TABLE_PXN) {
 			set_pgd(pgdp, __pgd(pgdval & ~PGD_TABLE_PXN));
 			changed = true;
+			pr_info("charlotte-pt: clear pgd %px %016llx -> %016llx\n",
+				(void *)addr, (unsigned long long)pgdval,
+				(unsigned long long)pgd_val(*pgdp));
 		}
 		if (pmdval & PMD_TABLE_PXN) {
 			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
 			changed = true;
+			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx\n",
+				(void *)addr, (unsigned long long)pmdval,
+				(unsigned long long)pmd_val(*pmdp));
 		}
 	}
 
