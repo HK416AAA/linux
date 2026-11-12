@@ -130,50 +130,6 @@ bool __init charlotte_exec_window(unsigned long *start, unsigned long *end)
 	return true;
 }
 
-static pmd_t *charlotte_exec_pmd __initdata;
-
-static void __init charlotte_dump_exec_pmd(const char *tag)
-{
-	pmdval_t v;
-
-	if (!charlotte_exec_pmd)
-		return;
-	dcache_clean_inval_poc((unsigned long)charlotte_exec_pmd,
-			       (unsigned long)charlotte_exec_pmd + sizeof(pmd_t));
-	v = pmd_val(*charlotte_exec_pmd);
-	pr_info("charlotte-pt: %s exec pmd=%016llx pxn=%d ap=%d uxn=%d\n",
-		tag, (unsigned long long)v, !!(v & PMD_TABLE_PXN),
-		!!(v & S1_TABLE_AP), !!(v & PMD_TABLE_UXN));
-}
-
-static int __init charlotte_pmd_postcore(void)
-{
-	charlotte_dump_exec_pmd("postcore");
-	return 0;
-}
-postcore_initcall(charlotte_pmd_postcore);
-
-static int __init charlotte_pmd_arch(void)
-{
-	charlotte_dump_exec_pmd("arch");
-	return 0;
-}
-arch_initcall(charlotte_pmd_arch);
-
-static int __init charlotte_pmd_device(void)
-{
-	charlotte_dump_exec_pmd("device");
-	return 0;
-}
-device_initcall(charlotte_pmd_device);
-
-static int __init charlotte_pmd_late(void)
-{
-	charlotte_dump_exec_pmd("late");
-	return 0;
-}
-late_initcall(charlotte_pmd_late);
-
 static void __init charlotte_preseed_exec_ptes(void)
 {
 	unsigned long start, end, addr;
@@ -207,8 +163,6 @@ static void __init charlotte_preseed_exec_ptes(void)
 		want = __phys_to_pmd_val(__pa(ptep)) | PMD_TYPE_TABLE |
 		       PMD_TABLE_AF | PMD_TABLE_UXN;
 		set_pmd(pmdp, __pmd(want));
-		if (!charlotte_exec_pmd)
-			charlotte_exec_pmd = pmdp;
 		after = pmd_val(*pmdp);
 		if (after != want)
 			failed++;
@@ -225,7 +179,6 @@ static void __init charlotte_preseed_exec_ptes(void)
 
 	pr_info("charlotte-pt: seeded %d exec pmds (%d not kept) %#lx..%#lx\n",
 		seeded, failed, start, end);
-	charlotte_dump_exec_pmd("after-seed");
 }
 
 static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
@@ -357,17 +310,13 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 				(void *)seg, (unsigned long long)pgdval,
 				(unsigned long long)pgd_val(*pgdp));
 		}
-		if (pmdval & (PMD_TABLE_PXN | S1_TABLE_AP)) {
-			pmdval_t want = pmdval &
-					~(PMD_TABLE_PXN | S1_TABLE_AP);
-
-			set_pmd(pmdp, __pmd(want));
+		if (pmdval & PMD_TABLE_PXN) {
+			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
 			__flush_tlb_kernel_pgtable(seg);
 			changed = true;
-			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx (want %016llx)\n",
+			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx\n",
 				(void *)seg, (unsigned long long)pmdval,
-				(unsigned long long)pmd_val(*pmdp),
-				(unsigned long long)want);
+				(unsigned long long)pmd_val(*pmdp));
 		}
 	}
 
