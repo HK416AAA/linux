@@ -47,6 +47,7 @@
 #include <asm/tlbflush.h>
 #include <asm/pgalloc.h>
 #include <asm/kfence.h>
+#include <asm/cacheflush.h>
 
 #define NO_BLOCK_MAPPINGS	BIT(0)
 #define NO_CONT_MAPPINGS	BIT(1)
@@ -105,7 +106,7 @@ static bool charlotte_skip_table_pxn(void)
  * PXNTable, and preseed the PMD/PTE tables there while paging_init() is
  * still running so vmap() only ever has to write leaf PTEs.
  */
-bool __init charlotte_exec_window(unsigned long *start, unsigned long *end)
+bool charlotte_exec_window(unsigned long *start, unsigned long *end)
 {
 	unsigned long base, lo, hi;
 
@@ -195,6 +196,88 @@ static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pud_t **pudp,
 	*pudp = pud_offset(p4dp, addr);
 	if (pud_present(**pudp) && !pud_leaf(**pudp))
 		*pmdp = pmd_offset(*pudp, addr);
+}
+
+/*
+ * Diagnostic: prove whether an executable mapping built from a PMD *block*
+ * descriptor survives the firmware hardening.  The exec window's PUD entry
+ * carries no PXNTable, so a block leaf has a clean permission path, unlike
+ * the 3-level table path that the firmware keeps rewriting to PXN.
+ */
+static phys_addr_t charlotte_probe_pa;
+static bool charlotte_probe_used;
+
+static void __init charlotte_prepare_block_probe(void)
+{
+	u32 *insn;
+	unsigned long i;
+
+	insn = memblock_alloc(PMD_SIZE, PMD_SIZE);
+	if (!insn) {
+		pr_info("charlotte-pt: block probe page unavailable\n");
+		return;
+	}
+	insn[0] = 0xd503245f;	/* bti c, harmless when BTI is off */
+	for (i = 1; i < PMD_SIZE / sizeof(u32); i++)
+		insn[i] = 0xd65f03c0;	/* ret */
+	charlotte_probe_pa = __pa(insn);
+	dcache_clean_poc((unsigned long)insn,
+			 (unsigned long)insn + PMD_SIZE);
+	pr_info("charlotte-pt: block probe page pa=%pa\n", &charlotte_probe_pa);
+}
+
+static void charlotte_block_probe(void)
+{
+	unsigned long start = 0, end = 0, addr;
+	pmdval_t before, want, after;
+	pgd_t *pgdp;
+	pud_t *pudp;
+	pmd_t *pmdp;
+
+	if (charlotte_probe_used || !charlotte_probe_pa)
+		return;
+	charlotte_probe_used = true;
+
+	if (!charlotte_exec_window(&start, &end))
+		return;
+
+	/* execmem allocates from the bottom, so the last 2MB is free here. */
+	addr = end - PMD_SIZE;
+	charlotte_pt_of(addr, &pgdp, &pudp, &pmdp);
+	if (!pmdp || !pmd_table(*pmdp)) {
+		pr_info("charlotte-pt: block probe %#lx: no pmd table\n", addr);
+		return;
+	}
+
+	before = READ_ONCE(pmd_val(*pmdp));
+	want = __phys_to_pmd_val(charlotte_probe_pa) | PMD_TYPE_SECT |
+	       PMD_SECT_AF | PMD_SECT_S | PMD_SECT_RDONLY |
+	       PMD_ATTRINDX(MT_NORMAL) | PMD_SECT_UXN;
+	set_pmd(pmdp, __pmd(want));
+	charlotte_sync_table_store(pmdp);
+	dsb(ishst);
+	flush_tlb_all();
+
+	after = READ_ONCE(pmd_val(*pmdp));
+	pr_info("charlotte-pt: block probe %#lx pmd %016llx -> %016llx (want %016llx)\n",
+		addr, (unsigned long long)before, (unsigned long long)after,
+		(unsigned long long)want);
+	if (after == want) {
+		icache_inval_all_pou();
+		isb();
+		asm volatile("mov x9, %0\n\tblr x9"
+			     :: "r"(addr) : "x9", "x30", "memory");
+		pr_info("charlotte-pt: block probe executed ok\n");
+	} else {
+		pr_info("charlotte-pt: block probe write dropped\n");
+	}
+
+	set_pmd(pmdp, __pmd(before));
+	charlotte_sync_table_store(pmdp);
+	dsb(ishst);
+	flush_tlb_all();
+	pr_info("charlotte-pt: block probe restored %016llx\n",
+		(unsigned long long)READ_ONCE(pmd_val(*pmdp)));
 }
 
 #ifdef CONFIG_ARM64_CHARLOTTE_SYNC_LEAF_PTES
@@ -415,6 +498,8 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 		dsb(ishst);
 		flush_tlb_all();
 	}
+
+	charlotte_block_probe();
 }
 #endif
 
@@ -1636,6 +1721,14 @@ void mark_rodata_ro(void)
 
 	/* Map the kernel data/bss as invalid in the linear map */
 	mark_linear_data_alias_valid(false);
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	{
+		unsigned long s = 0, e = 0;
+
+		if (charlotte_exec_window(&s, &e))
+			charlotte_dump_table_pxn("post-rodata", s, PMD_SIZE);
+	}
+#endif
 }
 
 static void __init declare_vma(struct vm_struct *vma,
@@ -1878,7 +1971,14 @@ void __init paging_init(void)
 	map_mem();
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	charlotte_preseed_exec_ptes();
+	{
+		unsigned long s = 0, e = 0;
+
+		charlotte_preseed_exec_ptes();
+		charlotte_prepare_block_probe();
+		if (charlotte_exec_window(&s, &e))
+			charlotte_dump_table_pxn("post-seed", s, PMD_SIZE);
+	}
 #endif
 
 	memblock_allow_resize();
