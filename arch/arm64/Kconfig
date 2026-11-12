@@ -2026,6 +2026,18 @@ config ARM64_CHARLOTTE_SYNC_LEAF_PTES
 	  after installing executable module mappings so that EL1 observes
 	  the updated descriptor on every CPU.
 
+config ARM64_CHARLOTTE_EARLY_UART
+	bool "Charlotte pre-MMU UART boot beacons"
+	depends on ARCH_HISI
+	help
+	  Diagnostic option. Emit single-byte beacons on the V500 debug UART
+	  at 0xffb82000 from the first instruction of the kernel image and
+	  around __cpu_setup and the MMU enable, before earlycon exists and
+	  while the MMU is off. A 115200 8N1 capture then shows how far a
+	  boot that dies before setup_arch() actually got, which no in-memory
+	  or pstore log can report. The FIFO wait is bounded, so a missing or
+	  clock-gated UART cannot stall the boot.
+
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM
