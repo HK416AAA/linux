@@ -52,6 +52,7 @@
 #include <asm/processor.h>
 #include <asm/smp_plat.h>
 #include <asm/sections.h>
+#include <asm/set_memory.h>
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
 #include <asm/virt.h>
@@ -252,6 +253,9 @@ asmlinkage notrace void secondary_start_kernel(void)
 #ifdef CONFIG_ARM64_CHARLOTTE_BOOT_CACHE
 	pr_info("charlotte-cache: secondary CPU%u SCTLR=%#llx\n",
 		cpu, read_sysreg(sctlr_el1));
+#endif
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	charlotte_enable_hpd1_cpu();
 #endif
 
 

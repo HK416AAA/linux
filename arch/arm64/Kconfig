@@ -2009,6 +2009,16 @@ config ARM64_CHARLOTTE_LITTLE_ONLY
 	  little cluster. Used to isolate per-cluster TLB and cache behaviour
 	  while debugging firmware page-table restrictions.
 
+config ARM64_CHARLOTTE_BOOT_CPUS
+	int "Maximum CPUs brought online on Charlotte"
+	depends on ARM64_CHARLOTTE_LITTLE_ONLY
+	range 1 12
+	default 4
+	help
+	  Number of CPUs to bring online when the Charlotte boot CPU limit
+	  applies. Raise it step by step (4 -> 8 -> 12) to verify that each
+	  cluster comes up and stays stable before enabling the next one.
+
 config ARM64_CHARLOTTE_NO_TLB_RANGE
 	bool "Ignore Charlotte TLB range maintenance instructions"
 	depends on ARCH_HISI
