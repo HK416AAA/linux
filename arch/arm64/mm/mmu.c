@@ -85,6 +85,64 @@ static bool charlotte_skip_table_pxn(void)
 #endif
 }
 
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+/*
+ * The firmware on charlotte prepopulates top-level entries with PXNTable
+ * (and APTable) for some vmalloc ranges, so pud_populate() sees a present
+ * entry, keeps it, and the whole subtree stays non-executable for EL1 even
+ * after set_memory_x() cleared the leaf PXN.  Drop PXNTable from every table
+ * entry on the path once the module text has been made executable; the leaf
+ * entries keep their own NX protection for non-text mappings.
+ */
+void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
+{
+	unsigned long addr, end = start + size;
+	bool changed = false;
+
+	if (!charlotte_pgtable_sync || !size)
+		return;
+
+	for (addr = start & PGDIR_MASK; addr < end; addr += PGDIR_SIZE) {
+		pgd_t *pgdp = pgd_offset_k(addr);
+		p4d_t *p4dp;
+		pud_t *pudp;
+		pmd_t *pmdp;
+		pgdval_t pgdval, pmdval;
+
+		if (!pgd_present(*pgdp))
+			continue;
+
+		pgdval = pgd_val(*pgdp);
+		p4dp = p4d_offset(pgdp, addr);
+		pudp = pud_offset(p4dp, addr);
+
+		pmdval = 0;
+		pmdp = NULL;
+		if (pud_present(*pudp) && !pud_leaf(*pudp)) {
+			pmdp = pmd_offset(pudp, addr);
+			pmdval = pmd_table(*pmdp) ? pmd_val(*pmdp) : 0;
+		}
+		pr_info("charlotte-pt: pxn walk %px pgd=%016llx pmd=%016llx\n",
+			(void *)addr, (unsigned long long)pgdval,
+			(unsigned long long)pmdval);
+
+		if (pgdval & PGD_TABLE_PXN) {
+			set_pgd(pgdp, __pgd(pgdval & ~PGD_TABLE_PXN));
+			changed = true;
+		}
+		if (pmdval & PMD_TABLE_PXN) {
+			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		dsb(ishst);
+		flush_tlb_kernel_range(start, end);
+	}
+}
+#endif
+
 /*
  * The booting CPU updates the failed status @__early_cpu_boot_status,
  * with MMU turned off.

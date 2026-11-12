@@ -19,4 +19,10 @@ bool kernel_page_present(struct page *page);
 int set_memory_encrypted(unsigned long addr, int numpages);
 int set_memory_decrypted(unsigned long addr, int numpages);
 
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+void charlotte_clear_table_pxn(unsigned long start, unsigned long size);
+#else
+static inline void charlotte_clear_table_pxn(unsigned long start, unsigned long size) { }
+#endif
+
 #endif /* _ASM_ARM64_SET_MEMORY_H */
