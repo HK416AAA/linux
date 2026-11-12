@@ -113,7 +113,12 @@ bool __init charlotte_exec_window(unsigned long *start, unsigned long *end)
 		return false;
 
 	base = (unsigned long)_text & PGDIR_MASK;
-	lo = ALIGN((unsigned long)_end, PAGE_SIZE);
+	/*
+	 * Start on a fresh PMD: the kernel image tail shares the PMD that
+	 * contains _end, and installing a PTE table over it would unmap
+	 * live data/bss that the early boot code still writes to.
+	 */
+	lo = ALIGN((unsigned long)_end, PMD_SIZE);
 	hi = base + PGDIR_SIZE;
 	if (hi <= lo || hi - lo < SZ_64M)
 		return false;
@@ -148,7 +153,7 @@ static void __init charlotte_preseed_exec_ptes(void)
 		if (!pud_present(*pudp) || pud_leaf(*pudp))
 			continue;
 		pmdp = pmd_offset(pudp, addr);
-		if (pmd_leaf(*pmdp))
+		if (!pmd_none(*pmdp))
 			continue;
 
 		before = pmd_val(*pmdp);
@@ -247,9 +252,13 @@ void charlotte_dump_table_pxn(const char *tag, unsigned long start,
 					       (unsigned long)pmdp + sizeof(pmd_t));
 			pmdval = pmd_val(*pmdp);
 		}
-		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx c=%d\n",
+		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx pxn=%d hpd1=%d hpd2=%d tcr=%016llx c=%d\n",
 			tag, (void *)seg, (unsigned long long)pgdval,
-			(unsigned long long)pmdval, !uncached);
+			(unsigned long long)pmdval,
+			!!(pmdval & PMD_TABLE_PXN),
+			!!(read_sysreg(tcr_el1) & BIT(42)),
+			!!(read_sysreg(tcr_el1) & BIT(43)),
+			(unsigned long long)read_sysreg(tcr_el1), !uncached);
 	}
 }
 
@@ -290,6 +299,12 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 			 * keeps its old (PXN) view of the entry.
 			 */
 			charlotte_sync_table_store(pgdp);
+			/*
+			 * This is an intermediate-level descriptor, so the
+			 * leaf-only vaale1is path is not enough: vaae1is
+			 * also drops the cached walk entries above the leaf.
+			 */
+			__flush_tlb_kernel_pgtable(seg);
 			changed = true;
 			pr_info("charlotte-pt: clear pgd %px %016llx -> %016llx\n",
 				(void *)seg, (unsigned long long)pgdval,
@@ -297,6 +312,7 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 		}
 		if (pmdval & PMD_TABLE_PXN) {
 			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
+			__flush_tlb_kernel_pgtable(seg);
 			changed = true;
 			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx\n",
 				(void *)seg, (unsigned long long)pmdval,
