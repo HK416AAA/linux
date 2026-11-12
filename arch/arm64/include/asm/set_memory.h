@@ -23,10 +23,12 @@ int set_memory_decrypted(unsigned long addr, int numpages);
 bool charlotte_exec_window(unsigned long *start, unsigned long *end);
 void charlotte_clear_table_pxn(unsigned long start, unsigned long size);
 void charlotte_dump_table_pxn(const char *tag, unsigned long start, unsigned long size);
+void charlotte_enable_hpd1_cpu(void);
 #else
 static inline bool charlotte_exec_window(unsigned long *start, unsigned long *end) { return false; }
 static inline void charlotte_clear_table_pxn(unsigned long start, unsigned long size) { }
 static inline void charlotte_dump_table_pxn(const char *tag, unsigned long start, unsigned long size) { }
+static inline void charlotte_enable_hpd1_cpu(void) { }
 #endif
 
 #endif /* _ASM_ARM64_SET_MEMORY_H */

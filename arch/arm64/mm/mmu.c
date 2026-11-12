@@ -181,19 +181,20 @@ static void __init charlotte_preseed_exec_ptes(void)
 		seeded, failed, start, end);
 }
 
-static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
+static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pud_t **pudp,
+			    pmd_t **pmdp)
 {
 	p4d_t *p4dp;
-	pud_t *pudp;
 
 	*pgdp = pgd_offset_k(addr);
+	*pudp = NULL;
 	*pmdp = NULL;
 	if (!(pgd_val(**pgdp) & PTE_VALID))
 		return;
 	p4dp = p4d_offset(*pgdp, addr);
-	pudp = pud_offset(p4dp, addr);
-	if (pud_present(*pudp) && !pud_leaf(*pudp))
-		*pmdp = pmd_offset(pudp, addr);
+	*pudp = pud_offset(p4dp, addr);
+	if (pud_present(**pudp) && !pud_leaf(**pudp))
+		*pmdp = pmd_offset(*pudp, addr);
 }
 
 #ifdef CONFIG_ARM64_CHARLOTTE_SYNC_LEAF_PTES
@@ -207,12 +208,13 @@ static void charlotte_sync_leaf_stores(unsigned long start, unsigned long size)
 {
 	unsigned long addr, end = start + size;
 	pgd_t *pgdp;
+	pud_t *pudp;
 	pmd_t *pmdp;
 
 	for (addr = start & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
 		pte_t *ptep;
 
-		charlotte_pt_of(addr, &pgdp, &pmdp);
+		charlotte_pt_of(addr, &pgdp, &pudp, &pmdp);
 		if (!pmdp || !pmd_table(*pmdp))
 			continue;
 		ptep = pte_offset_kernel(pmdp, addr);
@@ -223,6 +225,62 @@ static void charlotte_sync_leaf_stores(unsigned long start, unsigned long size)
 	}
 	dsb(ish);
 	pr_info("charlotte-pt: synced leaf ptes %#lx..%#lx\n", start, end);
+}
+#endif
+
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+static void charlotte_hpd1_set(void)
+{
+	u64 tcr = read_sysreg(tcr_el1);
+
+	if (!(tcr & TCR_HPD1)) {
+		write_sysreg(tcr | TCR_HPD1, tcr_el1);
+		isb();
+	}
+}
+
+/*
+ * Called from secondary_start_kernel(): the new CPU has an empty TLB, so no
+ * invalidation is needed after the TCR update.
+ */
+void charlotte_enable_hpd1_cpu(void)
+{
+	charlotte_hpd1_set();
+	pr_info("charlotte-pt: cpu%u hpd1 set=%d tcr=%016llx\n",
+		smp_processor_id(),
+		!!(read_sysreg(tcr_el1) & TCR_HPD1),
+		(unsigned long long)read_sysreg(tcr_el1));
+}
+
+/*
+ * The TCR_EL1 write in __cpu_setup happens before the hhee TVM handshake, so
+ * the firmware swallows it (see hpd1=0 in the logs).  Try again once the
+ * handshake has run: HPD1 makes the walker ignore the forced table-level
+ * permission bits, which is the only architectural escape from the firmware
+ * hardening.  HPD1 is RES0 when FEAT_TTHM is absent (the write is ignored),
+ * so this is safe to attempt unconditionally and the readback says whether
+ * the firmware accepted it.
+ */
+static bool charlotte_try_hpd1(const char *tag)
+{
+	static bool reported;
+	u64 mmfr2 = read_sysreg(id_aa64mmfr2_el1);
+	u64 before = read_sysreg(tcr_el1);
+	u64 after;
+
+	if (!(before & TCR_HPD1)) {
+		charlotte_hpd1_set();
+		flush_tlb_all();
+		dsb(nsh);
+		isb();
+	}
+	after = read_sysreg(tcr_el1);
+	if (!reported || !!(after & TCR_HPD1) != !!(before & TCR_HPD1)) {
+		pr_info("charlotte-pt: %s hpd1 mmfr2=%016llx tcr %016llx -> %016llx (set=%d)\n",
+			tag, mmfr2, before, after, !!(after & TCR_HPD1));
+		reported = true;
+	}
+	return !!(after & TCR_HPD1);
 }
 #endif
 
@@ -238,22 +296,25 @@ void charlotte_dump_table_pxn(const char *tag, unsigned long start,
 	for (base = start & PGDIR_MASK; base < end; base += PGDIR_SIZE) {
 		unsigned long seg = base < start ? start : base;
 		pgd_t *pgdp;
+		pud_t *pudp;
 		pmd_t *pmdp;
-		pgdval_t pgdval;
+		pgdval_t pgdval, pudval;
 		pmdval_t pmdval;
 
 		if (seg >= end)
 			break;
-		charlotte_pt_of(seg, &pgdp, &pmdp);
+		charlotte_pt_of(seg, &pgdp, &pudp, &pmdp);
 		pgdval = pgd_val(*pgdp);
+		pudval = (pudp && pud_table(*pudp)) ? pud_val(*pudp) : 0;
 		pmdval = 0;
 		if (pmdp && pmd_table(*pmdp)) {
 			dcache_clean_inval_poc((unsigned long)pmdp,
 					       (unsigned long)pmdp + sizeof(pmd_t));
-			pmdval = pmd_val(*pmdp);
+			pmdval = READ_ONCE(pmd_val(*pmdp));
 		}
-		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx pxn=%d hpd1=%d hpd2=%d tcr=%016llx c=%d\n",
+		pr_info("charlotte-pt: %s %px pgd=%016llx pud=%016llx pmd=%016llx pxn=%d hpd1=%d hpd2=%d tcr=%016llx c=%d\n",
 			tag, (void *)seg, (unsigned long long)pgdval,
+			(unsigned long long)pudval,
 			(unsigned long long)pmdval,
 			!!(pmdval & PMD_TABLE_PXN),
 			!!(read_sysreg(tcr_el1) & BIT(42)),
@@ -281,43 +342,69 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 	for (base = start & PGDIR_MASK; base < end; base += PGDIR_SIZE) {
 		unsigned long seg = base < start ? start : base;
 		pgd_t *pgdp;
+		pud_t *pudp;
 		pmd_t *pmdp;
-		pgdval_t pgdval, pmdval;
+		pgdval_t pgdval, pudval, pmdval;
+		bool dotted = false;
 
 		if (seg >= end)
 			break;
-		charlotte_pt_of(seg, &pgdp, &pmdp);
+		charlotte_pt_of(seg, &pgdp, &pudp, &pmdp);
 		pgdval = pgd_val(*pgdp);
 		if (!(pgdval & PTE_VALID))
 			continue;
+		pudval = (pudp && pud_table(*pudp)) ? pud_val(*pudp) : 0;
 		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
-		if (pgdval & PGD_TABLE_PXN) {
-			set_pgd(pgdp, __pgd(pgdval & ~PGD_TABLE_PXN));
+
+		charlotte_try_hpd1("pre-rox");
+
+		if (pgdval & (PGD_TABLE_PXN | S1_TABLE_AP)) {
+			pgdval_t want = pgdval & ~(PGD_TABLE_PXN | S1_TABLE_AP);
+
+			set_pgd(pgdp, __pgd(want));
 			/*
 			 * The EL1 page-table stores are emulated by EL2 on
 			 * this SoC; without cleaning the line the firmware
 			 * keeps its old (PXN) view of the entry.
 			 */
 			charlotte_sync_table_store(pgdp);
-			/*
-			 * This is an intermediate-level descriptor, so the
-			 * leaf-only vaale1is path is not enough: vaae1is
-			 * also drops the cached walk entries above the leaf.
-			 */
-			__flush_tlb_kernel_pgtable(seg);
-			changed = true;
+			dotted = true;
 			pr_info("charlotte-pt: clear pgd %px %016llx -> %016llx\n",
 				(void *)seg, (unsigned long long)pgdval,
-				(unsigned long long)pgd_val(*pgdp));
+				(unsigned long long)READ_ONCE(pgd_val(*pgdp)));
 		}
-		if (pmdval & PMD_TABLE_PXN) {
-			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
-			__flush_tlb_kernel_pgtable(seg);
-			changed = true;
-			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx\n",
+		if (pudval & (PUD_TABLE_PXN | S1_TABLE_AP)) {
+			pudval_t want = pudval & ~(PUD_TABLE_PXN | S1_TABLE_AP);
+
+			set_pud(pudp, __pud(want));
+			charlotte_sync_table_store(pudp);
+			dotted = true;
+			pr_info("charlotte-pt: clear pud %px %016llx -> %016llx\n",
+				(void *)seg, (unsigned long long)pudval,
+				(unsigned long long)READ_ONCE(pud_val(*pudp)));
+		}
+		if (pmdval & (PMD_TABLE_PXN | S1_TABLE_AP)) {
+			pmdval_t want = pmdval & ~(PMD_TABLE_PXN | S1_TABLE_AP);
+
+			set_pmd(pmdp, __pmd(want));
+			charlotte_sync_table_store(pmdp);
+			dotted = true;
+			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx (want %016llx)\n",
 				(void *)seg, (unsigned long long)pmdval,
-				(unsigned long long)pmd_val(*pmdp));
+				(unsigned long long)READ_ONCE(pmd_val(*pmdp)),
+				(unsigned long long)want);
 		}
+		if (!dotted)
+			continue;
+		/*
+		 * A change of hierarchical permissions affects every cached
+		 * walk below the entry, so drop the whole local and remote
+		 * TLB instead of a leaf-only range, and push the new
+		 * descriptors out of the private caches first.
+		 */
+		dsb(ishst);
+		flush_tlb_all();
+		changed = true;
 	}
 
 #ifdef CONFIG_ARM64_CHARLOTTE_SYNC_LEAF_PTES
@@ -326,7 +413,7 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 
 	if (changed) {
 		dsb(ishst);
-		flush_tlb_kernel_range(start, end);
+		flush_tlb_all();
 	}
 }
 #endif
@@ -1777,7 +1864,8 @@ void __init paging_init(void)
 #endif
 #ifdef CONFIG_ARM64_CHARLOTTE_LITTLE_ONLY
 	if (charlotte_pgtable_sync) {
-		setup_max_cpus = min_t(unsigned int, setup_max_cpus, 4);
+		setup_max_cpus = min_t(unsigned int, setup_max_cpus,
+				       CONFIG_ARM64_CHARLOTTE_BOOT_CPUS);
 		pr_info("charlotte-diag: boot CPUs limited to %u\n",
 			setup_max_cpus);
 	}
