@@ -1,0 +1,22 @@
+#!/bin/sh
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /tmp /run /sys/kernel/debug
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+
+echo
+echo "=============================================="
+echo " charlotte initramfs: userspace reached"
+echo " kernel : $(uname -r)"
+echo " cmdline: $(cat /proc/cmdline)"
+echo "=============================================="
+echo
+
+exec setsid cttyhack sh -i
