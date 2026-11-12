@@ -44,6 +44,7 @@ int module_enable_text_rox(const struct module *mod)
 			ret = module_set_memory(mod, type, set_memory_x);
 		if (ret)
 			return ret;
+		charlotte_clear_table_pxn((unsigned long)mem->base, mem->size);
 	}
 	return 0;
 }
