@@ -65,14 +65,19 @@ u64 charlotte_boot_sctlr_before __initdata;
 u64 charlotte_boot_sctlr_after __initdata;
 #endif
 
-void charlotte_sync_pmd_store(pmd_t *pmdp)
+void charlotte_sync_table_store(void *p)
 {
 	if (!charlotte_pgtable_sync || (read_sysreg(sctlr_el1) & SCTLR_ELx_C))
 		return;
 
 	/* EL2's emulated store may still reside in a dirty cache line. */
-	dcache_clean_inval_poc((unsigned long)pmdp,
-			       (unsigned long)(pmdp + 1));
+	dcache_clean_inval_poc((unsigned long)p,
+			       (unsigned long)p + sizeof(u64));
+}
+
+void charlotte_sync_pmd_store(pmd_t *pmdp)
+{
+	charlotte_sync_table_store(pmdp);
 }
 #endif
 
@@ -104,23 +109,27 @@ static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
 void charlotte_dump_table_pxn(const char *tag, unsigned long start,
 			      unsigned long size)
 {
-	unsigned long addr, end = start + size;
+	unsigned long base, end = start + size;
+	bool uncached = !(read_sysreg(sctlr_el1) & SCTLR_ELx_C);
 
 	if (!charlotte_pgtable_sync || !start || !size)
 		return;
 
-	for (addr = start & PGDIR_MASK; addr < end; addr += PGDIR_SIZE) {
+	for (base = start & PGDIR_MASK; base < end; base += PGDIR_SIZE) {
+		unsigned long seg = base < start ? start : base;
 		pgd_t *pgdp;
 		pmd_t *pmdp;
 		pgdval_t pgdval;
 		pmdval_t pmdval;
 
-		charlotte_pt_of(addr, &pgdp, &pmdp);
+		if (seg >= end)
+			break;
+		charlotte_pt_of(seg, &pgdp, &pmdp);
 		pgdval = pgd_val(*pgdp);
 		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
-		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx\n",
-			tag, (void *)addr, (unsigned long long)pgdval,
-			(unsigned long long)pmdval);
+		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx c=%d\n",
+			tag, (void *)seg, (unsigned long long)pgdval,
+			(unsigned long long)pmdval, !uncached);
 	}
 }
 
@@ -134,63 +143,43 @@ void charlotte_dump_table_pxn(const char *tag, unsigned long start,
  */
 void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 {
-	unsigned long addr, end = start + size;
+	unsigned long base, end = start + size;
 	bool changed = false;
 
 	if (!charlotte_pgtable_sync || !start || !size)
 		return;
 
-	for (addr = start & PGDIR_MASK; addr < end; addr += PGDIR_SIZE) {
+	for (base = start & PGDIR_MASK; base < end; base += PGDIR_SIZE) {
+		unsigned long seg = base < start ? start : base;
 		pgd_t *pgdp;
 		pmd_t *pmdp;
 		pgdval_t pgdval, pmdval;
 
-		charlotte_pt_of(addr, &pgdp, &pmdp);
+		if (seg >= end)
+			break;
+		charlotte_pt_of(seg, &pgdp, &pmdp);
 		pgdval = pgd_val(*pgdp);
 		if (!(pgdval & PTE_VALID))
 			continue;
 		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
 		if (pgdval & PGD_TABLE_PXN) {
 			set_pgd(pgdp, __pgd(pgdval & ~PGD_TABLE_PXN));
+			/*
+			 * The EL1 page-table stores are emulated by EL2 on
+			 * this SoC; without cleaning the line the firmware
+			 * keeps its old (PXN) view of the entry.
+			 */
+			charlotte_sync_table_store(pgdp);
 			changed = true;
 			pr_info("charlotte-pt: clear pgd %px %016llx -> %016llx\n",
-				(void *)addr, (unsigned long long)pgdval,
+				(void *)seg, (unsigned long long)pgdval,
 				(unsigned long long)pgd_val(*pgdp));
-			if (pgd_val(*pgdp) & PGD_TABLE_PXN) {
-				/*
-				 * The fixmap store went through the EL2
-				 * emulation path and the firmware added the
-				 * table attributes back.  Write the entry
-				 * through a private writable alias instead.
-				 */
-				struct page *page = virt_to_page(pgdp);
-				void *va = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
-
-				if (va) {
-					unsigned long off = (unsigned long)pgdp &
-							    ~PAGE_MASK;
-					pgd_t *alias = (pgd_t *)
-						((unsigned long)va + off);
-					pgdval_t cur = pgd_val(*pgdp);
-
-					WRITE_ONCE(*alias,
-						   __pgd(cur & ~PGD_TABLE_PXN));
-					dcache_clean_inval_poc(
-						(unsigned long)alias,
-						(unsigned long)(alias + 1));
-					dsb(ishst);
-					vunmap(va);
-					pr_info("charlotte-pt: pgd vmap %px -> %016llx\n",
-						(void *)addr,
-						(unsigned long long)pgd_val(*pgdp));
-				}
-			}
 		}
 		if (pmdval & PMD_TABLE_PXN) {
 			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
 			changed = true;
 			pr_info("charlotte-pt: clear pmd %px %016llx -> %016llx\n",
-				(void *)addr, (unsigned long long)pmdval,
+				(void *)seg, (unsigned long long)pmdval,
 				(unsigned long long)pmd_val(*pmdp));
 		}
 	}
