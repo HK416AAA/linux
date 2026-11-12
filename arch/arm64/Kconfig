@@ -2018,6 +2018,15 @@ config ARM64_CHARLOTTE_NO_TLB_RANGE
 	  check whether a broken range invalidation leaves stale executable
 	  permissions behind.
 
+config ARM64_CHARLOTTE_HPD1
+	bool "Disable Charlotte hierarchical permission checks for TTBR1"
+	depends on ARCH_HISI
+	help
+	  Diagnostic option. Set TCR_EL1.HPD1 so that the hardware ignores the
+	  table-level permission bits (PXNTable, UXNTable, APTable) that the
+	  Charlotte firmware installs on kernel page tables. Used to confirm
+	  that those bits are what make module text non-executable.
+
 config ARM64_CHARLOTTE_SYNC_LEAF_PTES
 	bool "Synchronize Charlotte leaf PTE stores"
 	depends on ARM64_CHARLOTTE_PGTABLE_SYNC
