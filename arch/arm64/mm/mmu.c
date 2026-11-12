@@ -129,6 +129,35 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 			pr_info("charlotte-pt: clear pgd %px %016llx -> %016llx\n",
 				(void *)addr, (unsigned long long)pgdval,
 				(unsigned long long)pgd_val(*pgdp));
+			if (pgd_val(*pgdp) & PGD_TABLE_PXN) {
+				/*
+				 * The fixmap store went through the EL2
+				 * emulation path and the firmware added the
+				 * table attributes back.  Write the entry
+				 * through a private writable alias instead.
+				 */
+				struct page *page = virt_to_page(pgdp);
+				void *va = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+
+				if (va) {
+					unsigned long off = (unsigned long)pgdp &
+							    ~PAGE_MASK;
+					pgd_t *alias = (pgd_t *)
+						((unsigned long)va + off);
+					pgdval_t cur = pgd_val(*pgdp);
+
+					WRITE_ONCE(*alias,
+						   __pgd(cur & ~PGD_TABLE_PXN));
+					dcache_clean_inval_poc(
+						(unsigned long)alias,
+						(unsigned long)(alias + 1));
+					dsb(ishst);
+					vunmap(va);
+					pr_info("charlotte-pt: pgd vmap %px -> %016llx\n",
+						(void *)addr,
+						(unsigned long long)pgd_val(*pgdp));
+				}
+			}
 		}
 		if (pmdval & PMD_TABLE_PXN) {
 			set_pmd(pmdp, __pmd(pmdval & ~PMD_TABLE_PXN));
