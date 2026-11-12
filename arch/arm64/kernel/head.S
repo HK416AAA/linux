@@ -111,7 +111,7 @@
  * Clobbers x6, x7 and x8 only.
  */
 	.macro CHARLOTTE_UART_EMIT, ch
-	movz	x6, #0x0000
+	movz	x6, #0x2000
 	movk	x6, #0xffb8, lsl #16	// PA 0xffb82000 = uart6
 	mov	w7, #4096
 1:	ldr	w8, [x6, #0x14]		// STAT
