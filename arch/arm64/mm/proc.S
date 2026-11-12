@@ -34,6 +34,13 @@
 #endif
 
 #ifdef CONFIG_RANDOMIZE_BASE
+#ifdef CONFIG_ARM64_CHARLOTTE_HPD1
+/* TCR_EL1.HPD1: ignore hierarchical permission bits for TTBR1 walks. */
+#define TCR_CHARLOTTE_HPD1	(1 << 42)
+#else
+#define TCR_CHARLOTTE_HPD1	0
+#endif
+
 #define TCR_KASLR_FLAGS	TCR_EL1_NFD1
 #else
 #define TCR_KASLR_FLAGS	0
@@ -507,7 +514,8 @@ SYM_FUNC_START(__cpu_setup)
 	mov_q	mair, MAIR_EL1_SET
 	mov_q	tcr, TCR_T0SZ(IDMAP_VA_BITS) | TCR_T1SZ(VA_BITS_MIN) | TCR_CACHE_FLAGS | \
 		     TCR_SHARED | TCR_TG_FLAGS | TCR_KASLR_FLAGS | TCR_EL1_AS | \
-		     TCR_EL1_TBI0 | TCR_EL1_A1 | TCR_KASAN_SW_FLAGS | TCR_MTE_FLAGS
+		     TCR_EL1_TBI0 | TCR_EL1_A1 | TCR_KASAN_SW_FLAGS | TCR_MTE_FLAGS | \
+		     TCR_CHARLOTTE_HPD1
 	mov	tcr2, xzr
 
 	tcr_clear_errata_bits tcr, x9, x5
