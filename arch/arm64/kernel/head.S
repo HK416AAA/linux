@@ -99,34 +99,6 @@
 	dc	cvac, x6			// push to DRAM: warm reset drops dirty lines
 	dsb	sy
 	.endm
-
-#ifdef CONFIG_ARM64_CHARLOTTE_EARLY_UART
-/*
- * Emit one beacon byte on the V500 debug UART at PA 0xffb82000.
- *
- * This runs before __enable_mmu, so the physical address is used
- * directly (MMU off: VA=PA).  STAT (0x14): bit 3 = TX FIFO full, bit 0 =
- * TX busy; TX FIFO (0x0c).  The FIFO-full wait is bounded so a clock-gated
- * or absent UART can never hang the boot; the byte is simply dropped.
- * Clobbers x6, x7 and x8 only.
- */
-	.macro CHARLOTTE_UART_EMIT, ch
-	movz	x6, #0x2000
-	movk	x6, #0xffb8, lsl #16	// PA 0xffb82000 = uart6
-	mov	w7, #4096
-1:	ldr	w8, [x6, #0x14]		// STAT
-	tbz	w8, #3, 2f		// TX FIFO has room
-	subs	w7, w7, #1
-	b.ne	1b
-	b	3f
-2:	movz	w8, #(\ch)
-	str	w8, [x6, #0x0c]		// TX FIFO
-3:
-	.endm
-#else
-	.macro CHARLOTTE_UART_EMIT, ch
-	.endm
-#endif
 SYM_CODE_START(primary_entry)
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	/* v108: mask SError (PSTATE.A).  Every mainline boot eventually
@@ -190,10 +162,6 @@ SYM_CODE_START(primary_entry)
 	msr	vbar_el1, x0
 	isb
 #endif
-	/* 'A': kernel image entered.  Emitted only after VBAR is installed,
-	 * so a faulting UART access is caught by the dumper instead of
-	 * running into the bootloader's vectors. */
-	CHARLOTTE_UART_EMIT 0x41
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	mov	x0, x24
 	mov	x1, x25
@@ -323,11 +291,7 @@ SYM_CODE_END(charlotte_exc_dump)
 	 * On return, the CPU will be ready for the MMU to be turned on and
 	 * the TCR will have been set.
 	 */
-	/* 'B': about to enter __cpu_setup (TCR_EL1 / MMU setup). */
-	CHARLOTTE_UART_EMIT 0x42
 	bl	__cpu_setup			// initialise processor
-	/* 'C': __cpu_setup returned (TCR_EL1 written, still pre-MMU). */
-	CHARLOTTE_UART_EMIT 0x43
 	CHARLOTTE_MAGIC 5			// last pre-MMU checkpoint
 	b	__primary_switch
 SYM_CODE_END(primary_entry)
@@ -683,7 +647,6 @@ alternative_if ARM64_HAS_VA52
 alternative_else_nop_endif
 #endif
 
-	CHARLOTTE_UART_EMIT 0x73		// 's': secondary entering __cpu_setup
 	bl	__cpu_setup			// initialise processor
 #ifdef CONFIG_CHARLOTTE_BBOXLOG
 	movz	x1, #0x0000
@@ -692,7 +655,6 @@ alternative_else_nop_endif
 	add	w2, w2, #1
 	str	w2, [x1, #0xcc]			// past __cpu_setup
 #endif
-	CHARLOTTE_UART_EMIT 0x74		// 't': secondary past __cpu_setup
 	/* v64 recipe: write everything except M, then M-only. */
 	bic	x0, x0, #SCTLR_ELx_M
 	adrp	x1, swapper_pg_dir
@@ -931,8 +893,6 @@ SYM_FUNC_END(__no_granule_support)
 SYM_FUNC_START_LOCAL(__primary_switch)
 	adrp	x1, reserved_pg_dir
 	adrp	x2, __pi_init_idmap_pg_dir
-	/* 'D': last beacon before the MMU comes on. */
-	CHARLOTTE_UART_EMIT 0x44
 	bl	__enable_mmu
 	mrs	x1, sctlr_el1
 	movz	x6, #0x0000

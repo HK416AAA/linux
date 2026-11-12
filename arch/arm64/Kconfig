@@ -2000,54 +2000,6 @@ config ARM64_CHARLOTTE_BOOT_CACHE
 	  secondary caches after the firmware-required MMU transition. Keep
 	  firmware-mediated address-space and FP state transitions ordered.
 
-config ARM64_CHARLOTTE_LITTLE_ONLY
-	bool "Boot only the Charlotte little cluster"
-	depends on ARCH_HISI
-	help
-	  Diagnostic option. Limit the number of CPUs brought online to four
-	  so that all kernel threads, including module loading, execute on the
-	  little cluster. Used to isolate per-cluster TLB and cache behaviour
-	  while debugging firmware page-table restrictions.
-
-config ARM64_CHARLOTTE_BOOT_CPUS
-	int "Maximum CPUs brought online on Charlotte"
-	depends on ARM64_CHARLOTTE_LITTLE_ONLY
-	range 1 12
-	default 4
-	help
-	  Number of CPUs to bring online when the Charlotte boot CPU limit
-	  applies. Raise it step by step (4 -> 8 -> 12) to verify that each
-	  cluster comes up and stays stable before enabling the next one.
-
-config ARM64_CHARLOTTE_NO_TLB_RANGE
-	bool "Ignore Charlotte TLB range maintenance instructions"
-	depends on ARCH_HISI
-	help
-	  Diagnostic option. Report no support for FEAT_TLBIRANGE so that
-	  kernel TLB invalidation falls back to per-page operations. Used to
-	  check whether a broken range invalidation leaves stale executable
-	  permissions behind.
-
-config ARM64_CHARLOTTE_SYNC_LEAF_PTES
-	bool "Synchronize Charlotte leaf PTE stores"
-	depends on ARM64_CHARLOTTE_PGTABLE_SYNC
-	help
-	  Diagnostic option. Clean and invalidate the leaf PTE cache line
-	  after installing executable module mappings so that EL1 observes
-	  the updated descriptor on every CPU.
-
-config ARM64_CHARLOTTE_EARLY_UART
-	bool "Charlotte pre-MMU UART boot beacons"
-	depends on ARCH_HISI
-	help
-	  Diagnostic option. Emit single-byte beacons on the V500 debug UART
-	  at 0xffb82000 from the first instruction of the kernel image and
-	  around __cpu_setup and the MMU enable, before earlycon exists and
-	  while the MMU is off. A 115200 8N1 capture then shows how far a
-	  boot that dies before setup_arch() actually got, which no in-memory
-	  or pstore log can report. The FIFO wait is bounded, so a missing or
-	  clock-gated UART cannot stall the boot.
-
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM
