@@ -634,8 +634,18 @@ static int split_pmd(pmd_t *pmdp, pmd_t pmd, gfp_t gfp, bool to_cont)
 		return -ENOMEM;
 	ptep = (pte_t *)phys_to_virt(pte_phys);
 
+	/*
+	 * The split block keeps its NX protection on the new leaf PTEs.  On
+	 * charlotte the table-level PXN also survives set_memory_x(), which
+	 * leaves module init text non-executable, so skip it there.
+	 */
+#ifndef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
 	if (pgprot_val(prot) & PMD_SECT_PXN)
 		tableprot |= PMD_TABLE_PXN;
+#else
+	if ((pgprot_val(prot) & PMD_SECT_PXN) && !charlotte_pgtable_sync)
+		tableprot |= PMD_TABLE_PXN;
+#endif
 
 	prot = __pgprot((pgprot_val(prot) & ~PTE_TYPE_MASK) | PTE_TYPE_PAGE);
 	if (!pmd_valid(pmd))
@@ -1219,16 +1229,6 @@ static void __init map_mem(void)
 	 */
 	BUILD_BUG_ON(pgd_index(direct_map_end - 1) == pgd_index(direct_map_end) &&
 		     pgd_index(_PAGE_OFFSET(VA_BITS_MIN)) != PTRS_PER_PGD - 1);
-
-#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	/*
-	 * On charlotte the hierarchical PMD_TABLE_PXN ends up covering the
-	 * module init text; set_memory_x() only clears the leaf PXN, so the
-	 * range stays non-executable.  Keep NX on the leaf descriptors only.
-	 */
-	if (charlotte_pgtable_sync)
-		flags &= ~NO_EXEC_MAPPINGS;
-#endif
 
 	arm64_kfence_map_pool();
 
