@@ -76,6 +76,15 @@ void charlotte_sync_pmd_store(pmd_t *pmdp)
 }
 #endif
 
+static bool charlotte_skip_table_pxn(void)
+{
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	return charlotte_pgtable_sync;
+#else
+	return false;
+#endif
+}
+
 /*
  * The booting CPU updates the failed status @__early_cpu_boot_status,
  * with MMU turned off.
@@ -639,13 +648,8 @@ static int split_pmd(pmd_t *pmdp, pmd_t pmd, gfp_t gfp, bool to_cont)
 	 * charlotte the table-level PXN also survives set_memory_x(), which
 	 * leaves module init text non-executable, so skip it there.
 	 */
-#ifndef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	if (pgprot_val(prot) & PMD_SECT_PXN)
+	if ((pgprot_val(prot) & PMD_SECT_PXN) && !charlotte_skip_table_pxn())
 		tableprot |= PMD_TABLE_PXN;
-#else
-	if ((pgprot_val(prot) & PMD_SECT_PXN) && !charlotte_pgtable_sync)
-		tableprot |= PMD_TABLE_PXN;
-#endif
 
 	prot = __pgprot((pgprot_val(prot) & ~PTE_TYPE_MASK) | PTE_TYPE_PAGE);
 	if (!pmd_valid(pmd))
@@ -691,7 +695,7 @@ static int split_pud(pud_t *pudp, pud_t pud, gfp_t gfp, bool to_cont)
 		return -ENOMEM;
 	pmdp = (pmd_t *)phys_to_virt(pmd_phys);
 
-	if (pgprot_val(prot) & PMD_SECT_PXN)
+	if ((pgprot_val(prot) & PMD_SECT_PXN) && !charlotte_skip_table_pxn())
 		tableprot |= PUD_TABLE_PXN;
 
 	prot = __pgprot((pgprot_val(prot) & ~PMD_TYPE_MASK) | PMD_TYPE_SECT);
