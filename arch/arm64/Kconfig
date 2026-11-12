@@ -2000,6 +2000,32 @@ config ARM64_CHARLOTTE_BOOT_CACHE
 	  secondary caches after the firmware-required MMU transition. Keep
 	  firmware-mediated address-space and FP state transitions ordered.
 
+config ARM64_CHARLOTTE_LITTLE_ONLY
+	bool "Boot only the Charlotte little cluster"
+	depends on ARCH_HISI
+	help
+	  Diagnostic option. Limit the number of CPUs brought online to four
+	  so that all kernel threads, including module loading, execute on the
+	  little cluster. Used to isolate per-cluster TLB and cache behaviour
+	  while debugging firmware page-table restrictions.
+
+config ARM64_CHARLOTTE_NO_TLB_RANGE
+	bool "Ignore Charlotte TLB range maintenance instructions"
+	depends on ARCH_HISI
+	help
+	  Diagnostic option. Report no support for FEAT_TLBIRANGE so that
+	  kernel TLB invalidation falls back to per-page operations. Used to
+	  check whether a broken range invalidation leaves stale executable
+	  permissions behind.
+
+config ARM64_CHARLOTTE_SYNC_LEAF_PTES
+	bool "Synchronize Charlotte leaf PTE stores"
+	depends on ARM64_CHARLOTTE_PGTABLE_SYNC
+	help
+	  Diagnostic option. Clean and invalidate the leaf PTE cache line
+	  after installing executable module mappings so that EL1 observes
+	  the updated descriptor on every CPU.
+
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM
