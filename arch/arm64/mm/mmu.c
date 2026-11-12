@@ -67,10 +67,14 @@ u64 charlotte_boot_sctlr_after __initdata;
 
 void charlotte_sync_table_store(void *p)
 {
-	if (!charlotte_pgtable_sync || (read_sysreg(sctlr_el1) & SCTLR_ELx_C))
+	if (!charlotte_pgtable_sync)
 		return;
 
-	/* EL2's emulated store may still reside in a dirty cache line. */
+	/*
+	 * EL2 emulates the EL1 table store and may keep the old view of the
+	 * entry in a dirty cache line, so always push the line out even when
+	 * EL1 runs with the MMU caches enabled.
+	 */
 	dcache_clean_inval_poc((unsigned long)p,
 			       (unsigned long)p + sizeof(u64));
 }
@@ -123,11 +127,13 @@ bool __init charlotte_exec_window(unsigned long *start, unsigned long *end)
 static void __init charlotte_preseed_exec_ptes(void)
 {
 	unsigned long start, end, addr;
+	int seeded = 0, failed = 0, shown = 0;
 
 	if (!charlotte_exec_window(&start, &end))
 		return;
 
 	for (addr = start; addr < end; addr += PMD_SIZE) {
+		pmdval_t before, want, after;
 		p4d_t *p4dp;
 		pud_t *pudp;
 		pmd_t *pmdp;
@@ -141,19 +147,32 @@ static void __init charlotte_preseed_exec_ptes(void)
 		if (!pud_present(*pudp) || pud_leaf(*pudp))
 			continue;
 		pmdp = pmd_offset(pudp, addr);
-		if (!pmd_none(*pmdp))
+		if (pmd_leaf(*pmdp))
 			continue;
 
+		before = pmd_val(*pmdp);
 		ptep = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
 		if (!ptep)
 			break;
-		set_pmd(pmdp, __pmd(__phys_to_pmd_val(__pa(ptep)) |
-				    PMD_TYPE_TABLE | PMD_TABLE_AF |
-				    PMD_TABLE_UXN));
+		want = __phys_to_pmd_val(__pa(ptep)) | PMD_TYPE_TABLE |
+		       PMD_TABLE_AF | PMD_TABLE_UXN;
+		set_pmd(pmdp, __pmd(want));
+		after = pmd_val(*pmdp);
+		if (after != want)
+			failed++;
+		if (shown < 6) {
+			pr_info("charlotte-pt: seed %#lx pmdp=%#lx before=%016llx want=%016llx after=%016llx\n",
+				addr, (unsigned long)__pa(pmdp),
+				(unsigned long long)before,
+				(unsigned long long)want,
+				(unsigned long long)after);
+			shown++;
+		}
+		seeded++;
 	}
 
-	pr_info("charlotte-pt: preseeded exec page tables %#lx..%#lx\n",
-		start, end);
+	pr_info("charlotte-pt: seeded %d exec pmds (%d not kept) %#lx..%#lx\n",
+		seeded, failed, start, end);
 }
 
 static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
