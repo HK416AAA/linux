@@ -833,6 +833,9 @@ static inline bool system_supports_bti_kernel(void)
 
 static inline bool system_supports_tlb_range(void)
 {
+	if (IS_ENABLED(CONFIG_ARM64_CHARLOTTE_NO_TLB_RANGE))
+		return false;
+
 	return alternative_has_cap_unlikely(ARM64_HAS_TLB_RANGE);
 }
 

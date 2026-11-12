@@ -31,6 +31,7 @@
 #include <linux/pagewalk.h>
 #include <linux/of_fdt.h>
 #include <linux/stop_machine.h>
+#include <linux/smp.h>
 
 #include <asm/barrier.h>
 #include <asm/cputype.h>
@@ -190,6 +191,36 @@ static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
 		*pmdp = pmd_offset(pudp, addr);
 }
 
+#ifdef CONFIG_ARM64_CHARLOTTE_SYNC_LEAF_PTES
+/*
+ * Diagnostic: the leaf descriptors are installed by set_memory_x() on the
+ * CPU running the module loader.  Push every touched PTE line out of the
+ * private caches so that the next instruction fetch sees the descriptor
+ * that memory actually holds.
+ */
+static void charlotte_sync_leaf_stores(unsigned long start, unsigned long size)
+{
+	unsigned long addr, end = start + size;
+	pgd_t *pgdp;
+	pmd_t *pmdp;
+
+	for (addr = start & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		pte_t *ptep;
+
+		charlotte_pt_of(addr, &pgdp, &pmdp);
+		if (!pmdp || !pmd_table(*pmdp))
+			continue;
+		ptep = pte_offset_kernel(pmdp, addr);
+		if (!pte_present(*ptep))
+			continue;
+		dcache_clean_inval_poc((unsigned long)ptep,
+				       (unsigned long)ptep + sizeof(pte_t));
+	}
+	dsb(ish);
+	pr_info("charlotte-pt: synced leaf ptes %#lx..%#lx\n", start, end);
+}
+#endif
+
 void charlotte_dump_table_pxn(const char *tag, unsigned long start,
 			      unsigned long size)
 {
@@ -210,7 +241,12 @@ void charlotte_dump_table_pxn(const char *tag, unsigned long start,
 			break;
 		charlotte_pt_of(seg, &pgdp, &pmdp);
 		pgdval = pgd_val(*pgdp);
-		pmdval = (pmdp && pmd_table(*pmdp)) ? pmd_val(*pmdp) : 0;
+		pmdval = 0;
+		if (pmdp && pmd_table(*pmdp)) {
+			dcache_clean_inval_poc((unsigned long)pmdp,
+					       (unsigned long)pmdp + sizeof(pmd_t));
+			pmdval = pmd_val(*pmdp);
+		}
 		pr_info("charlotte-pt: %s %px pgd=%016llx pmd=%016llx c=%d\n",
 			tag, (void *)seg, (unsigned long long)pgdval,
 			(unsigned long long)pmdval, !uncached);
@@ -267,6 +303,10 @@ void charlotte_clear_table_pxn(unsigned long start, unsigned long size)
 				(unsigned long long)pmd_val(*pmdp));
 		}
 	}
+
+#ifdef CONFIG_ARM64_CHARLOTTE_SYNC_LEAF_PTES
+	charlotte_sync_leaf_stores(start, size);
+#endif
 
 	if (changed) {
 		dsb(ishst);
@@ -1719,6 +1759,18 @@ void __init paging_init(void)
 			read_sysreg(sctlr_el1), read_sysreg(id_aa64pfr0_el1));
 #endif
 #endif
+#ifdef CONFIG_ARM64_CHARLOTTE_LITTLE_ONLY
+	if (charlotte_pgtable_sync) {
+		setup_max_cpus = min_t(unsigned int, setup_max_cpus, 4);
+		pr_info("charlotte-diag: boot CPUs limited to %u\n",
+			setup_max_cpus);
+	}
+#endif
+#ifdef CONFIG_ARM64_CHARLOTTE_NO_TLB_RANGE
+	if (charlotte_pgtable_sync)
+		pr_info("charlotte-diag: TLB range invalidation disabled\n");
+#endif
+
 	map_mem();
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
