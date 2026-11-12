@@ -20,9 +20,11 @@ int set_memory_encrypted(unsigned long addr, int numpages);
 int set_memory_decrypted(unsigned long addr, int numpages);
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+bool charlotte_exec_window(unsigned long *start, unsigned long *end);
 void charlotte_clear_table_pxn(unsigned long start, unsigned long size);
 void charlotte_dump_table_pxn(const char *tag, unsigned long start, unsigned long size);
 #else
+static inline bool charlotte_exec_window(unsigned long *start, unsigned long *end) { return false; }
 static inline void charlotte_clear_table_pxn(unsigned long start, unsigned long size) { }
 static inline void charlotte_dump_table_pxn(const char *tag, unsigned long start, unsigned long size) { }
 #endif
