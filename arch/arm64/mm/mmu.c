@@ -91,6 +91,71 @@ static bool charlotte_skip_table_pxn(void)
 }
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+/*
+ * The firmware on charlotte forces table-level PXN on page-table entries
+ * created after boot (both the swapper_pg_dir fixmap store and plain PMD
+ * descriptor stores appear to be dropped), so executable mappings made at
+ * runtime can never run.  Keep executable allocations inside the kernel
+ * image's own 1GB window, whose PGD entry is created at boot with no
+ * PXNTable, and preseed the PMD/PTE tables there while paging_init() is
+ * still running so vmap() only ever has to write leaf PTEs.
+ */
+bool __init charlotte_exec_window(unsigned long *start, unsigned long *end)
+{
+	unsigned long base, lo, hi;
+
+	if (!charlotte_pgtable_sync)
+		return false;
+
+	base = (unsigned long)_text & PGDIR_MASK;
+	lo = ALIGN((unsigned long)_end, PAGE_SIZE);
+	hi = base + PGDIR_SIZE;
+	if (hi <= lo || hi - lo < SZ_64M)
+		return false;
+	if (lo + SZ_256M < hi)
+		hi = lo + SZ_256M;
+
+	*start = lo;
+	*end = hi;
+	return true;
+}
+
+static void __init charlotte_preseed_exec_ptes(void)
+{
+	unsigned long start, end, addr;
+
+	if (!charlotte_exec_window(&start, &end))
+		return;
+
+	for (addr = start; addr < end; addr += PMD_SIZE) {
+		p4d_t *p4dp;
+		pud_t *pudp;
+		pmd_t *pmdp;
+		pte_t *ptep;
+		pgd_t *pgdp = pgd_offset_k(addr);
+
+		if (!(pgd_val(*pgdp) & PTE_VALID))
+			continue;
+		p4dp = p4d_offset(pgdp, addr);
+		pudp = pud_offset(p4dp, addr);
+		if (!pud_present(*pudp) || pud_leaf(*pudp))
+			continue;
+		pmdp = pmd_offset(pudp, addr);
+		if (!pmd_none(*pmdp))
+			continue;
+
+		ptep = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
+		if (!ptep)
+			break;
+		set_pmd(pmdp, __pmd(__phys_to_pmd_val(__pa(ptep)) |
+				    PMD_TYPE_TABLE | PMD_TABLE_AF |
+				    PMD_TABLE_UXN));
+	}
+
+	pr_info("charlotte-pt: preseeded exec page tables %#lx..%#lx\n",
+		start, end);
+}
+
 static void charlotte_pt_of(unsigned long addr, pgd_t **pgdp, pmd_t **pmdp)
 {
 	p4d_t *p4dp;
@@ -1636,6 +1701,10 @@ void __init paging_init(void)
 #endif
 #endif
 	map_mem();
+
+#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
+	charlotte_preseed_exec_ptes();
+#endif
 
 	memblock_allow_resize();
 

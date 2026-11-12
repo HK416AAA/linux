@@ -47,6 +47,7 @@
 #include <asm/rsi.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
+#include <asm/set_memory.h>
 #include <linux/sizes.h>
 #include <asm/tlb.h>
 #include <asm/alternative.h>
@@ -512,35 +513,6 @@ static int __init module_init_limits(void)
 
 static struct execmem_info execmem_info __ro_after_init;
 
-#ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-/*
- * On charlotte the firmware prepopulates some top-level entries in the
- * module/vmalloc region with the table-level PXN bit, and stores through
- * the swapper_pg_dir fixmap do not take effect, so executable module text
- * placed in those 1GB windows can never run.  Put executable allocations
- * in the kernel image's own 1GB window instead: its PGD entry is known to
- * be clean (the kernel itself executes from it) and the space above _end
- * up to the next 1GB boundary is unused.
- */
-static bool __init charlotte_clean_execmem_range(unsigned long *start,
-						 unsigned long *end)
-{
-	unsigned long img_base = (unsigned long)_text & PGDIR_MASK;
-	unsigned long lo = ALIGN((unsigned long)_end, PAGE_SIZE);
-	unsigned long hi = img_base + PGDIR_SIZE;
-
-	if (!of_flat_dt_is_compatible(of_get_flat_dt_root(),
-				      "hisilicon,charlotte"))
-		return false;
-	if (hi <= lo || hi - lo < SZ_16M)
-		return false;
-
-	*start = lo;
-	*end = hi;
-	return true;
-}
-#endif
-
 struct execmem_info __init *execmem_arch_setup(void)
 {
 	unsigned long fallback_start = 0, fallback_end = 0;
@@ -569,7 +541,7 @@ struct execmem_info __init *execmem_arch_setup(void)
 	}
 
 #ifdef CONFIG_ARM64_CHARLOTTE_PGTABLE_SYNC
-	charlotte_clean_range = charlotte_clean_execmem_range(&start, &end);
+	charlotte_clean_range = charlotte_exec_window(&start, &end);
 	if (charlotte_clean_range) {
 		fallback_start = 0;
 		fallback_end = 0;
