@@ -70,6 +70,7 @@ struct charlotte_dpu {
 	struct mutex diagnostic_lock;
 	struct i2c_client *backlight;
 	bool backlight_on;
+	bool backlight_ro;
 	int irq;
 	bool irq_requested, irq_running, irq_storm;
 	u64 irq_count, irq_window_ns;
@@ -111,12 +112,21 @@ static int charlotte_backlight_probe(struct i2c_client *client)
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
 		return -EOPNOTSUPP;
 	value = i2c_smbus_read_byte_data(client, 0x0b);
+	/* Bind even when the LED control register cannot be read.  The DPU
+	 * consumer is linked to this supplier through the backlight phandle,
+	 * so a failing probe would keep the whole display deferred forever.
+	 * The firmware already left the panel lit; the KMS handoff must not
+	 * depend on gaining backlight control first.
+	 */
 	if (value < 0)
-		return dev_err_probe(&client->dev, value, "backlight LED control read\n");
-	if (!(value & 0x7e))
-		return dev_err_probe(&client->dev, -ENODEV, "backlight has no enabled LED channels\n");
+		dev_warn(&client->dev,
+			 "LED control read failed: %d; keeping firmware brightness\n", value);
+	else if (!(value & 0x7e))
+		dev_warn(&client->dev,
+			 "no enabled LED channels (0x%02x); keeping firmware brightness\n", value);
+	else
+		dev_info(&client->dev, "RT4539 LED control=%02x; retaining firmware brightness\n", value);
 	i2c_set_clientdata(client, client);
-	dev_info(&client->dev, "RT4539 LED control=%02x; retaining firmware brightness\n", value);
 	return 0;
 }
 static const struct of_device_id charlotte_backlight_match[] = {
@@ -150,8 +160,15 @@ static int charlotte_backlight_init(struct charlotte_dpu *dpu)
 	if (ret)
 		return ret;
 	value = i2c_smbus_read_byte_data(client, 0x0b);
-	if (value < 0)
-		return value;
+	if (value < 0) {
+		dev_warn(dpu->drm.dev,
+			 "backlight LED control read failed: %d; preserving firmware state\n",
+			 value);
+		dpu->backlight = client;
+		dpu->backlight_on = true;
+		dpu->backlight_ro = true;
+		return 0;
+	}
 	dpu->backlight = client;
 	dpu->backlight_on = !!(value & BIT(7));
 	return 0;
@@ -159,6 +176,11 @@ static int charlotte_backlight_init(struct charlotte_dpu *dpu)
 static void charlotte_backlight_power(struct charlotte_dpu *dpu, bool on)
 {
 	int value, ret;
+	/* Leave the panel at the brightness the firmware programmed when the
+	 * LED control register never became readable.
+	 */
+	if (!dpu->backlight || dpu->backlight_ro)
+		return;
 	/* Atomic commits serialize enable/disable; all I2C operations are in
 	 * process context and use the adapter lock, never raw MMIO in the IRQ.
 	 */
