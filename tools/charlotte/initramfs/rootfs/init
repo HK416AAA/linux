@@ -11,6 +11,8 @@ mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
 
+exec </dev/console >/dev/console 2>&1
+
 echo
 echo "=============================================="
 echo " charlotte initramfs: userspace reached"
