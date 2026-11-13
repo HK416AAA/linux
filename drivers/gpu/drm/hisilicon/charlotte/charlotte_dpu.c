@@ -87,6 +87,7 @@ MODULE_PARM_DESC(strict_handoff, "Refuse to take over when the firmware register
 
 struct charlotte_dpu {
 	struct drm_device drm;
+	struct device *dev;
 	struct drm_plane plane;
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
@@ -486,7 +487,7 @@ static void charlotte_cmdlist_release(struct charlotte_dpu *dpu)
 {
 	if (!dpu->cmdlist_buf)
 		return;
-	dma_free_coherent(dpu->drm.dev, CMDLIST_HDR_SIZE + DM_PARAM_SIZE,
+	dma_free_coherent(dpu->dev, CMDLIST_HDR_SIZE + DM_PARAM_SIZE,
 		dpu->cmdlist_buf, dpu->cmdlist_dma);
 	dpu->cmdlist_buf = NULL;
 	dpu->cmdlist_item = NULL;
@@ -501,7 +502,7 @@ static void charlotte_cmdlist_release(struct charlotte_dpu *dpu)
 static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 {
 	size_t size = CMDLIST_HDR_SIZE + DM_PARAM_SIZE;
-	struct device *dev = dpu->drm.dev;
+	struct device *dev = dpu->dev;
 	u32 *hdr, *item;
 	unsigned int i;
 
@@ -695,7 +696,7 @@ static ssize_t charlotte_pattern_write(struct file *file, const char __user *buf
 	    dpu->test_active || dpu->frame_count < 10)
 		return -EINVAL;
 	if (!dpu->test_vaddr) {
-		dpu->test_vaddr = dma_alloc_wc(dpu->drm.dev, TEST_SIZE, &dpu->test_address,
+		dpu->test_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE, &dpu->test_address,
 			GFP_KERNEL | __GFP_NOWARN);
 		if (!dpu->test_vaddr)
 			return -ENOMEM;
@@ -918,7 +919,7 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	ret = charlotte_backlight_init(dpu);
 	if (ret)
 		return dev_err_probe(drm->dev, ret, "backlight supplier unavailable\n");
-	dpu->blank_vaddr = dma_alloc_wc(drm->dev, TEST_SIZE, &dpu->blank_address,
+	dpu->blank_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE, &dpu->blank_address,
 		GFP_KERNEL | __GFP_NOWARN);
 	if (!dpu->blank_vaddr)
 		return -ENOMEM;
@@ -1003,12 +1004,12 @@ static void charlotte_stop(void *data)
 	flush_work(&dpu->retire_work);
 	debugfs_remove_recursive(dpu->debugfs);
 	if (dpu->test_vaddr && !dpu->test_active)
-		dma_free_wc(dpu->drm.dev, TEST_SIZE, dpu->test_vaddr, dpu->test_address);
+		dma_free_wc(dpu->dev, TEST_SIZE, dpu->test_vaddr, dpu->test_address);
 	/* A stopped/storming IRQ does not prove the black buffer is no longer
 	 * scanned. Keep it pinned if firmware restoration was not confirmed.
 	 */
 	if (dpu->blank_vaddr && restored)
-		dma_free_wc(dpu->drm.dev, TEST_SIZE, dpu->blank_vaddr, dpu->blank_address);
+		dma_free_wc(dpu->dev, TEST_SIZE, dpu->blank_vaddr, dpu->blank_address);
 }
 static int charlotte_probe(struct platform_device *pdev)
 {
@@ -1050,6 +1051,7 @@ static int charlotte_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dpu->irq_stop_work, charlotte_irq_stop_work);
 	INIT_WORK(&dpu->retire_work, charlotte_retire_work);
 	init_completion(&dpu->flip_done);
+	dpu->dev = dev;
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
