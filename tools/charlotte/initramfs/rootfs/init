@@ -21,4 +21,19 @@ echo " cmdline: $(cat /proc/cmdline)"
 echo "=============================================="
 echo
 
+rootdev=$(findfs LABEL=charlotte-root 2>/dev/null)
+if [ -n "$rootdev" ]; then
+	echo "charlotte: found root filesystem on $rootdev"
+	mkdir -p /newroot
+	if mount -t ext4 -o rw "$rootdev" /newroot; then
+		mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp
+		mount -t proc proc /newroot/proc
+		mount -t sysfs sysfs /newroot/sys
+		mount -t devtmpfs devtmpfs /newroot/dev
+		echo "charlotte: switching root to $rootdev"
+		exec switch_root /newroot /sbin/init
+	fi
+	echo "charlotte: cannot mount $rootdev, staying in rescue shell"
+fi
+
 exec setsid cttyhack sh -i
