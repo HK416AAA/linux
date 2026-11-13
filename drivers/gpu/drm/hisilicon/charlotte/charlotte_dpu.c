@@ -50,6 +50,17 @@
 #define DM_ADDRESS_L (DM0 + 0x1e0)
 #define DM_STRIDE (DM0 + 0x1f0)
 #define DMC0 0x40400
+#define DPU_WINDOW_SIZE 0x100000
+#define DACC_SCENE0 0x40400
+#define DACC_GLB0 0x13000
+#define DACC_GLB_DP0_STATUS (DACC_GLB0 + 0x240)
+#define DACC_GLB_DP0_MASK (DACC_GLB0 + 0x244)
+#define DACC_GLB_DP1_STATUS (DACC_GLB0 + 0x248)
+#define DACC_GLB_DP1_MASK (DACC_GLB0 + 0x24c)
+#define DACC_GLB_MDP_STATUS (DACC_GLB0 + 0x250)
+#define DACC_GLB_MDP_MASK (DACC_GLB0 + 0x254)
+#define DACC_GLB_SDP_STATUS (DACC_GLB0 + 0x258)
+#define DACC_GLB_SDP_MASK (DACC_GLB0 + 0x25c)
 #define WIDTH 1840
 #define HEIGHT 2800
 #define TEST_PITCH 7424
@@ -326,6 +337,83 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(charlotte_status);
+
+static int charlotte_reg_show(struct seq_file *s, void *unused)
+{
+	struct charlotte_dpu *dpu = s->private;
+	static const u32 offs[] = {
+		0x000, 0x008, 0x100, 0x104, 0x108, 0x120, 0x124, 0x128, 0x12c,
+		0x130, 0x138, 0x140, 0x144, 0x1a0, 0x1a4, 0x1a8, 0x1ac, 0x1b0,
+		0x1b4, 0x200,
+		DACC_GLB0 + 0x004, DACC_GLB0 + 0x104, DACC_GLB0 + 0x108,
+		DACC_GLB0 + 0x140, DACC_GLB0 + 0x144,
+		DACC_GLB_DP0_STATUS, DACC_GLB_DP0_MASK,
+		DACC_GLB_DP1_STATUS, DACC_GLB_DP1_MASK,
+		DACC_GLB_MDP_STATUS, DACC_GLB_MDP_MASK,
+		DACC_GLB_SDP_STATUS, DACC_GLB_SDP_MASK,
+		0x40000, 0x40008, 0x4000c, 0x40010, 0x40014, 0x40048,
+		DACC_SCENE0 + 0x000, DACC_SCENE0 + 0x004, DACC_SCENE0 + 0x010,
+		DACC_SCENE0 + 0x01c, DACC_SCENE0 + 0x024,
+		DM0, DM_LAYER_SIZE, DM_LAYER_SELECT, DM_LAYER_OV_FMT,
+		DM_ADDRESS_H, DM_ADDRESS_L, DM_STRIDE,
+	};
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(offs); i++)
+		seq_printf(s, "%06x %08x\n", offs[i], readl(dpu->regs + offs[i]));
+	return 0;
+}
+static ssize_t charlotte_reg_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	char tmp[32];
+	unsigned int off, val;
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	if (sscanf(tmp, "%x %x", &off, &val) != 2)
+		return -EINVAL;
+	if ((off & 3) || off >= DPU_WINDOW_SIZE)
+		return -EINVAL;
+	writel(val, dpu->regs + off);
+	return len;
+}
+static int charlotte_reg_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, charlotte_reg_show, inode->i_private);
+}
+static const struct file_operations charlotte_reg_fops = {
+	.owner = THIS_MODULE, .open = charlotte_reg_open, .write = charlotte_reg_write,
+	.read = seq_read, .llseek = seq_lseek, .release = single_release,
+};
+static ssize_t charlotte_dacc_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned int value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+	if (ret)
+		return ret;
+	if (value != 1)
+		return -EINVAL;
+	/* Vendor dpu_dacc_config_scene(): online scene keeps ST_FRM_SEL0 cleared. */
+	writel(readl(dpu->regs + DACC_SCENE0) | 1, dpu->regs + DACC_SCENE0);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x04) | 1, dpu->regs + DACC_SCENE0 + 0x04);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) & ~1U, dpu->regs + DACC_SCENE0 + 0x24);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x1c) & ~1U, dpu->regs + DACC_SCENE0 + 0x1c);
+	writel(0, dpu->regs + DACC_GLB_DP0_MASK);
+	writel(0, dpu->regs + DACC_GLB_DP1_MASK);
+	writel(0, dpu->regs + DACC_GLB_MDP_MASK);
+	writel(0, dpu->regs + DACC_GLB_SDP_MASK);
+	dev_info(dpu->drm.dev, "dacc scene0 enabled, DPU interrupt outputs unmasked\n");
+	return len;
+}
+static const struct file_operations charlotte_dacc_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_dacc_write,
+	.llseek = noop_llseek,
+};
 
 static ssize_t charlotte_takeover_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
@@ -817,6 +905,8 @@ static int charlotte_probe(struct platform_device *pdev)
 		return ret;
 	dpu->debugfs = debugfs_create_dir("charlotte-dpu", NULL);
 	debugfs_create_file("status", 0400, dpu->debugfs, dpu, &charlotte_status_fops);
+	debugfs_create_file("reg", 0600, dpu->debugfs, dpu, &charlotte_reg_fops);
+	debugfs_create_file("dacc", 0200, dpu->debugfs, dpu, &charlotte_dacc_fops);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
