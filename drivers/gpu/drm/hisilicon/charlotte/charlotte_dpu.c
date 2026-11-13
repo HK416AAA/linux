@@ -42,6 +42,7 @@
 #define DSI_VACT_START BIT(7)
 #define DSI_VACT_END BIT(8)
 #define DSI_UNDERFLOW BIT(2)
+#define DSI_LCD_TE0 BIT(12)
 #define DM0 0x35400
 #define DM_LAYER_SIZE (DM0 + 0x1a0)
 #define DM_LAYER_SELECT (DM0 + 0x1ac)
@@ -92,7 +93,7 @@ struct charlotte_dpu {
 	bool kms, kms_attempted, pending, latched;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
-	u64 frame_count, vsync_count, underflows, flips;
+	u64 frame_count, vsync_count, te_count, underflows, flips;
 	u64 last_frame_ns, frame_period_ns;
 	dma_addr_t next_address;
 	u32 next_stride;
@@ -247,6 +248,8 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	bool event_ref = false;
 	unsigned long flags;
 	u64 now;
+	/* Command-mode panels pace frames with TE; video panels use LDI VACT. */
+	u32 frame_bit = DSI_VACT_START | DSI_LCD_TE0;
 	/* A wrong/stuck source must not monopolize a CPU until the watchdog fires. */
 	now = ktime_get_ns();
 	dpu->irq_count++;
@@ -267,13 +270,15 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	spin_lock_irqsave(&dpu->lock, flags);
 	if (status & DSI_UNDERFLOW)
 		dpu->underflows++;
-	if (status & DSI_VACT_END && dpu->pending) {
+	if (status & (DSI_VACT_END | DSI_LCD_TE0) && dpu->pending) {
 		program_scanout(dpu, dpu->next_address, dpu->next_stride, dpu->next_format);
 		dpu->pending = false;
 		dpu->latched = true;
 		dpu->flips++;
 	}
-	if (status & DSI_VACT_START) {
+	if (status & DSI_LCD_TE0)
+		dpu->te_count++;
+	if (status & frame_bit) {
 		now = ktime_get_ns();
 		if (dpu->last_frame_ns)
 			dpu->frame_period_ns = now - dpu->last_frame_ns;
@@ -305,7 +310,7 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	if (status & DSI_VSYNC)
 		dpu->vsync_count++;
 	spin_unlock_irqrestore(&dpu->lock, flags);
-	if (dpu->kms && status & DSI_VACT_START) {
+	if (dpu->kms && status & frame_bit) {
 		drm_crtc_handle_vblank(&dpu->crtc);
 		if (event) {
 			spin_lock_irqsave(&dpu->drm.event_lock, flags);
@@ -322,9 +327,9 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	struct charlotte_dpu *dpu = s->private;
 	unsigned long flags;
 	spin_lock_irqsave(&dpu->lock, flags);
-	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u irq_count=%llu frames=%llu vsyncs=%llu period_ns=%llu underflows=%llu flips=%llu\n",
+	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
 		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->irq_count, dpu->frame_count, dpu->vsync_count,
-		dpu->frame_period_ns, dpu->underflows, dpu->flips);
+		dpu->te_count, dpu->frame_period_ns, dpu->underflows, dpu->flips);
 	seq_printf(s, "address=%02x%08x stride=%u pending=%u test_active=%u test_restoring=%u\n",
 		readl(dpu->regs + DM_ADDRESS_H) & 0xff,
 		readl(dpu->regs + DM_ADDRESS_L), readl(dpu->regs + DM_STRIDE),
@@ -353,6 +358,10 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "dsi2_mask", 0x00a4c },
 	{ "dsiglb_dualhdr", 0x00c1c }, { "dsiglb_dualwr", 0x00c24 },
 	{ "cmd0_ctrl", 0x12004 }, { "cmd0_status", 0x12008 }, { "cmd0_curad", 0x12010 },
+	{ "dm_cmdh", 0x35400 }, { "dm_cmd0", 0x35404 }, { "dm_cmd1", 0x35408 },
+	{ "dm_cmd2", 0x3540c }, { "dm_cmd3", 0x35410 }, { "dm_cmd4", 0x35414 },
+	{ "dm_cmd5", 0x35418 }, { "dm_cmd6", 0x3541c }, { "dm_cmd7", 0x35420 },
+	{ "dm_srotnum", 0x35450 }, { "dm_ddicnum", 0x35454 },
 	{ "glb_tag", 0x13000 }, { "glb_jtag", 0x13008 }, { "glb_clken", 0x13104 },
 	{ "glb_pm", 0x13108 }, { "glb_ch0ken", 0x13128 }, { "glb_ch1ken", 0x13130 },
 	{ "glb_avhrken", 0x13138 }, { "glb_dispken", 0x13140 }, { "glb_rst", 0x13144 },
@@ -372,6 +381,9 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "l0_sel", 0x355ac }, { "l0_sblk", 0x355b0 }, { "l0_crop", 0x355b4 },
 	{ "l0_addrh", 0x355dc }, { "l0_addrl", 0x355e0 }, { "l0_stride", 0x355f0 },
 	{ "l1_sel", 0x3562c }, { "l1_addrl", 0x35660 }, { "l1_stride", 0x35670 },
+	{ "itf0_size", 0xcc000 }, { "itf0_flush", 0xcc05c }, { "itf0_datasel", 0xcc068 },
+	{ "psw_sig0", 0xcc400 }, { "psw_sigen0", 0xcc404 }, { "psw_dat0", 0xcc408 },
+	{ "psw_daten0", 0xcc40c }, { "psw_splith", 0xcc48c }, { "psw_splitc", 0xcc490 },
 };
 static int charlotte_reg_show(struct seq_file *s, void *unused)
 {
@@ -393,6 +405,13 @@ static ssize_t charlotte_reg_write(struct file *file, const char __user *buf,
 	if (copy_from_user(tmp, buf, len))
 		return -EFAULT;
 	tmp[len] = '\0';
+	if (sscanf(tmp, "%x %x", &off, &val) == 1) {
+		if ((off & 3) || off >= DPU_WINDOW_SIZE)
+			return -EINVAL;
+		dev_info(dpu->drm.dev, "reg read %06x = %08x\n", off,
+			readl(dpu->regs + off));
+		return len;
+	}
 	if (sscanf(tmp, "%x %x", &off, &val) != 2)
 		return -EINVAL;
 	if ((off & 3) || off >= DPU_WINDOW_SIZE)
@@ -416,18 +435,24 @@ static ssize_t charlotte_dacc_write(struct file *file, const char __user *buf,
 	int ret = kstrtouint_from_user(buf, len, 0, &value);
 	if (ret)
 		return ret;
-	if (value != 1)
+	if (value > 1)
 		return -EINVAL;
-	/* Vendor dpu_dacc_config_scene(): online scene keeps ST_FRM_SEL0 cleared. */
+	/* Vendor dpu_dacc_config_scene(): online scene keeps ST_FRM_SEL0 cleared.
+	 * value 0 selects direct mode, value 1 selects cmdlist mode like vendor.
+	 */
 	writel(readl(dpu->regs + DACC_SCENE0) | 1, dpu->regs + DACC_SCENE0);
 	writel(readl(dpu->regs + DACC_SCENE0 + 0x04) | 1, dpu->regs + DACC_SCENE0 + 0x04);
-	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) & ~1U, dpu->regs + DACC_SCENE0 + 0x24);
+	if (value)
+		writel(readl(dpu->regs + DACC_SCENE0 + 0x24) | 1, dpu->regs + DACC_SCENE0 + 0x24);
+	else
+		writel(readl(dpu->regs + DACC_SCENE0 + 0x24) & ~1U, dpu->regs + DACC_SCENE0 + 0x24);
 	writel(readl(dpu->regs + DACC_SCENE0 + 0x1c) & ~1U, dpu->regs + DACC_SCENE0 + 0x1c);
 	writel(0, dpu->regs + DACC_GLB_DP0_MASK);
 	writel(0, dpu->regs + DACC_GLB_DP1_MASK);
 	writel(0, dpu->regs + DACC_GLB_MDP_MASK);
 	writel(0, dpu->regs + DACC_GLB_SDP_MASK);
-	dev_info(dpu->drm.dev, "dacc scene0 enabled, DPU interrupt outputs unmasked\n");
+	dev_info(dpu->drm.dev, "dacc scene0 enabled (%s mode), DPU interrupt outputs unmasked\n",
+		value ? "cmdlist" : "direct");
 	return len;
 }
 static const struct file_operations charlotte_dacc_fops = {
@@ -501,7 +526,8 @@ static int charlotte_irq_start(struct charlotte_dpu *dpu)
 	writel(~0U, dpu->regs + DSI_MASK);
 	writel(readl(dpu->regs + DSI_INTS), dpu->regs + DSI_INTS);
 	dpu->irq_running = true;
-	writel(~(u32)(DSI_VSYNC | DSI_VACT_START | DSI_VACT_END | DSI_UNDERFLOW), dpu->regs + DSI_MASK);
+	writel(~(u32)(DSI_VSYNC | DSI_VACT_START | DSI_VACT_END | DSI_UNDERFLOW | DSI_LCD_TE0),
+		dpu->regs + DSI_MASK);
 	enable_irq(dpu->irq);
 	return 0;
 }
