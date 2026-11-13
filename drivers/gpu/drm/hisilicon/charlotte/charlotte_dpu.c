@@ -58,6 +58,9 @@
 static bool probe_only;
 module_param(probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only, "Keep simpledrm and expose bounded handoff diagnostics instead of native KMS");
+static bool strict_handoff;
+module_param(strict_handoff, bool, 0444);
+MODULE_PARM_DESC(strict_handoff, "Refuse to take over when the firmware register signature differs from the TGR one");
 
 struct charlotte_dpu {
 	struct drm_device drm;
@@ -763,7 +766,7 @@ static int charlotte_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct charlotte_dpu *dpu;
-	u32 size, select;
+	u32 size, select, dm0_58, dmc0_24;
 	int ret;
 	dpu = devm_drm_dev_alloc(dev, &charlotte_drm_driver, struct charlotte_dpu, drm);
 	if (IS_ERR(dpu))
@@ -775,10 +778,18 @@ static int charlotte_probe(struct platform_device *pdev)
 	/* No SMMU/clock/secure-register probing: only confirmed active DPU RAM. */
 	size = readl(dpu->regs + DM_LAYER_SIZE);
 	select = readl(dpu->regs + DM_LAYER_SELECT);
+	dm0_58 = readl(dpu->regs + DM0 + 0x58);
+	dmc0_24 = readl(dpu->regs + DMC0 + 0x24);
+	dev_info(dev, "handoff signature size=0x%08x select=0x%08x dm0_58=0x%08x dmc0_24=0x%08x address=0x%08x%08x stride=0x%08x ov_fmt=0x%08x\n",
+		size, select, dm0_58, dmc0_24,
+		readl(dpu->regs + DM_ADDRESS_H), readl(dpu->regs + DM_ADDRESS_L),
+		readl(dpu->regs + DM_STRIDE), readl(dpu->regs + DM_LAYER_OV_FMT));
 	if (size != ((HEIGHT - 1) << 16 | (WIDTH - 1)) || select != 0x02000d00 ||
-		readl(dpu->regs + DM0 + 0x58) != 0x01010001 ||
-		readl(dpu->regs + DMC0 + 0x24) != 0)
-		return dev_err_probe(dev, -ENODEV, "unsupported firmware handoff configuration\n");
+		dm0_58 != 0x01010001 || dmc0_24 != 0) {
+		if (strict_handoff)
+			return dev_err_probe(dev, -ENODEV, "unsupported firmware handoff configuration\n");
+		dev_warn(dev, "firmware signature differs from the TGR handoff state; taking over anyway\n");
+	}
 	dpu->boot_address_h = readl(dpu->regs + DM_ADDRESS_H);
 	dpu->boot_address_l = readl(dpu->regs + DM_ADDRESS_L);
 	dpu->boot_stride = readl(dpu->regs + DM_STRIDE);
