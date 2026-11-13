@@ -420,7 +420,7 @@ static int charlotte_reg_show(struct seq_file *s, void *unused)
 static ssize_t charlotte_reg_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
 {
-	struct charlotte_dpu *dpu = file->private_data;
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
 	char tmp[32];
 	unsigned int off, val;
 	if (!len || len >= sizeof(tmp))
@@ -545,7 +545,7 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 static ssize_t charlotte_cmdlist_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
 {
-	struct charlotte_dpu *dpu = file->private_data;
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
 	unsigned int value;
 	int ret = kstrtouint_from_user(buf, len, 0, &value);
 	if (ret)
