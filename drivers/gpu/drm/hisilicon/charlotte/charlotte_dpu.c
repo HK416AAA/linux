@@ -78,7 +78,7 @@
 #define TEST_PITCH 7424
 #define TEST_SIZE PAGE_ALIGN(TEST_PITCH * HEIGHT)
 
-static bool probe_only;
+static bool probe_only = true;
 module_param(probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only, "Keep simpledrm and expose bounded handoff diagnostics instead of native KMS");
 static bool strict_handoff;
