@@ -71,6 +71,11 @@ jobs:
             --workdir /tmp/cpio2ext4-work
           ls -l "$IMG_DIR"
 
+      - name: Pack the rescue initramfs
+        run: |
+          mkdir -p out
+          sudo bash tools/charlotte/initramfs/pack.sh out/charlotte-rescue.cpio.gz
+
       - name: Embed device tree into Image
         run: |
           mkdir -p out
