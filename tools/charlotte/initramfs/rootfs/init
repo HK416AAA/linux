@@ -21,19 +21,46 @@ echo " cmdline: $(cat /proc/cmdline)"
 echo "=============================================="
 echo
 
+try_root() {
+	mount -t ext4 -o ro "$1" /newroot 2>/dev/null || return 1
+	if [ -e /newroot/etc/os-release ] &&
+		{ [ -x /newroot/usr/sbin/init ] || [ -x /newroot/sbin/init ]; }; then
+		mount -o remount,rw /newroot 2>/dev/null
+		return 0
+	fi
+	umount /newroot
+	return 1
+}
+
+mkdir -p /newroot
+
 rootdev=$(findfs LABEL=charlotte-root 2>/dev/null)
 if [ -n "$rootdev" ]; then
-	echo "charlotte: found root filesystem on $rootdev"
-	mkdir -p /newroot
-	if mount -t ext4 -o rw "$rootdev" /newroot; then
-		mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp
-		mount -t proc proc /newroot/proc
-		mount -t sysfs sysfs /newroot/sys
-		mount -t devtmpfs devtmpfs /newroot/dev
-		echo "charlotte: switching root to $rootdev"
-		exec switch_root /newroot /sbin/init
-	fi
-	echo "charlotte: cannot mount $rootdev, staying in rescue shell"
+	try_root "$rootdev" || rootdev=
 fi
 
+if [ -z "$rootdev" ]; then
+	for part in /dev/sd* /dev/mmcblk*p* /dev/nvme*p*; do
+		case "$part" in
+		*[0-9])
+			if try_root "$part"; then
+				rootdev=$part
+				break
+			fi
+			;;
+		esac
+	done
+fi
+
+if [ -n "$rootdev" ]; then
+	echo "charlotte: found root filesystem on $rootdev"
+	mkdir -p /newroot/proc /newroot/sys /newroot/dev
+	mount -t proc proc /newroot/proc
+	mount -t sysfs sysfs /newroot/sys
+	mount -t devtmpfs devtmpfs /newroot/dev
+	echo "charlotte: switching root to $rootdev"
+	exec switch_root /newroot /usr/sbin/init
+fi
+
+echo "charlotte: no root filesystem found, staying in rescue shell"
 exec setsid cttyhack sh -i

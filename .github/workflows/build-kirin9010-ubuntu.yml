@@ -71,10 +71,13 @@ jobs:
             --workdir /tmp/cpio2ext4-work
           ls -l "$IMG_DIR"
 
-      - name: Pack the rescue initramfs
+      - name: Pack the rescue ramdisk
         run: |
           mkdir -p out
           sudo bash tools/charlotte/initramfs/pack.sh out/charlotte-rescue.cpio.gz
+          python3 tools/charlotte/mkbootimg.py \
+            --ramdisk out/charlotte-rescue.cpio.gz \
+            --out out/charlotte-ramdisk.img
 
       - name: Embed device tree into Image
         run: |
