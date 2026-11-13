@@ -51,6 +51,17 @@
 #define DM_ADDRESS_L (DM0 + 0x1e0)
 #define DM_STRIDE (DM0 + 0x1f0)
 #define DMC0 0x40400
+/* Vendor dpu_dm_param image: 170 sixteen-byte items starting at DM0. */
+#define DM_PARAM_SIZE 0xaa0
+#define CMDLIST_HDR_SIZE 16
+#define CMDLIST_ITEM_SIZE 16
+#define DM_PARAM_ITEMS ((DM_PARAM_SIZE) / (CMDLIST_ITEM_SIZE))
+/* Layer0 fields inside the DM image, as word indices. */
+#define DM_W_START_ADDR_H ((0x1dc) / 4)
+#define DM_W_START_ADDR_L ((0x1e0) / 4)
+#define DM_W_STRIDE ((0x1f0) / 4)
+#define DM_W_DMA_SEL ((0x1ac) / 4)
+#define DM_W_LAYER_HEIGHT ((0x1a0) / 4)
 #define DPU_WINDOW_SIZE 0x100000
 #define DACC_SCENE0 0x40400
 #define DACC_GLB0 0x13000
@@ -93,6 +104,9 @@ struct charlotte_dpu {
 	bool kms, kms_attempted, pending, latched;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
+	void *cmdlist_buf;
+	dma_addr_t cmdlist_dma;
+	u32 *cmdlist_item;
 	u64 frame_count, vsync_count, te_count, underflows, flips;
 	u64 last_frame_ns, frame_period_ns;
 	dma_addr_t next_address;
@@ -221,6 +235,14 @@ error:
 
 static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
 {
+	if (dpu->cmdlist_item) {
+		dpu->cmdlist_item[DM_W_START_ADDR_H] = upper_32_bits(addr);
+		dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
+		dpu->cmdlist_item[DM_W_STRIDE] = pitch;
+		dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
+			(format == DRM_FORMAT_XRGB8888 ? 5U : 13U) << 8;
+		wmb();
+	}
 	u32 hw_format = format == DRM_FORMAT_XRGB8888 ? 5 : 13;
 	/* GPL opr_set_sdma_layer_fmt sets both the DMA and dynamic DFC formats.
 	 * Firmware uses ABGR (13); GNOME's opaque BGRA buffers use XRGB (5).
@@ -458,6 +480,98 @@ static ssize_t charlotte_dacc_write(struct file *file, const char __user *buf,
 static const struct file_operations charlotte_dacc_fops = {
 	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_dacc_write,
 	.llseek = noop_llseek,
+};
+
+static void charlotte_cmdlist_release(struct charlotte_dpu *dpu)
+{
+	if (!dpu->cmdlist_buf)
+		return;
+	dma_free_coherent(dpu->drm.dev, CMDLIST_HDR_SIZE + DM_PARAM_SIZE,
+		dpu->cmdlist_buf, dpu->cmdlist_dma);
+	dpu->cmdlist_buf = NULL;
+	dpu->cmdlist_item = NULL;
+	dpu->cmdlist_dma = 0;
+}
+
+/*
+ * Vendor composer present path: build a DM transport cmdlist whose payload is
+ * the dpu_dm_param register image, point its own cmdlist_addr0 back at itself
+ * so the DACC re-runs it every frame, then hand the header to DM_CMDLIST_ADDR0.
+ */
+static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
+{
+	size_t size = CMDLIST_HDR_SIZE + DM_PARAM_SIZE;
+	struct device *dev = dpu->drm.dev;
+	u32 *hdr, *item;
+	unsigned int i;
+
+	if (dpu->cmdlist_buf)
+		return -EBUSY;
+	dpu->cmdlist_buf = dma_alloc_coherent(dev, size, &dpu->cmdlist_dma, GFP_KERNEL);
+	if (!dpu->cmdlist_buf)
+		return -ENOMEM;
+	memset(dpu->cmdlist_buf, 0, size);
+	item = (u32 *)((u8 *)dpu->cmdlist_buf + CMDLIST_HDR_SIZE);
+	dpu->cmdlist_item = item;
+	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
+		item[i] = readl(dpu->regs + DM0 + i * 4);
+	/* Self-linked DM node: cmdlist_h_addr and cmdlist_addr0 (DM0 + 0/4). */
+	item[0] = upper_32_bits(dpu->cmdlist_dma);
+	item[1] = lower_32_bits(dpu->cmdlist_dma);
+	item[2] = 0;
+	item[3] = 0;
+
+	hdr = dpu->cmdlist_buf;
+	/* valid_flag 0xA5, cmd_mode TRANSPORT, task_end, last. */
+	hdr[0] = (0xa5U << 24) | BIT(23) | BIT(22) | BIT(1);
+	hdr[1] = 0;
+	/* dma_dst_addr is a word offset, items_count excludes the header item. */
+	hdr[2] = ((DM0 >> 2) << 14) | (DM_PARAM_ITEMS - 1);
+	hdr[3] = lower_32_bits(dpu->cmdlist_dma) + CMDLIST_HDR_SIZE;
+	wmb();
+
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) | 1, dpu->regs + DACC_SCENE0 + 0x24);
+	writel(0, dpu->regs + DM0);
+	writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
+	writel(0, dpu->regs + DACC_GLB_DP0_MASK);
+	writel(0, dpu->regs + DACC_GLB_DP1_MASK);
+	writel(0, dpu->regs + DACC_GLB_MDP_MASK);
+	writel(0, dpu->regs + DACC_GLB_SDP_MASK);
+	dev_info(dev, "cmdlist started at %pad (%u items)\n", &dpu->cmdlist_dma,
+		DM_PARAM_ITEMS - 1);
+	return 0;
+}
+static ssize_t charlotte_cmdlist_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned int value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+	if (ret)
+		return ret;
+	if (value > 1)
+		return -EINVAL;
+	if (value)
+		ret = charlotte_cmdlist_start(dpu);
+	else
+		charlotte_cmdlist_release(dpu);
+	return ret ? ret : len;
+}
+static int charlotte_cmdlist_show(struct seq_file *s, void *unused)
+{
+	struct charlotte_dpu *dpu = s->private;
+	seq_printf(s, "active=%u dma=%pad dm_cmd0=%08x\n", dpu->cmdlist_buf != NULL,
+		&dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4));
+	return 0;
+}
+static int charlotte_cmdlist_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, charlotte_cmdlist_show, inode->i_private);
+}
+static const struct file_operations charlotte_cmdlist_fops = {
+	.owner = THIS_MODULE, .open = charlotte_cmdlist_open,
+	.write = charlotte_cmdlist_write, .read = seq_read,
+	.llseek = seq_lseek, .release = single_release,
 };
 
 static ssize_t charlotte_takeover_write(struct file *file, const char __user *buf,
@@ -953,6 +1067,7 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("status", 0400, dpu->debugfs, dpu, &charlotte_status_fops);
 	debugfs_create_file("reg", 0600, dpu->debugfs, dpu, &charlotte_reg_fops);
 	debugfs_create_file("dacc", 0200, dpu->debugfs, dpu, &charlotte_dacc_fops);
+	debugfs_create_file("cmdl", 0600, dpu->debugfs, dpu, &charlotte_cmdlist_fops);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
@@ -971,6 +1086,7 @@ static void charlotte_remove(struct platform_device *pdev)
 		drm_dev_unregister(&dpu->drm);
 		drm_atomic_helper_shutdown(&dpu->drm);
 	}
+	charlotte_cmdlist_release(dpu);
 	of_reserved_mem_device_release(&pdev->dev);
 }
 static void charlotte_shutdown(struct platform_device *pdev)
