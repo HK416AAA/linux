@@ -439,7 +439,7 @@ install -D -m 0644 "$HERE/firmware/cfg_mro_w00_vb.ini" \
 	"$ROOTFS/lib/firmware/hi11xx/cfg_mro_w00_vb.ini"
 
 # 5. Publish the initramfs and a standalone module tree.
-tar -C "$MODTREE" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
+tar -C "$MODTREE/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
 (cd "$ROOTFS" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "$OUT/$IMAGE_NAME.cpio.gz"
 
 echo "modules : $OUT/modules-$KERNEL_RELEASE.tar.gz"
