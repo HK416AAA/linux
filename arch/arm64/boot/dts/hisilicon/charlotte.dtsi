@@ -676,6 +676,17 @@
 			reg = <0x0 0x34380000 0x0 0x7080000>;
 			no-map;
 		};
+
+		/*
+		 * The firmware leaves layer0 scanning this System RAM range
+		 * (DM start address 0x53458000).  Keep it out of the buddy
+		 * allocator so simpledrm can own it without the kernel
+		 * recycling pages underneath the scanout.
+		 */
+		scanout_fb: scanout-fb@53458000 {
+			reg = <0x0 0x53458000 0x0 0x2000000>;
+			no-map;
+		};
 	};
 
 	/*
@@ -685,12 +696,13 @@
 	 * B,G,R,X (red 16:8, green 8:8, blue 0:8 -> "x8b8g8r8").  The old
 	 * 2800x1840/11200 guess produced the v49 horizontal tearing.
 	 */
-	framebuffer@34380000 {
+	framebuffer@53458000 {
 		compatible = "simple-framebuffer";
-		reg = <0x0 0x34380000 0x0 0x13aa000>;
+		reg = <0x0 0x53458000 0x0 0x13aa000>;
 		width = <1840>;
 		height = <2800>;
 		stride = <7360>;
 		format = "x8b8g8r8";
+		memory-region = <&scanout_fb>;
 	};
 };
