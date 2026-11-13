@@ -338,28 +338,48 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(charlotte_status);
 
+struct charlotte_reg_desc {
+	const char *name;
+	u32 off;
+};
+static const struct charlotte_reg_desc charlotte_regs[] = {
+	{ "dsi0_pm", 0x00198 }, { "dsi0_ldi", 0x001b8 }, { "dsi0_cmdmod", 0x001c0 },
+	{ "dsi0_te", 0x001c4 }, { "dsi0_frmmsk", 0x001d4 }, { "dsi0_frmvalid", 0x001d8 },
+	{ "dsi0_vinact", 0x001dc }, { "dsi0_vstate", 0x001fc }, { "dsi0_ints", 0x00248 },
+	{ "dsi0_mask", 0x0024c },
+	{ "dsi1_pm", 0x00598 }, { "dsi1_ldi", 0x005b8 }, { "dsi1_ints", 0x00648 },
+	{ "dsi1_mask", 0x0064c },
+	{ "dsi2_pm", 0x00998 }, { "dsi2_ldi", 0x009b8 }, { "dsi2_ints", 0x00a48 },
+	{ "dsi2_mask", 0x00a4c },
+	{ "dsiglb_dualhdr", 0x00c1c }, { "dsiglb_dualwr", 0x00c24 },
+	{ "cmd0_ctrl", 0x12004 }, { "cmd0_status", 0x12008 }, { "cmd0_curad", 0x12010 },
+	{ "glb_tag", 0x13000 }, { "glb_jtag", 0x13008 }, { "glb_clken", 0x13104 },
+	{ "glb_pm", 0x13108 }, { "glb_ch0ken", 0x13128 }, { "glb_ch1ken", 0x13130 },
+	{ "glb_avhrken", 0x13138 }, { "glb_dispken", 0x13140 }, { "glb_rst", 0x13144 },
+	{ "glb_dfsok", 0x13200 },
+	{ "dp0_stat", 0x13240 }, { "dp0_mask", 0x13244 }, { "dp1_stat", 0x13248 },
+	{ "dp1_mask", 0x1324c }, { "mdp_stat", 0x13250 }, { "mdp_mask", 0x13254 },
+	{ "sdp_stat", 0x13258 }, { "sdp_mask", 0x1325c },
+	{ "dacc_int", 0x40000 }, { "dacc_intmsk", 0x40004 }, { "dacc_resetpc", 0x40008 },
+	{ "dacc_cfg", 0x4000c }, { "dacc_status", 0x40010 }, { "dacc_monpc", 0x40014 },
+	{ "dacc_monlr", 0x40018 }, { "dacc_ckgen", 0x40048 },
+	{ "sc0_clksel", 0x40400 }, { "sc0_clken", 0x40404 }, { "sc0_swstart", 0x40410 },
+	{ "sc0_stfrm", 0x4041c }, { "sc0_cfgmode", 0x40424 },
+	{ "dm_num", 0x35458 }, { "dm_scene", 0x3545c }, { "dm_ovwidth", 0x35460 },
+	{ "dm_srot0_w", 0x354a0 }, { "dm_srot0_ow", 0x354a4 }, { "dm_srot0_fmt", 0x354a8 },
+	{ "dm_srot1_w", 0x354b0 }, { "dm_srot1_ow", 0x354b4 },
+	{ "l0_size", 0x355a0 }, { "l0_maskx", 0x355a4 }, { "l0_masky", 0x355a8 },
+	{ "l0_sel", 0x355ac }, { "l0_sblk", 0x355b0 }, { "l0_crop", 0x355b4 },
+	{ "l0_addrh", 0x355dc }, { "l0_addrl", 0x355e0 }, { "l0_stride", 0x355f0 },
+	{ "l1_sel", 0x3562c }, { "l1_addrl", 0x35660 }, { "l1_stride", 0x35670 },
+};
 static int charlotte_reg_show(struct seq_file *s, void *unused)
 {
 	struct charlotte_dpu *dpu = s->private;
-	static const u32 offs[] = {
-		0x000, 0x008, 0x100, 0x104, 0x108, 0x120, 0x124, 0x128, 0x12c,
-		0x130, 0x138, 0x140, 0x144, 0x1a0, 0x1a4, 0x1a8, 0x1ac, 0x1b0,
-		0x1b4, 0x200,
-		DACC_GLB0 + 0x004, DACC_GLB0 + 0x104, DACC_GLB0 + 0x108,
-		DACC_GLB0 + 0x140, DACC_GLB0 + 0x144,
-		DACC_GLB_DP0_STATUS, DACC_GLB_DP0_MASK,
-		DACC_GLB_DP1_STATUS, DACC_GLB_DP1_MASK,
-		DACC_GLB_MDP_STATUS, DACC_GLB_MDP_MASK,
-		DACC_GLB_SDP_STATUS, DACC_GLB_SDP_MASK,
-		0x40000, 0x40008, 0x4000c, 0x40010, 0x40014, 0x40048,
-		DACC_SCENE0 + 0x000, DACC_SCENE0 + 0x004, DACC_SCENE0 + 0x010,
-		DACC_SCENE0 + 0x01c, DACC_SCENE0 + 0x024,
-		DM0, DM_LAYER_SIZE, DM_LAYER_SELECT, DM_LAYER_OV_FMT,
-		DM_ADDRESS_H, DM_ADDRESS_L, DM_STRIDE,
-	};
 	unsigned int i;
-	for (i = 0; i < ARRAY_SIZE(offs); i++)
-		seq_printf(s, "%06x %08x\n", offs[i], readl(dpu->regs + offs[i]));
+	for (i = 0; i < ARRAY_SIZE(charlotte_regs); i++)
+		seq_printf(s, "%-13s %06x %08x\n", charlotte_regs[i].name,
+			charlotte_regs[i].off, readl(dpu->regs + charlotte_regs[i].off));
 	return 0;
 }
 static ssize_t charlotte_reg_write(struct file *file, const char __user *buf,
