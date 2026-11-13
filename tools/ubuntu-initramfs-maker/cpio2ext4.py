@@ -181,17 +181,113 @@ def verify_devices(image, nodes, dest):
     return len(nodes)
 
 
-def compare_manifests(first, second, label_first, label_second, limit=20):
-    only_first = sorted(set(first) - set(second))
-    only_second = sorted(set(second) - set(first))
-    if not only_first and not only_second:
-        return
-    print("manifest mismatch between {} and {}".format(label_first, label_second))
-    for line in only_first[:limit]:
-        print("  only in {}: {}".format(label_first, line))
-    for line in only_second[:limit]:
-        print("  only in {}: {}".format(label_second, line))
-    raise SystemExit("manifest verification failed")
+STAT_FMT = {
+    "regular": stat.S_IFREG,
+    "directory": stat.S_IFDIR,
+    "symlink": stat.S_IFLNK,
+    "character special": stat.S_IFCHR,
+    "block special": stat.S_IFBLK,
+    "FIFO": stat.S_IFIFO,
+    "socket": stat.S_IFSOCK,
+}
+
+
+def stat_image(image, rels):
+    """Read the authoritative metadata straight out of the image.
+
+    ``debugfs rdump`` creates plain files with the caller's umask, so it
+    drops setuid/setgid/sticky bits and device modes.  ``stat`` reports the
+    on-disk inode instead, and one debugfs session covers every path.
+    """
+    for rel in rels:
+        if '"' in rel or "\n" in rel:
+            raise SystemExit("unsupported character in path: {!r}".format(rel))
+    commands = "\n".join('stat "/{}"'.format(rel) for rel in rels) + "\n"
+    handle, path = tempfile.mkstemp(prefix="stat.", suffix=".debugfs")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            stream.write(commands)
+        result = subprocess.run(
+            ["debugfs", "-f", path, image], capture_output=True, text=True
+        )
+    finally:
+        os.unlink(path)
+    blocks = result.stdout.split("Inode:")[1:]
+    if len(blocks) != len(rels):
+        raise SystemExit(
+            "debugfs returned {} stat blocks for {} paths".format(len(blocks), len(rels))
+        )
+    return dict(zip(rels, blocks))
+
+
+def parse_stat(text):
+    kind = re.search(r"Type:\s+(.+?)\s+Mode:\s+([0-7]+)", text)
+    ids = re.search(r"User:\s+(\d+)\s+Group:\s+(\d+)", text)
+    size = re.search(r"Size:\s+(\d+)", text)
+    dev = re.search(r"Device major/minor number:\s+(\d+):(\d+)", text)
+    if not (kind and ids):
+        raise SystemExit("cannot parse debugfs stat output")
+    return {
+        "type": kind.group(1).strip(),
+        "mode": int(kind.group(2), 8),
+        "uid": int(ids.group(1)),
+        "gid": int(ids.group(2)),
+        "size": int(size.group(1)) if size else 0,
+        "dev": (int(dev.group(1)), int(dev.group(2))) if dev else None,
+    }
+
+
+def compare_image_metadata(image, tree_manifest, limit=20):
+    expected = {}
+    order = []
+    for entry in tree_manifest:
+        fields = entry.split("\t")
+        if len(fields) != 7:
+            raise SystemExit("cannot parse manifest entry: {!r}".format(entry))
+        rel = fields[0]
+        expected[rel] = {
+            "type": int(fields[1]),
+            "mode": int(fields[2], 8),
+            "uid": int(fields[3]),
+            "gid": int(fields[4]),
+            "size": int(fields[5]),
+            "extra": fields[6],
+        }
+        order.append(rel)
+
+    blocks = stat_image(image, order)
+    problems = []
+    for rel in order:
+        want = expected[rel]
+        got = parse_stat(blocks[rel])
+        got_fmt = STAT_FMT.get(got["type"])
+        if got_fmt != want["type"]:
+            problems.append("{}: type {} != {}".format(rel, got["type"], want["type"]))
+            continue
+        if got["mode"] != want["mode"]:
+            problems.append(
+                "{}: mode {:04o} != {:04o}".format(rel, got["mode"], want["mode"])
+            )
+        if (got["uid"], got["gid"]) != (want["uid"], want["gid"]):
+            problems.append(
+                "{}: owner {}:{} != {}:{}".format(
+                    rel, got["uid"], got["gid"], want["uid"], want["gid"]
+                )
+            )
+        if want["type"] == stat.S_IFREG and got["size"] != want["size"]:
+            problems.append("{}: size {} != {}".format(rel, got["size"], want["size"]))
+        if want["type"] in (stat.S_IFCHR, stat.S_IFBLK):
+            major, minor = want["extra"].split(":")
+            if got["dev"] != (int(major), int(minor)):
+                problems.append(
+                    "{}: device {} != {}".format(rel, got["dev"], want["extra"])
+                )
+    if problems:
+        print("\n".join(problems[:limit]))
+        if len(problems) > limit:
+            print("... {} more".format(len(problems) - limit))
+        raise SystemExit("image metadata differs from the cpio")
+    return len(order)
 
 
 def tree_files(root, skip_top=()):
@@ -218,8 +314,18 @@ def tree_files(root, skip_top=()):
 def compare_payload(first, second, skip_top=(), limit=20):
     left = tree_files(first, skip_top)
     right = tree_files(second, skip_top)
+    special = set()
+    for rel, value in left.items():
+        if value[0] != "other":
+            continue
+        st = os.lstat(os.path.join(first, rel))
+        if stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode) \
+                or stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):
+            special.add(rel)
     problems = []
     for rel in sorted(set(left) | set(right)):
+        if rel in special:
+            continue
         if left.get(rel) != right.get(rel):
             problems.append("{}\n    cpio: {}\n    ext4: {}".format(
                 rel, left.get(rel), right.get(rel)))
@@ -460,9 +566,8 @@ def main():
     if not any(entry == "lost+found" or entry.startswith("lost+found/")
                for entry in tree_manifest):
         skip_top = ("lost+found",)
-    dump_manifest = manifest(dumped, skip_top=skip_top)
-    compare_manifests(tree_manifest, dump_manifest, "cpio", "ext4")
-    print("ext4   : metadata matches the cpio")
+    checked = compare_image_metadata(raw, tree_manifest)
+    print("ext4   : metadata of {} entries matches the cpio".format(checked))
     compare_payload(tree, dumped, skip_top=skip_top)
     print("ext4   : payload matches the cpio")
 

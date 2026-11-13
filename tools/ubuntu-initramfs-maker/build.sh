@@ -418,10 +418,18 @@ for unit in ssh.service getty@tty1.service \
 done
 CHROOT
 
-# 4. Install the matching kernel modules and refresh depmod.
+# 4. Build the matching module tree beside the rootfs.  Module code cannot
+#    execute on this platform yet (fuse_init faults with an instruction
+#    abort), so the rootfs stays free of /lib/modules and systemd never
+#    triggers modprobe.  The tarball remains available for later work.
+MODTREE=$WORK/modules-tree
 make -C "$KERNEL_SRC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-	INSTALL_MOD_PATH="$ROOTFS" modules_install
-depmod -b "$ROOTFS" "$KERNEL_RELEASE"
+	INSTALL_MOD_PATH="$MODTREE" modules_install
+depmod -b "$MODTREE" "$KERNEL_RELEASE"
+if [ -e "$ROOTFS/lib/modules" ]; then
+	echo "rootfs must not contain /lib/modules" >&2
+	exit 1
+fi
 
 # 4b. Install the MRO-W00/W09 stock WiFi calibration files.  The kernel
 #     requests /lib/firmware/hi11xx/cfg_mro_w00_va.ini from the board DTS.
@@ -431,7 +439,7 @@ install -D -m 0644 "$HERE/firmware/cfg_mro_w00_vb.ini" \
 	"$ROOTFS/lib/firmware/hi11xx/cfg_mro_w00_vb.ini"
 
 # 5. Publish the initramfs and a standalone module tree.
-tar -C "$ROOTFS/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
+tar -C "$MODTREE" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
 (cd "$ROOTFS" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "$OUT/$IMAGE_NAME.cpio.gz"
 
 echo "modules : $OUT/modules-$KERNEL_RELEASE.tar.gz"
