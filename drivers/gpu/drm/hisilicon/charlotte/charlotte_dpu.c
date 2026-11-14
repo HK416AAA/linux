@@ -35,6 +35,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_vblank.h>
+#include "charlotte_vendor_init.h"
 
 #define DSI_INTS 0x248
 #define DSI_MASK 0x24c
@@ -120,6 +121,8 @@ struct charlotte_dpu {
 	u32 *cmdlist_item;
 	void *regcmd_buf;
 	dma_addr_t regcmd_dma;
+	void *seq_buf;
+	dma_addr_t seq_dma;
 	u64 frame_count, vsync_count, te_count, underflows, flips;
 	u64 last_frame_ns, frame_period_ns;
 	dma_addr_t next_address;
@@ -581,42 +584,47 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	return 0;
 }
 /*
- * Vendor dkmd_set_reg() encodes a single register write as a CONFIG_MODE
- * cmdlist item and lets the DACC perform the store.  The ITF and pipe-switch
- * blocks ignore CPU stores while the firmware owns the display, so route those
- * writes through the same transport the vendor composer uses.
+ * Vendor dkmd_set_reg() encodes register writes as CONFIG_MODE cmdlist items
+ * and lets the DACC perform the store.  The ITF and pipe-switch blocks ignore
+ * CPU stores while the firmware owns the display, so route those writes
+ * through the same transport the vendor composer uses.
  */
-static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
+#define CHARLOTTE_SEQ_MAX 128
+static int charlotte_regseq_run(struct charlotte_dpu *dpu,
+				const struct charlotte_reg_init *seq, size_t n)
 {
+	size_t items;
 	u32 *hdr, *item;
 	u32 status = 0;
 	int ret = 0, i;
 
-	if (addr & 3 || addr >= DPU_WINDOW_SIZE)
+	if (!n || n > CHARLOTTE_SEQ_MAX)
 		return -EINVAL;
-	if (!dpu->regcmd_buf) {
-		dpu->regcmd_buf = dma_alloc_coherent(dpu->dev,
-			CMDLIST_HDR_SIZE + 2 * CMDLIST_ITEM_SIZE,
-			&dpu->regcmd_dma, GFP_KERNEL);
-		if (!dpu->regcmd_buf)
+	/*
+	 * The vendor composer never emits a CONFIG_MODE node with a single
+	 * item: the DACC then raises onedone but no taskdone.  Duplicate it.
+	 */
+	items = (n == 1) ? 2 : n;
+	if (!dpu->seq_buf) {
+		dpu->seq_buf = dma_alloc_coherent(dpu->dev,
+			CMDLIST_HDR_SIZE + CHARLOTTE_SEQ_MAX * CMDLIST_ITEM_SIZE,
+			&dpu->seq_dma, GFP_KERNEL);
+		if (!dpu->seq_buf)
 			return -ENOMEM;
 	}
-	hdr = dpu->regcmd_buf;
+	hdr = dpu->seq_buf;
 	item = hdr + 4;
-	memset(hdr, 0, CMDLIST_HDR_SIZE + 2 * CMDLIST_ITEM_SIZE);
+	memset(hdr, 0, CMDLIST_HDR_SIZE + items * CMDLIST_ITEM_SIZE);
 	/* last, task_end, CONFIG mode, valid_flag 0xA5.  exec stays 0. */
 	hdr[0] = (0xa5U << 24) | BIT(22) | BIT(1);
 	hdr[1] = 0;
-	/*
-	 * The vendor composer never emits a node with a single item; the DACC
-	 * then raises onedone but no taskdone.  Duplicate the write.
-	 */
-	hdr[2] = 2;	/* items_count, no transport destination */
-	hdr[3] = lower_32_bits(dpu->regcmd_dma) + CMDLIST_HDR_SIZE;
-	/* addr0 (18 bits, word aligned), data0, one register. */
-	for (i = 0; i < 2; i++) {
-		item[i * 4 + 0] = ((addr >> 2) & 0x3ffff);
-		item[i * 4 + 1] = val;
+	hdr[2] = items;	/* items_count, no transport destination */
+	hdr[3] = lower_32_bits(dpu->seq_dma) + CMDLIST_HDR_SIZE;
+	/* cmd_item: addr0 (18 bits, word aligned), data0, one register. */
+	for (i = 0; i < items; i++) {
+		const struct charlotte_reg_init *e = &seq[i % n];
+		item[i * 4 + 0] = (e->addr >> 2) & 0x3ffff;
+		item[i * 4 + 1] = e->val;
 		item[i * 4 + 2] = 0;
 		item[i * 4 + 3] = 0;
 	}
@@ -626,7 +634,7 @@ static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 	writel(readl(dpu->regs + CMDLIST_CH_CTRL(CMDLIST_SCENE_INIT)) | 1,
 		dpu->regs + CMDLIST_CH_CTRL(CMDLIST_SCENE_INIT));
 	writel(0xffffffff, dpu->regs + CMDLIST0 + 0x1c + 0x40 * CMDLIST_SCENE_INIT);
-	writel(lower_32_bits(dpu->regcmd_dma),
+	writel(lower_32_bits(dpu->seq_dma),
 		dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT));
 	writel((u32)~BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_ADDR_MASK_DIS);
 	writel(BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_START);
@@ -638,12 +646,70 @@ static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 		udelay(50);
 	}
 	if (!(status & BIT(7))) {
-		dev_warn(dpu->drm.dev, "regcmd %06x=%08x not done, ints=%08x\n",
-			addr, val, status);
+		dev_warn(dpu->drm.dev,
+			"regseq %zu items (%06x=%08x) not done, ints=%08x\n",
+			n, seq[0].addr, seq[0].val, status);
 		ret = -EIO;
 	}
 	return ret;
 }
+
+static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
+{
+	const struct charlotte_reg_init e = { addr, val, NULL };
+
+	if (addr & 3 || addr >= DPU_WINDOW_SIZE)
+		return -EINVAL;
+	return charlotte_regseq_run(dpu, &e, 1);
+}
+
+struct charlotte_named_seq {
+	const char *name;
+	const struct charlotte_reg_init *seq;
+	size_t n;
+};
+static const struct charlotte_named_seq charlotte_vendor_seqs[] = {
+	{ "clocks", charlotte_seq_clocks, ARRAY_SIZE(charlotte_seq_clocks) },
+	{ "memory", charlotte_seq_memory, ARRAY_SIZE(charlotte_seq_memory) },
+	{ "itf", charlotte_seq_itf, ARRAY_SIZE(charlotte_seq_itf) },
+};
+static ssize_t charlotte_vendorseq_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	char tmp[16];
+	size_t i;
+	int ret = 0;
+	bool ran = false;
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	if (tmp[len - 1] == '\n')
+		tmp[len - 1] = '\0';
+
+	/* Vendor dpu_comp_init() order: clocks, memory, then ITF/pipe switch. */
+	for (i = 0; i < ARRAY_SIZE(charlotte_vendor_seqs); i++) {
+		const struct charlotte_named_seq *s = &charlotte_vendor_seqs[i];
+		if (strcmp(tmp, "all") && strcmp(tmp, s->name))
+			continue;
+		ret = charlotte_regseq_run(dpu, s->seq, s->n);
+		dev_info(dpu->drm.dev, "vendor seq %s (%zu writes): %d\n",
+			s->name, s->n, ret);
+		ran = true;
+		if (ret)
+			break;
+	}
+	if (!ran)
+		return -EINVAL;
+	return ret ? ret : len;
+}
+static const struct file_operations charlotte_vendorseq_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_vendorseq_write, .llseek = noop_llseek,
+};
 static ssize_t charlotte_regcmd_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
 {
@@ -1204,6 +1270,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("dacc", 0200, dpu->debugfs, dpu, &charlotte_dacc_fops);
 	debugfs_create_file("cmdl", 0600, dpu->debugfs, dpu, &charlotte_cmdlist_fops);
 	debugfs_create_file("daccw", 0200, dpu->debugfs, dpu, &charlotte_regcmd_fops);
+	debugfs_create_file("vendorseq", 0200, dpu->debugfs, dpu,
+		&charlotte_vendorseq_fops);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
