@@ -603,8 +603,8 @@ static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 	hdr = dpu->regcmd_buf;
 	item = hdr + 4;
 	memset(hdr, 0, 32);
-	/* exec, last, CONFIG mode, valid_flag 0xA5. */
-	hdr[0] = (0xa5U << 24) | BIT(1) | BIT(0);
+	/* exec, last, task_end, CONFIG mode, valid_flag 0xA5. */
+	hdr[0] = (0xa5U << 24) | BIT(22) | BIT(1) | BIT(0);
 	hdr[1] = 0;
 	hdr[2] = 1;	/* one item, no transport destination */
 	hdr[3] = lower_32_bits(dpu->regcmd_dma) + CMDLIST_HDR_SIZE;
@@ -1034,8 +1034,11 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	int ret;
 	ret = charlotte_backlight_init(dpu);
+	if (ret == -EPROBE_DEFER)
+		return ret;
 	if (ret)
-		return dev_err_probe(drm->dev, ret, "backlight supplier unavailable\n");
+		dev_warn(drm->dev, "backlight unavailable (%d), continuing without brightness control\n",
+			ret);
 	dpu->blank_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE, &dpu->blank_address,
 		GFP_KERNEL | __GFP_NOWARN);
 	if (!dpu->blank_vaddr)
