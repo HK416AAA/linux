@@ -1034,8 +1034,6 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	int ret;
 	ret = charlotte_backlight_init(dpu);
-	if (ret == -EPROBE_DEFER)
-		return ret;
 	if (ret)
 		dev_warn(drm->dev, "backlight unavailable (%d), continuing without brightness control\n",
 			ret);
