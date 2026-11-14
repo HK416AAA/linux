@@ -6,6 +6,7 @@
  */
 #include <linux/aperture.h>
 #include <linux/arm-smccc.h>
+#include <linux/arm_ffa.h>
 #include <linux/debugfs.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -44,6 +45,10 @@
 #define DSI_MODE_CTRL 0x008
 #define DSI_EDPI_CMD_SIZE 0x040
 #define DSI_CMD_MODE_CTRL 0x044
+/* 0x1c0 is CMD_MOD_CTRL (bit1 = dsi_halt_video_en), distinct from the
+ * CMD_MODE_CTRL frame-format register at 0x044.
+ */
+#define DSI_CMD_MOD_CTRL 0x1c0
 #define DSI_VSTATE 0x1fc
 #define DSI_VINACT 0x1dc
 #define DACC_CTRL 0x40000
@@ -60,12 +65,43 @@
 #define CHARLOTTE_FID_DACC_LOAD 0xc3003705UL
 /* Command-mode frame pump: vendor enable_dsi_ldi() writes both per TE. */
 #define DSI_LDI_CTRL 0x1b8
+#define DSI_LDI_FRM_MSK 0x1d4
 #define DSI_LDI_FRM_MSK_UP 0x238
 #define DSI_VSYNC BIT(4)
 #define DSI_VACT_START BIT(7)
 #define DSI_VACT_END BIT(8)
 #define DSI_UNDERFLOW BIT(2)
 #define DSI_LCD_TE0 BIT(12)
+/* DSI video-mode timing block (mipi v700).  A video panel free-runs from these
+ * instead of the TE-paced EDPI path.  The bootloader already programmed the
+ * timing for this panel, so the videomode diagnostic keeps those values and
+ * only seeds the transport-control fields the cmd-mode skip left at default.
+ */
+#define DSI_VIDEO_MODE_CTRL 0x050
+#define DSI_VIDEO_MODE_LP_CMD_TIMING 0x03c
+#define DSI_VIDEO_PKT_LEN 0x054
+#define DSI_VIDEO_HSA 0x060
+#define DSI_VIDEO_HBP 0x064
+#define DSI_VIDEO_HLINE 0x068
+#define DSI_VIDEO_VSA 0x06c
+#define DSI_VIDEO_VBP 0x070
+#define DSI_VIDEO_VFP 0x074
+#define DSI_VIDEO_VACT 0x078
+#define DSI_LP_CLK_CTRL 0x080
+#define DSI_TO_TIME_CTRL 0x0f0
+#define DSI_LDI_DPI0_HRZ_CTRL2 0x1ec
+#define DSI_LDI_VRT_CTRL2 0x1f0
+#define DSI_LDI_DPI0_HRZ_CTRL3 0x1f4
+#define DSI_VCOUNT 0x204
+#define DSI_HCOUNT 0x208
+/* 0x110 is VIDEO_MODE_CTRL_ACT, not vactive; vactive lives in LDI_VRT_CTRL2. */
+/* Vendor dpu_comp_clear_fastboot_config(): the bootloader freezes the pipeline
+ * with REG_CTRL_DEBUG bit10 on the active pipe and the vendor kernel clears it
+ * once it takes over.  Do the same so the pipeline actually advances.
+ */
+#define DPP0_REG_CTRL_DEBUG 0xb4064
+#define DSC0_REG_CTRL_DEBUG 0xd4258
+#define ITF0_REG_CTRL_DEBUG 0xcc060
 #define DM0 0x35400
 #define DM_LAYER_SIZE (DM0 + 0x1a0)
 #define DM_LAYER_SELECT (DM0 + 0x1ac)
@@ -115,6 +151,54 @@
 #define TEST_PITCH (WIDTH * 4)
 #define TEST_SIZE PAGE_ALIGN(TEST_PITCH * HEIGHT)
 
+/*
+ * The stock firmware routes display security calls through the FF-A
+ * "platdrv" secure partition instead of the raw BL31 SMC dispatcher
+ * (CONFIG_DPU_FFA_SUPPORT=y).  The raw CHARLOTTE_FID_DACC_LOAD SMC comes back
+ * with the FID echoed, i.e. an unsupported-function return, so the DACC core
+ * never leaves WFI.  Bind the same partition the vendor ffa_plat_drv.c uses
+ * (UUID f9e75f33-a1ca-4f82-98e6-c8020f20ecb4) and send the load request over
+ * FFA_MSG_SEND_DIRECT_REQ with data0=func_id, data1=channel, data2=mode,
+ * data3=dpu_index, exactly like configure_dss_service_security().
+ */
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+static const struct ffa_device_id charlotte_platdrv_ffa_ids[] = {
+	{ .uuid = { .b = { 0x33, 0x5f, 0xe7, 0xf9, 0x82, 0x4f, 0xca, 0xa1,
+			   0x02, 0xc8, 0xe6, 0x98, 0xb4, 0xec, 0x20, 0x0f } } },
+	{}
+};
+
+static const struct ffa_ops *charlotte_ffa_ops;
+static struct ffa_device *charlotte_ffa_dev;
+
+static int charlotte_platdrv_ffa_probe(struct ffa_device *ffa_dev)
+{
+	charlotte_ffa_dev = ffa_dev;
+	charlotte_ffa_ops = ffa_dev->ops;
+	if (charlotte_ffa_ops && charlotte_ffa_ops->msg_ops &&
+	    charlotte_ffa_ops->msg_ops->mode_32bit_set)
+		charlotte_ffa_ops->msg_ops->mode_32bit_set(ffa_dev);
+	pr_info("charlotte-dpu: platdrv FF-A probe ok vm_id=0x%04x\n",
+		ffa_dev->vm_id);
+	return 0;
+}
+
+static void charlotte_platdrv_ffa_remove(struct ffa_device *ffa_dev)
+{
+	if (charlotte_ffa_dev == ffa_dev) {
+		charlotte_ffa_dev = NULL;
+		charlotte_ffa_ops = NULL;
+	}
+}
+
+static struct ffa_driver charlotte_platdrv_ffa_driver = {
+	.name = "charlotte_platdrv_ffa",
+	.probe = charlotte_platdrv_ffa_probe,
+	.remove = charlotte_platdrv_ffa_remove,
+	.id_table = charlotte_platdrv_ffa_ids,
+};
+#endif
+
 static bool probe_only = true;
 module_param(probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only, "Keep simpledrm and expose bounded handoff diagnostics instead of native KMS");
@@ -141,6 +225,13 @@ struct charlotte_dpu {
 	u32 irq_window_count;
 	bool kms, kms_attempted, pending, latched;
 	bool ldi_pump;
+	/* V0 experiment: reversible DSI command->video transport flip. */
+	bool video_active;
+	u32 video_saved_mode, video_saved_cmdmod, video_saved_frmmsk;
+	u32 video_saved_vidmode, video_saved_lpcmd, video_saved_totime;
+	u32 video_saved_ldi_h2, video_saved_ldi_v2, video_saved_cmdmodctl;
+	u32 video_saved_vfp;
+	u32 video_saved_dpp_dbg, video_saved_dsc_dbg, video_saved_itf_dbg;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
 	void *cmdlist_buf;
@@ -442,12 +533,21 @@ struct charlotte_reg_desc {
 	u32 off;
 };
 static const struct charlotte_reg_desc charlotte_regs[] = {
-	{ "dsi0_pm", 0x00198 }, { "dsi0_ldi", 0x001b8 }, { "dsi0_cmdmod", 0x001c0 },
-	{ "dsi0_mode", 0x00008 }, { "dsi0_edpi", 0x00040 }, { "dsi0_cmdctl", 0x00044 },
-	{ "dsi0_vidctl", 0x00050 }, { "dsi0_vidact", 0x00110 },
+	{ "dsi0_pm", 0x00198 }, { "dsi0_ldi", 0x001b8 }, { "dsi0_cmdmodctl", 0x001c0 },
+	{ "dsi0_mode", 0x00008 }, { "dsi0_edpi", 0x00040 }, { "dsi0_cmdmod", 0x00044 },
+	{ "dsi0_vidmode", 0x00050 }, { "dsi0_pktlen", 0x00054 },
+	{ "dsi0_hsa", 0x00060 }, { "dsi0_hbp", 0x00064 }, { "dsi0_hline", 0x00068 },
+	{ "dsi0_vsa", 0x0006c }, { "dsi0_vbp", 0x00070 }, { "dsi0_vfp", 0x00074 },
+	{ "dsi0_vactnum", 0x00078 }, { "dsi0_lpclk", 0x00080 },
+	{ "dsi0_lpcmd", 0x0003c }, { "dsi0_totime", 0x000f0 },
+	{ "dsi0_ldi_h2", 0x001ec }, { "dsi0_ldi_v2", 0x001f0 }, { "dsi0_ldi_h3", 0x001f4 },
+	{ "dsi0_vcount", 0x00204 }, { "dsi0_hcount", 0x00208 },
 	{ "dsi0_te", 0x001c4 }, { "dsi0_frmmsk", 0x001d4 }, { "dsi0_frmvalid", 0x001d8 },
 	{ "dsi0_vinact", 0x001dc }, { "dsi0_vstate", 0x001fc }, { "dsi0_ints", 0x00248 },
 	{ "dsi0_mask", 0x0024c },
+	{ "dsc_en", 0xd4008 }, { "dsc_ctrl", 0xd400c }, { "dsc_pic", 0xd4010 },
+	{ "dsc_slice", 0xd4014 }, { "dsc_multi", 0xd4074 }, { "dsc_outctl", 0xd4078 },
+	{ "dsc_dbg", 0xd4258 },
 	{ "dsi1_pm", 0x00598 }, { "dsi1_ldi", 0x005b8 }, { "dsi1_ints", 0x00648 },
 	{ "dsi1_mask", 0x0064c },
 	{ "dsi2_pm", 0x00998 }, { "dsi2_ldi", 0x009b8 }, { "dsi2_ints", 0x00a48 },
@@ -459,9 +559,12 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "dm_cmd5", 0x35418 }, { "dm_cmd6", 0x3541c }, { "dm_cmd7", 0x35420 },
 	{ "dm_srotnum", 0x35450 }, { "dm_ddicnum", 0x35454 },
 	{ "glb_tag", 0x13000 }, { "glb_jtag", 0x13008 }, { "glb_clken", 0x13104 },
-	{ "glb_pm", 0x13108 }, { "glb_ch0ken", 0x13128 }, { "glb_ch1ken", 0x13130 },
-	{ "glb_avhrken", 0x13138 }, { "glb_dispken", 0x13140 }, { "glb_rst", 0x13144 },
-	{ "glb_dfsok", 0x13200 },
+	{ "glb_pm", 0x13108 }, { "glb_rsclear", 0x13120 }, { "glb_ch0ken", 0x13128 },
+	{ "glb_ch1ken", 0x13130 }, { "glb_avhrken", 0x13138 }, { "glb_dispken", 0x13140 },
+	{ "glb_rst", 0x13144 }, { "glb_dfsok", 0x13200 },
+	{ "dpp0_int", 0xb4000 }, { "dpp0_clksel", 0xb4008 }, { "dpp0_clken", 0xb400c },
+	{ "dpp0_clrbar", 0xb4010 }, { "dpp0_ctrl", 0xb4058 }, { "dpp0_flush", 0xb4060 },
+	{ "dpp0_dbg", 0xb4064 }, { "dpp0_state", 0xb4068 },
 	{ "dp0_stat", 0x13240 }, { "dp0_mask", 0x13244 }, { "dp1_stat", 0x13248 },
 	{ "dp1_mask", 0x1324c }, { "mdp_stat", 0x13250 }, { "mdp_mask", 0x13254 },
 	{ "sdp_stat", 0x13258 }, { "sdp_mask", 0x1325c },
@@ -477,7 +580,8 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "l0_sel", 0x355ac }, { "l0_sblk", 0x355b0 }, { "l0_crop", 0x355b4 },
 	{ "l0_addrh", 0x355dc }, { "l0_addrl", 0x355e0 }, { "l0_stride", 0x355f0 },
 	{ "l1_sel", 0x3562c }, { "l1_addrl", 0x35660 }, { "l1_stride", 0x35670 },
-	{ "itf0_size", 0xcc000 }, { "itf0_flush", 0xcc05c }, { "itf0_datasel", 0xcc068 },
+	{ "itf0_size", 0xcc000 }, { "itf0_flush", 0xcc05c }, { "itf0_dbg", 0xcc060 },
+	{ "itf0_datasel", 0xcc068 },
 	{ "psw_sig0", 0xcc400 }, { "psw_sigen0", 0xcc404 }, { "psw_dat0", 0xcc408 },
 	{ "psw_daten0", 0xcc40c }, { "psw_splith", 0xcc48c }, { "psw_splitc", 0xcc490 },
 };
@@ -732,6 +836,37 @@ static void charlotte_dacc_load(struct charlotte_dpu *dpu)
 		readl(dpu->regs + DACC_MONPC), readl(dpu->regs + DSI_VSTATE));
 }
 
+/* Same load request, routed through the platdrv secure partition via FF-A. */
+static void charlotte_dacc_ffa_load(struct charlotte_dpu *dpu)
+{
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+	struct ffa_send_direct_data args = {
+		.data0 = CHARLOTTE_FID_DACC_LOAD,
+		.data1 = 0,
+		.data2 = 0,
+		.data3 = 0,
+	};
+	int ret;
+
+	if (!charlotte_ffa_dev || !charlotte_ffa_ops ||
+	    !charlotte_ffa_ops->msg_ops ||
+	    !charlotte_ffa_ops->msg_ops->sync_send_receive) {
+		dev_warn(dpu->dev,
+			"dacc_load ffa: platdrv SP not bound (check arm_ffa bus)\n");
+		return;
+	}
+	ret = charlotte_ffa_ops->msg_ops->sync_send_receive(charlotte_ffa_dev,
+							    &args);
+	dev_info(dpu->dev,
+		"dacc_load ffa ret=%d d0=%08lx d1=%08lx d2=%08lx d3=%08lx d4=%08lx status=%08x monpc=%08x vstate=%08x\n",
+		ret, args.data0, args.data1, args.data2, args.data3, args.data4,
+		readl(dpu->regs + DACC_STATUS), readl(dpu->regs + DACC_MONPC),
+		readl(dpu->regs + DSI_VSTATE));
+#else
+	dev_warn(dpu->dev, "dacc_load ffa: CONFIG_ARM_FFA_TRANSPORT unavailable\n");
+#endif
+}
+
 static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 {
 	const struct charlotte_reg_init e = { addr, val, NULL };
@@ -872,6 +1007,27 @@ static const struct file_operations charlotte_daccload_fops = {
 	.llseek = noop_llseek,
 };
 
+static ssize_t charlotte_daccffa_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value != 1 || !probe_only || dpu->kms)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	charlotte_dacc_ffa_load(dpu);
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+static const struct file_operations charlotte_daccffa_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_daccffa_write,
+	.llseek = noop_llseek,
+};
+
 /*
  * Vendor enable_dsi_ldi(): in command mode the DSI fetches exactly one frame
  * per TE, so LDI_CTRL bit0 must be re-armed on every panel TE.  Arm it now so
@@ -1002,6 +1158,255 @@ static ssize_t charlotte_irq_write(struct file *file, const char __user *buf,
 }
 static const struct file_operations charlotte_irq_fops = {
 	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_irq_write,
+	.llseek = noop_llseek,
+};
+
+/* V0: reversible DSI command->video transport flip and end-to-end bring-up.
+ *
+ * The new road needs the panel to accept a free-running video stream instead of
+ * TE-paced EDPI.  This node flips the transport (MODE_CTRL bit0=0, CMD_MOD_CTRL
+ * bit1=1, LDI_FRM_MSK=0, LDI enable), programs the vendor video-mode bits
+ * (VIDEO_MODE_CTRL LP/burst, LP_CMD_TIMING, TO_TIME), seeds the authoritative
+ * MRO timing only if the bootloader left it clear, and releases the frozen
+ * fastboot pipeline on the active DPP0->DSC0->ITF0 pipe.  Everything is
+ * snapshotted so "echo 0" restores the handoff state exactly.  Watching the
+ * result:
+ *   - vcount/hcount change across the two 20ms samples means the VTG free-runs;
+ *   - vstate cycling VSW/VACTIVE (0x2/0x8) instead of stuck at IDLE;
+ *   - vsyncs/frames rising, underflows flagging a starved FIFO.
+ * If vcount stays put the DPU-side VTG/online path is not enabled yet; if the
+ * stream runs but the panel stays dark the DDIC rejected video and the FF-A
+ * command-mode route is the fallback.  "echo 2" halves the rate via VFP.
+ */
+static ssize_t charlotte_videomode_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned value;
+	u32 mode, cmdmod, vstate, vinact, ints, h2, v2;
+	u32 vcount0, vcount1, hcount0, hcount1;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	/* 1 = video at the bootloader rate, 2 = video at roughly half rate by
+	 * expanding VFP only (lane clock and PHY stay untouched).
+	 */
+	if (value > 2 || !probe_only || dpu->kms)
+		return -EINVAL;
+	cancel_delayed_work_sync(&dpu->irq_stop_work);
+	mutex_lock(&dpu->diagnostic_lock);
+	if (value && !dpu->video_active) {
+		dpu->video_saved_mode = readl(dpu->regs + DSI_MODE_CTRL);
+		dpu->video_saved_cmdmod = readl(dpu->regs + DSI_CMD_MODE_CTRL);
+		dpu->video_saved_frmmsk = readl(dpu->regs + DSI_LDI_FRM_MSK);
+		dpu->video_saved_vidmode = readl(dpu->regs + DSI_VIDEO_MODE_CTRL);
+		dpu->video_saved_lpcmd = readl(dpu->regs + DSI_VIDEO_MODE_LP_CMD_TIMING);
+		dpu->video_saved_totime = readl(dpu->regs + DSI_TO_TIME_CTRL);
+		dpu->video_saved_ldi_h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+		dpu->video_saved_ldi_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+		dpu->video_saved_cmdmodctl = readl(dpu->regs + DSI_CMD_MOD_CTRL);
+		dpu->video_saved_vfp = readl(dpu->regs + DSI_VIDEO_VFP);
+		dpu->video_saved_dpp_dbg = readl(dpu->regs + DPP0_REG_CTRL_DEBUG);
+		dpu->video_saved_dsc_dbg = readl(dpu->regs + DSC0_REG_CTRL_DEBUG);
+		dpu->video_saved_itf_dbg = readl(dpu->regs + ITF0_REG_CTRL_DEBUG);
+		dev_info(dpu->drm.dev,
+			"video: timing vidctl=%08x pktlen=%u hsa=%u hbp=%u hline=%u vsa=%u vbp=%u vfp=%u vact=%u ldi_h2=%08x ldi_v2=%08x ldi_h3=%08x lpclk=%08x cmdmodctl=%08x\n",
+			readl(dpu->regs + DSI_VIDEO_MODE_CTRL),
+			readl(dpu->regs + DSI_VIDEO_PKT_LEN),
+			readl(dpu->regs + DSI_VIDEO_HSA), readl(dpu->regs + DSI_VIDEO_HBP),
+			readl(dpu->regs + DSI_VIDEO_HLINE), readl(dpu->regs + DSI_VIDEO_VSA),
+			readl(dpu->regs + DSI_VIDEO_VBP), readl(dpu->regs + DSI_VIDEO_VFP),
+			readl(dpu->regs + DSI_VIDEO_VACT),
+			readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
+			readl(dpu->regs + DSI_LDI_VRT_CTRL2),
+			readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3),
+			readl(dpu->regs + DSI_LP_CLK_CTRL),
+			readl(dpu->regs + DSI_CMD_MOD_CTRL));
+		/* Same bounded IRQ lifetime as irq_test so a stuck source cannot
+		 * keep the peripheral enabled forever.
+		 */
+		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
+		if (!dpu->irq_running) {
+			ret = charlotte_irq_start(dpu);
+			if (ret && ret != -EBUSY) {
+				mutex_unlock(&dpu->diagnostic_lock);
+				return ret;
+			}
+		}
+		/* mipi_dsi_video_mode_config(): LP mode on all lanes (bits
+		 * 13:8), send read command in LP (bit15).  Keep the burst-mode
+		 * field (bits 1:0) the bootloader already chose.  The
+		 * cmd-mode skip in mipi_dsi_on_sub2() left these at default.
+		 */
+		writel((dpu->video_saved_vidmode & ~GENMASK(13, 8)) |
+		       (0x3f << 8) | BIT(15), dpu->regs + DSI_VIDEO_MODE_CTRL);
+		writel(dpu->video_saved_lpcmd | (0x4 << 8),
+			dpu->regs + DSI_VIDEO_MODE_LP_CMD_TIMING);
+		writel((dpu->video_saved_totime & ~GENMASK(15, 0)) | 0x7ff,
+			dpu->regs + DSI_TO_TIME_CTRL);
+		/* LDI horizontal/vertical active are derived from the DSC output
+		 * geometry; only seed them when the bootloader left them clear so
+		 * we never clobber a valid handoff value.
+		 */
+		h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+		v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+		if ((h2 & 0x1fff) == 0)
+			writel(0x3a7, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+		if ((v2 & 0x1fff) == 0)
+			writel(0x72f, dpu->regs + DSI_LDI_VRT_CTRL2);
+		/* If the bootloader left the video timing empty, seed the exact
+		 * MRO values recovered from the stock lcd_config DT: HSA 10,
+		 * HBP 12, HLINE 878, VSA 18, VBP 70, VFP 42, VACT 1840,
+		 * PKT_LEN 936 (single DSI, DSC 3.75x, dsc_out_width 936).
+		 * Read-modify-write keeps any reserved upper bits intact.
+		 */
+		if (readl(dpu->regs + DSI_VIDEO_HLINE) == 0 ||
+		    readl(dpu->regs + DSI_VIDEO_VACT) == 0 ||
+		    readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3) == 0) {
+			writel((readl(dpu->regs + DSI_VIDEO_HSA) & ~GENMASK(11, 0)) | 10,
+				dpu->regs + DSI_VIDEO_HSA);
+			writel((readl(dpu->regs + DSI_VIDEO_HBP) & ~GENMASK(11, 0)) | 12,
+				dpu->regs + DSI_VIDEO_HBP);
+			writel((readl(dpu->regs + DSI_VIDEO_HLINE) & ~GENMASK(14, 0)) | 878,
+				dpu->regs + DSI_VIDEO_HLINE);
+			writel((readl(dpu->regs + DSI_VIDEO_VSA) & ~GENMASK(19, 0)) | 18,
+				dpu->regs + DSI_VIDEO_VSA);
+			writel((readl(dpu->regs + DSI_VIDEO_VBP) & ~GENMASK(19, 0)) | 70,
+				dpu->regs + DSI_VIDEO_VBP);
+			writel((readl(dpu->regs + DSI_VIDEO_VFP) & ~GENMASK(19, 0)) | 42,
+				dpu->regs + DSI_VIDEO_VFP);
+			writel((readl(dpu->regs + DSI_VIDEO_VACT) & ~GENMASK(23, 0)) | 1840,
+				dpu->regs + DSI_VIDEO_VACT);
+			writel((readl(dpu->regs + DSI_VIDEO_PKT_LEN) & ~GENMASK(13, 0)) | 936,
+				dpu->regs + DSI_VIDEO_PKT_LEN);
+			writel((readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3) & ~GENMASK(12, 0)) | 701,
+				dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3);
+			dev_info(dpu->drm.dev,
+				"video: seeded MRO video timing (bootloader left it clear)\n");
+		}
+		/* value 2: halve the frame rate by adding one full frame of idle
+		 * lines to VFP.  This keeps the 845MHz lane clock and the PHY
+		 * untouched while giving underflow/timing more margin.
+		 */
+		if (value == 2) {
+			u32 vsa = readl(dpu->regs + DSI_VIDEO_VSA);
+			u32 vbp = readl(dpu->regs + DSI_VIDEO_VBP);
+			u32 vact = readl(dpu->regs + DSI_VIDEO_VACT);
+			u32 vfp = readl(dpu->regs + DSI_VIDEO_VFP);
+			u32 vtotal = vsa + vbp + vact + vfp;
+			writel((vfp & ~GENMASK(19, 0)) + vtotal,
+				dpu->regs + DSI_VIDEO_VFP);
+			dev_info(dpu->drm.dev,
+				"video: half-rate vfp %u -> %u (vtotal %u -> %u)\n",
+				vfp, vfp + vtotal, vtotal, vtotal * 2);
+		}
+		/* Release the bootloader's frozen fastboot pipeline state on the
+		 * active pipe (DPP0 -> DSC0 -> ITF0), as the vendor composer does
+		 * once the kernel boots.
+		 */
+		writel(dpu->video_saved_dpp_dbg & ~BIT(10),
+			dpu->regs + DPP0_REG_CTRL_DEBUG);
+		writel(dpu->video_saved_dsc_dbg & ~BIT(10),
+			dpu->regs + DSC0_REG_CTRL_DEBUG);
+		writel(dpu->video_saved_itf_dbg & ~BIT(10),
+			dpu->regs + ITF0_REG_CTRL_DEBUG);
+		dev_info(dpu->drm.dev,
+			"video: fastboot dbg dpp=%08x dsc=%08x itf=%08x -> clear bit10\n",
+			dpu->video_saved_dpp_dbg, dpu->video_saved_dsc_dbg,
+			dpu->video_saved_itf_dbg);
+		/* Backlight is intentionally left alone here so this stays a
+		 * single-variable test; the separate "backlight" node toggles it.
+		 */
+		/* Vendor video path only clears MODE_CTRL bit0; CMD_MODE_CTRL
+		 * keeps the mipi_init values for video panels.  mipi_ldi_init()
+		 * additionally sets CMD_MOD_CTRL bit1 (dsi_halt_video_en) and
+		 * clears LDI_FRM_MSK for a video panel.
+		 */
+		writel(dpu->video_saved_mode & ~BIT(0), dpu->regs + DSI_MODE_CTRL);
+		writel(dpu->video_saved_cmdmodctl | BIT(1),
+			dpu->regs + DSI_CMD_MOD_CTRL);
+		writel(0, dpu->regs + DSI_LDI_FRM_MSK);
+		writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0),
+			dpu->regs + DSI_LDI_CTRL);
+		dpu->video_active = true;
+		msleep(30);
+	} else if (!value && dpu->video_active) {
+		writel(dpu->video_saved_mode, dpu->regs + DSI_MODE_CTRL);
+		writel(dpu->video_saved_cmdmod, dpu->regs + DSI_CMD_MODE_CTRL);
+		writel(dpu->video_saved_frmmsk, dpu->regs + DSI_LDI_FRM_MSK);
+		writel(dpu->video_saved_vidmode, dpu->regs + DSI_VIDEO_MODE_CTRL);
+		writel(dpu->video_saved_lpcmd, dpu->regs + DSI_VIDEO_MODE_LP_CMD_TIMING);
+		writel(dpu->video_saved_totime, dpu->regs + DSI_TO_TIME_CTRL);
+		writel(dpu->video_saved_ldi_h2, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+		writel(dpu->video_saved_ldi_v2, dpu->regs + DSI_LDI_VRT_CTRL2);
+		writel(dpu->video_saved_cmdmodctl, dpu->regs + DSI_CMD_MOD_CTRL);
+		writel(dpu->video_saved_vfp, dpu->regs + DSI_VIDEO_VFP);
+		writel(dpu->video_saved_itf_dbg, dpu->regs + ITF0_REG_CTRL_DEBUG);
+		writel(dpu->video_saved_dsc_dbg, dpu->regs + DSC0_REG_CTRL_DEBUG);
+		writel(dpu->video_saved_dpp_dbg, dpu->regs + DPP0_REG_CTRL_DEBUG);
+		dpu->video_active = false;
+		msleep(20);
+	}
+	vcount0 = readl(dpu->regs + DSI_VCOUNT);
+	hcount0 = readl(dpu->regs + DSI_HCOUNT);
+	msleep(20);
+	vcount1 = readl(dpu->regs + DSI_VCOUNT);
+	hcount1 = readl(dpu->regs + DSI_HCOUNT);
+	mode = readl(dpu->regs + DSI_MODE_CTRL);
+	cmdmod = readl(dpu->regs + DSI_CMD_MODE_CTRL);
+	vstate = readl(dpu->regs + DSI_VSTATE);
+	vinact = readl(dpu->regs + DSI_VINACT);
+	ints = readl(dpu->regs + DSI_INTS);
+	dev_info(dpu->drm.dev,
+		"video: active=%u mode=%08x cmdmod=%08x frmmsk=%08x vstate=%08x vinact=%08x ints=%08x vcount=%u->%u hcount=%u->%u vsyncs=%llu frames=%llu te=%llu underflows=%llu\n",
+		dpu->video_active, mode, cmdmod,
+		readl(dpu->regs + DSI_LDI_FRM_MSK), vstate, vinact, ints,
+		vcount0, vcount1, hcount0, hcount1,
+		dpu->vsync_count, dpu->frame_count, dpu->te_count, dpu->underflows);
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+static const struct file_operations charlotte_videomode_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_videomode_write,
+	.llseek = noop_llseek,
+};
+
+/* The MRO panel hangs off a Richtek RT4539 at i2c 0x3c.  Register 0x0b bit7 is
+ * the LED enable the firmware path used.  Writing 2 dumps 0x00..0x15 to dmesg so
+ * the real chip state can be read back before toggling anything.
+ */
+static ssize_t charlotte_backlight_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned value;
+	int i, ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value > 2 || !probe_only || dpu->kms)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	if (!dpu->backlight) {
+		dev_info(dpu->drm.dev, "backlight: no RT4539 supplier bound\n");
+	} else if (value == 2) {
+		dev_info(dpu->drm.dev, "backlight: reg dump");
+		for (i = 0; i <= 0x15; i++) {
+			int v = i2c_smbus_read_byte_data(dpu->backlight, i);
+			pr_cont(" %02x=%02x", i, v < 0 ? 0xff : v);
+		}
+		pr_cont("\n");
+	} else {
+		charlotte_backlight_power(dpu, value);
+		dev_info(dpu->drm.dev, "backlight: on=%d ro=%d\n",
+			dpu->backlight_on, dpu->backlight_ro);
+	}
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+static const struct file_operations charlotte_backlight_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_backlight_write,
 	.llseek = noop_llseek,
 };
 
@@ -1412,8 +1817,14 @@ static int charlotte_probe(struct platform_device *pdev)
 		debugfs_create_file("takeover", 0200, dpu->debugfs, dpu, &charlotte_takeover_fops);
 		debugfs_create_file("daccload", 0200, dpu->debugfs, dpu,
 			&charlotte_daccload_fops);
+		debugfs_create_file("daccffa", 0200, dpu->debugfs, dpu,
+			&charlotte_daccffa_fops);
 		debugfs_create_file("ldipump", 0200, dpu->debugfs, dpu,
 			&charlotte_ldipump_fops);
+		debugfs_create_file("videomode", 0200, dpu->debugfs, dpu,
+			&charlotte_videomode_fops);
+		debugfs_create_file("backlight", 0200, dpu->debugfs, dpu,
+			&charlotte_backlight_fops);
 		dev_info(dev, "read-only handoff probe: %ux%u pitch=%u IRQ=%d; KMS retained by simpledrm\n",
 			WIDTH, HEIGHT, dpu->boot_stride, dpu->irq);
 		return 0;
@@ -1458,9 +1869,17 @@ static int __init charlotte_init(void)
 	if (ret)
 		return ret;
 	ret = platform_driver_register(&charlotte_platform_driver);
-	if (ret)
+	if (ret) {
 		i2c_del_driver(&charlotte_backlight_driver);
-	return ret;
+		return ret;
+	}
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+	ret = ffa_register(&charlotte_platdrv_ffa_driver);
+	if (ret)
+		pr_warn("charlotte-dpu: platdrv FF-A driver register failed: %d\n",
+			ret);
+#endif
+	return 0;
 }
 #ifdef MODULE
 module_init(charlotte_init);
@@ -1469,6 +1888,9 @@ late_initcall_sync(charlotte_init);
 #endif
 static void __exit charlotte_exit(void)
 {
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+	ffa_unregister(&charlotte_platdrv_ffa_driver);
+#endif
 	platform_driver_unregister(&charlotte_platform_driver);
 	i2c_del_driver(&charlotte_backlight_driver);
 }
