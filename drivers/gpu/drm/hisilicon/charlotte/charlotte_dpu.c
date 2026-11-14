@@ -118,6 +118,8 @@ struct charlotte_dpu {
 	void *cmdlist_buf;
 	dma_addr_t cmdlist_dma;
 	u32 *cmdlist_item;
+	void *regcmd_buf;
+	dma_addr_t regcmd_dma;
 	u64 frame_count, vsync_count, te_count, underflows, flips;
 	u64 last_frame_ns, frame_period_ns;
 	dma_addr_t next_address;
@@ -495,6 +497,11 @@ static const struct file_operations charlotte_dacc_fops = {
 
 static void charlotte_cmdlist_release(struct charlotte_dpu *dpu)
 {
+	if (dpu->regcmd_buf) {
+		dma_free_coherent(dpu->dev, 32, dpu->regcmd_buf, dpu->regcmd_dma);
+		dpu->regcmd_buf = NULL;
+		dpu->regcmd_dma = 0;
+	}
 	if (!dpu->cmdlist_buf)
 		return;
 	dma_free_coherent(dpu->dev, CMDLIST_HDR_SIZE + DM_PARAM_SIZE,
@@ -573,6 +580,77 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 		DM_PARAM_ITEMS - 1);
 	return 0;
 }
+/*
+ * Vendor dkmd_set_reg() encodes a single register write as a CONFIG_MODE
+ * cmdlist item and lets the DACC perform the store.  The ITF and pipe-switch
+ * blocks ignore CPU stores while the firmware owns the display, so route those
+ * writes through the same transport the vendor composer uses.
+ */
+static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
+{
+	u32 *hdr, *item;
+	u32 status;
+	int ret = 0;
+
+	if (addr & 3 || addr >= DPU_WINDOW_SIZE)
+		return -EINVAL;
+	if (!dpu->regcmd_buf) {
+		dpu->regcmd_buf = dma_alloc_coherent(dpu->dev, 32,
+			&dpu->regcmd_dma, GFP_KERNEL);
+		if (!dpu->regcmd_buf)
+			return -ENOMEM;
+	}
+	hdr = dpu->regcmd_buf;
+	item = hdr + 4;
+	memset(hdr, 0, 32);
+	/* exec, last, CONFIG mode, valid_flag 0xA5. */
+	hdr[0] = (0xa5U << 24) | BIT(1) | BIT(0);
+	hdr[1] = 0;
+	hdr[2] = 1;	/* one item, no transport destination */
+	hdr[3] = lower_32_bits(dpu->regcmd_dma) + CMDLIST_HDR_SIZE;
+	/* addr0 (18 bits, word aligned), data0, one register. */
+	item[0] = ((addr >> 2) & 0x3ffff) | 0;
+	item[1] = val;
+	item[2] = 0;
+	item[3] = 0;
+	wmb();
+
+	writel(0xffffffff, dpu->regs + CMDLIST0 + 0x1c + 0x40 * CMDLIST_SCENE_INIT);
+	writel(lower_32_bits(dpu->regcmd_dma),
+		dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT));
+	writel((u32)~BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_ADDR_MASK_DIS);
+	writel(BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_START);
+	udelay(50);
+	status = readl(dpu->regs + CMDLIST0 + 0x1c + 0x40 * CMDLIST_SCENE_INIT);
+	if (!(status & BIT(7))) {
+		dev_warn(dpu->drm.dev, "regcmd %06x=%08x not done, ints=%08x\n",
+			addr, val, status);
+		ret = -EIO;
+	}
+	return ret;
+}
+static ssize_t charlotte_regcmd_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	char tmp[40];
+	unsigned int addr, val;
+	int ret;
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	if (sscanf(tmp, "%x %x", &addr, &val) != 2)
+		return -EINVAL;
+	ret = charlotte_regcmd_run(dpu, addr, val);
+	return ret ? ret : len;
+}
+static const struct file_operations charlotte_regcmd_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_regcmd_write,
+	.llseek = noop_llseek,
+};
 static ssize_t charlotte_cmdlist_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
 {
@@ -1109,6 +1187,7 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("reg", 0600, dpu->debugfs, dpu, &charlotte_reg_fops);
 	debugfs_create_file("dacc", 0200, dpu->debugfs, dpu, &charlotte_dacc_fops);
 	debugfs_create_file("cmdl", 0600, dpu->debugfs, dpu, &charlotte_cmdlist_fops);
+	debugfs_create_file("daccw", 0200, dpu->debugfs, dpu, &charlotte_regcmd_fops);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
