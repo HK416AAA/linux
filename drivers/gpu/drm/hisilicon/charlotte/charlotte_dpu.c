@@ -589,39 +589,54 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 {
 	u32 *hdr, *item;
-	u32 status;
-	int ret = 0;
+	u32 status = 0;
+	int ret = 0, i;
 
 	if (addr & 3 || addr >= DPU_WINDOW_SIZE)
 		return -EINVAL;
 	if (!dpu->regcmd_buf) {
-		dpu->regcmd_buf = dma_alloc_coherent(dpu->dev, 32,
+		dpu->regcmd_buf = dma_alloc_coherent(dpu->dev,
+			CMDLIST_HDR_SIZE + 2 * CMDLIST_ITEM_SIZE,
 			&dpu->regcmd_dma, GFP_KERNEL);
 		if (!dpu->regcmd_buf)
 			return -ENOMEM;
 	}
 	hdr = dpu->regcmd_buf;
 	item = hdr + 4;
-	memset(hdr, 0, 32);
-	/* exec, last, task_end, CONFIG mode, valid_flag 0xA5. */
-	hdr[0] = (0xa5U << 24) | BIT(22) | BIT(1) | BIT(0);
+	memset(hdr, 0, CMDLIST_HDR_SIZE + 2 * CMDLIST_ITEM_SIZE);
+	/* last, task_end, CONFIG mode, valid_flag 0xA5.  exec stays 0. */
+	hdr[0] = (0xa5U << 24) | BIT(22) | BIT(1);
 	hdr[1] = 0;
-	hdr[2] = 1;	/* one item, no transport destination */
+	/*
+	 * The vendor composer never emits a node with a single item; the DACC
+	 * then raises onedone but no taskdone.  Duplicate the write.
+	 */
+	hdr[2] = 2;	/* items_count, no transport destination */
 	hdr[3] = lower_32_bits(dpu->regcmd_dma) + CMDLIST_HDR_SIZE;
 	/* addr0 (18 bits, word aligned), data0, one register. */
-	item[0] = ((addr >> 2) & 0x3ffff) | 0;
-	item[1] = val;
-	item[2] = 0;
-	item[3] = 0;
+	for (i = 0; i < 2; i++) {
+		item[i * 4 + 0] = ((addr >> 2) & 0x3ffff);
+		item[i * 4 + 1] = val;
+		item[i * 4 + 2] = 0;
+		item[i * 4 + 3] = 0;
+	}
 	wmb();
 
+	writel(0xe4, dpu->regs + CMDLIST_CH_INTE(CMDLIST_SCENE_INIT));
+	writel(readl(dpu->regs + CMDLIST_CH_CTRL(CMDLIST_SCENE_INIT)) | 1,
+		dpu->regs + CMDLIST_CH_CTRL(CMDLIST_SCENE_INIT));
 	writel(0xffffffff, dpu->regs + CMDLIST0 + 0x1c + 0x40 * CMDLIST_SCENE_INIT);
 	writel(lower_32_bits(dpu->regcmd_dma),
 		dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT));
 	writel((u32)~BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_ADDR_MASK_DIS);
 	writel(BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_START);
-	udelay(50);
-	status = readl(dpu->regs + CMDLIST0 + 0x1c + 0x40 * CMDLIST_SCENE_INIT);
+	for (i = 0; i < 1000; i++) {
+		status = readl(dpu->regs + CMDLIST0 + 0x1c +
+			0x40 * CMDLIST_SCENE_INIT);
+		if (status & BIT(7))
+			break;
+		udelay(50);
+	}
 	if (!(status & BIT(7))) {
 		dev_warn(dpu->drm.dev, "regcmd %06x=%08x not done, ints=%08x\n",
 			addr, val, status);
