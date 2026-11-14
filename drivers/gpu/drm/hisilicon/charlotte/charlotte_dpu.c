@@ -39,6 +39,9 @@
 
 #define DSI_INTS 0x248
 #define DSI_MASK 0x24c
+/* Command-mode frame pump: vendor enable_dsi_ldi() writes both per TE. */
+#define DSI_LDI_CTRL 0x1b8
+#define DSI_LDI_FRM_MSK_UP 0x238
 #define DSI_VSYNC BIT(4)
 #define DSI_VACT_START BIT(7)
 #define DSI_VACT_END BIT(8)
@@ -84,9 +87,13 @@
 #define DACC_GLB_MDP_MASK (DACC_GLB0 + 0x254)
 #define DACC_GLB_SDP_STATUS (DACC_GLB0 + 0x258)
 #define DACC_GLB_SDP_MASK (DACC_GLB0 + 0x25c)
-#define WIDTH 1840
-#define HEIGHT 2800
-#define TEST_PITCH 7424
+/* Firmware handoff proves the panel and layer are 2800x1840 landscape:
+ * DM layer height 0x072f0aef packs width-1 in the low word, stride 11200 is
+ * 2800*4, DSC PIC_SIZE is 0x0aef072f, and DSI vactive reads 1840.
+ */
+#define WIDTH 2800
+#define HEIGHT 1840
+#define TEST_PITCH (WIDTH * 4)
 #define TEST_SIZE PAGE_ALIGN(TEST_PITCH * HEIGHT)
 
 static bool probe_only = true;
@@ -251,15 +258,18 @@ error:
 
 static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
 {
+	u32 layer_size = ((HEIGHT - 1) << 16) | (WIDTH - 1);
+	u32 hw_format;
 	if (dpu->cmdlist_item) {
 		dpu->cmdlist_item[DM_W_START_ADDR_H] = upper_32_bits(addr);
 		dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
 		dpu->cmdlist_item[DM_W_STRIDE] = pitch;
+		dpu->cmdlist_item[DM_W_LAYER_HEIGHT] = layer_size;
 		dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
 			(format == DRM_FORMAT_XRGB8888 ? 5U : 13U) << 8;
 		wmb();
 	}
-	u32 hw_format = format == DRM_FORMAT_XRGB8888 ? 5 : 13;
+	hw_format = format == DRM_FORMAT_XRGB8888 ? 5 : 13;
 	/* GPL opr_set_sdma_layer_fmt sets both the DMA and dynamic DFC formats.
 	 * Firmware uses ABGR (13); GNOME's opaque BGRA buffers use XRGB (5).
 	 */
@@ -268,6 +278,7 @@ static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitc
 	writel(upper_32_bits(addr) & 0xff, dpu->regs + DM_ADDRESS_H);
 	writel(lower_32_bits(addr), dpu->regs + DM_ADDRESS_L);
 	writel(pitch, dpu->regs + DM_STRIDE);
+	writel(layer_size, dpu->regs + DM_LAYER_SIZE);
 	wmb();
 }
 static void queue_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
@@ -348,6 +359,15 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	if (status & DSI_VSYNC)
 		dpu->vsync_count++;
 	spin_unlock_irqrestore(&dpu->lock, flags);
+	if (dpu->kms && (status & DSI_LCD_TE0)) {
+		/* The panel is command mode with GRAM, so the DSI sends one frame
+		 * per TE. Vendor enable_dsi_ldi() re-arms both registers every
+		 * frame; without this the pipeline stalls after the first frame.
+		 */
+		writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0),
+			dpu->regs + DSI_LDI_CTRL);
+		writel(1, dpu->regs + DSI_LDI_FRM_MSK_UP);
+	}
 	if (dpu->kms && status & frame_bit) {
 		drm_crtc_handle_vblank(&dpu->crtc);
 		if (event) {
