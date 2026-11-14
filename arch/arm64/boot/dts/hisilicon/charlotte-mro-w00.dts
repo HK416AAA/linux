@@ -199,7 +199,7 @@
 	};
 
 	chosen {
-		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=tty0 console=ttyHW0,115200 ignore_loglevel loglevel=8 log_buf_len=4M nokaslr panic=10 charlotte_dpu.probe_only=0";
+		bootargs = "earlycon=uart_v500,mmio32,0xffb82000 console=tty0 console=ttyHW0,115200 ignore_loglevel loglevel=8 log_buf_len=4M nokaslr panic=10 charlotte_dpu.probe_only=1";
 		stdout-path = "serial0:115200n8";
 		/* Placeholders for setup.c to overwrite in place; adding new
 		 * properties on the flat blob fails without string space. */

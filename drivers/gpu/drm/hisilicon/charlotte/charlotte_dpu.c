@@ -39,6 +39,17 @@
 
 #define DSI_INTS 0x248
 #define DSI_MASK 0x24c
+/* Phase A pristine snapshot: DSI framing state and DACC core state. */
+#define DSI_MODE_CTRL 0x008
+#define DSI_EDPI_CMD_SIZE 0x040
+#define DSI_CMD_MODE_CTRL 0x044
+#define DSI_VSTATE 0x1fc
+#define DSI_VINACT 0x1dc
+#define DACC_CTRL 0x40000
+#define DACC_INTMSK 0x40004
+#define DACC_CFG 0x4000c
+#define DACC_STATUS 0x40010
+#define DACC_MONPC 0x40014
 /* Command-mode frame pump: vendor enable_dsi_ldi() writes both per TE. */
 #define DSI_LDI_CTRL 0x1b8
 #define DSI_LDI_FRM_MSK_UP 0x238
@@ -396,6 +407,22 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		dpu->boot_address_h & 0xff, dpu->boot_address_l,
 		dpu->boot_stride, &dpu->test_address);
 	spin_unlock_irqrestore(&dpu->lock, flags);
+	/* Read framing/core state without the spinlock: MMIO reads only, and this
+	 * keeps the interrupt path untouched while collecting a snapshot.
+	 * VSTATE: 0x1 idle, 0x2 vsw, 0x8 vactive0, 0x80 v_wait_te0.
+	 */
+	seq_printf(s, "snapshot dsi_mode=%08x cmdmod=%08x edpi=%08x vstate=%08x vinact=%08x\n",
+		readl(dpu->regs + DSI_MODE_CTRL), readl(dpu->regs + DSI_CMD_MODE_CTRL),
+		readl(dpu->regs + DSI_EDPI_CMD_SIZE), readl(dpu->regs + DSI_VSTATE),
+		readl(dpu->regs + DSI_VINACT));
+	seq_printf(s, "snapshot dacc_int=%08x intmsk=%08x cfg=%08x status=%08x monpc=%08x\n",
+		readl(dpu->regs + DACC_CTRL), readl(dpu->regs + DACC_INTMSK),
+		readl(dpu->regs + DACC_CFG), readl(dpu->regs + DACC_STATUS),
+		readl(dpu->regs + DACC_MONPC));
+	seq_printf(s, "snapshot sc0_clksel=%08x clken=%08x swstart=%08x stfrm=%08x cfgmode=%08x\n",
+		readl(dpu->regs + DACC_SCENE0), readl(dpu->regs + DACC_SCENE0 + 0x04),
+		readl(dpu->regs + DACC_SCENE0 + 0x10), readl(dpu->regs + DACC_SCENE0 + 0x1c),
+		readl(dpu->regs + DACC_SCENE0 + 0x24));
 	seq_printf(s, "backlight_on=%u\n", READ_ONCE(dpu->backlight_on));
 	return 0;
 }
@@ -407,6 +434,8 @@ struct charlotte_reg_desc {
 };
 static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "dsi0_pm", 0x00198 }, { "dsi0_ldi", 0x001b8 }, { "dsi0_cmdmod", 0x001c0 },
+	{ "dsi0_mode", 0x00008 }, { "dsi0_edpi", 0x00040 }, { "dsi0_cmdctl", 0x00044 },
+	{ "dsi0_vidctl", 0x00050 }, { "dsi0_vidact", 0x00110 },
 	{ "dsi0_te", 0x001c4 }, { "dsi0_frmmsk", 0x001d4 }, { "dsi0_frmvalid", 0x001d8 },
 	{ "dsi0_vinact", 0x001dc }, { "dsi0_vstate", 0x001fc }, { "dsi0_ints", 0x00248 },
 	{ "dsi0_mask", 0x0024c },

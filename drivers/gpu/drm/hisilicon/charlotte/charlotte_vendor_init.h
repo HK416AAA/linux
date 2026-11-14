@@ -106,7 +106,7 @@ static const struct charlotte_reg_init charlotte_seq_memory[] = {
 
 #define CHARLOTTE_SEQ_ITF_NUM 13
 static const struct charlotte_reg_init charlotte_seq_itf[] = {
-	{ 0xcc000, 0x0aef072f, "itfch: IMG_SIZE 1840x2800" },
+	{ 0xcc000, 0x072f03a7, "itfch: IMG_SIZE 936x1840 (DSC out)" },
 	{ 0xcc068, 0x00000000, "itfch: ITFSW_DATA_SEL" },
 	{ 0xcc05c, 0x00000001, "itfch: FLUSH_EN" },
 	{ 0xcc074, 0x000001a1, "itfch: VSYNC_DELAY_CNT_CTRL" },
