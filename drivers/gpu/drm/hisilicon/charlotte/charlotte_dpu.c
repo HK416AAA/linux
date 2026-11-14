@@ -65,6 +65,16 @@
 #define DPU_WINDOW_SIZE 0x100000
 #define DACC_SCENE0 0x40400
 #define DACC_GLB0 0x13000
+/* Command transport: nine scenes, INITIAL(7) is the one-shot loader. */
+#define CMDLIST0 0x12000
+#define CMDLIST_CH_CTRL(i) (CMDLIST0 + 0x04 + 0x40 * (i))
+#define CMDLIST_CH_STAAD(i) (CMDLIST0 + 0x0c + 0x40 * (i))
+#define CMDLIST_CH_INTE(i) (CMDLIST0 + 0x14 + 0x40 * (i))
+#define CMDLIST_START (CMDLIST0 + 0x714)
+#define CMDLIST_ADDR_MASK_DIS (CMDLIST0 + 0x71c)
+#define CMDLIST_TWO_SAME_FRAME_BYPASS (CMDLIST0 + 0x7a0)
+#define CMDLIST_SCENE_MAX 9
+#define CMDLIST_SCENE_INIT 7
 #define DACC_GLB_DP0_STATUS (DACC_GLB0 + 0x240)
 #define DACC_GLB_DP0_MASK (DACC_GLB0 + 0x244)
 #define DACC_GLB_DP1_STATUS (DACC_GLB0 + 0x248)
@@ -531,7 +541,28 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	hdr[3] = lower_32_bits(dpu->cmdlist_dma) + CMDLIST_HDR_SIZE;
 	wmb();
 
+	/* Vendor dpu_cmdlist_init_ch(): arm every transport channel. */
+	writel(readl(dpu->regs + CMDLIST_TWO_SAME_FRAME_BYPASS) | 1,
+		dpu->regs + CMDLIST_TWO_SAME_FRAME_BYPASS);
+	for (i = 0; i < CMDLIST_SCENE_MAX; i++) {
+		writel(0xe4, dpu->regs + CMDLIST_CH_INTE(i));
+		writel(readl(dpu->regs + CMDLIST_CH_CTRL(i)) | 1,
+			dpu->regs + CMDLIST_CH_CTRL(i));
+	}
+
+	/* Online scene keeps the firmware clocks; only the fetch mode changes. */
+	writel(readl(dpu->regs + DACC_SCENE0) | 1, dpu->regs + DACC_SCENE0);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x04) | 1, dpu->regs + DACC_SCENE0 + 0x04);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x1c) & ~1U, dpu->regs + DACC_SCENE0 + 0x1c);
 	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) | 1, dpu->regs + DACC_SCENE0 + 0x24);
+
+	/* Vendor dpu_cmdlist_init_commit(): run the INITIAL scene once. */
+	writel(lower_32_bits(dpu->cmdlist_dma),
+		dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT));
+	writel((u32)~BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_ADDR_MASK_DIS);
+	writel(BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_START);
+
+	/* Hand the online scene the same buffer; it re-runs every frame. */
 	writel(0, dpu->regs + DM0);
 	writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
 	writel(0, dpu->regs + DACC_GLB_DP0_MASK);
@@ -563,6 +594,14 @@ static int charlotte_cmdlist_show(struct seq_file *s, void *unused)
 	struct charlotte_dpu *dpu = s->private;
 	seq_printf(s, "active=%u dma=%pad dm_cmd0=%08x\n", dpu->cmdlist_buf != NULL,
 		&dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4));
+	seq_printf(s, "monpc=%08x ch0_ctrl=%08x ch0_status=%08x ch0_curad=%08x\n",
+		readl(dpu->regs + 0x40014), readl(dpu->regs + CMDLIST_CH_CTRL(0)),
+		readl(dpu->regs + CMDLIST0 + 0x08), readl(dpu->regs + CMDLIST0 + 0x10));
+	seq_printf(s, "ch7_ctrl=%08x ch7_status=%08x start=%08x mask_dis=%08x\n",
+		readl(dpu->regs + CMDLIST_CH_CTRL(7)),
+		readl(dpu->regs + CMDLIST0 + 0x08 + 0x40 * 7),
+		readl(dpu->regs + CMDLIST_START),
+		readl(dpu->regs + CMDLIST_ADDR_MASK_DIS));
 	return 0;
 }
 static int charlotte_cmdlist_open(struct inode *inode, struct file *file)
