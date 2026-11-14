@@ -5,6 +5,7 @@
  * Cold panel initialization, alternate modes and runtime PM are not provided.
  */
 #include <linux/aperture.h>
+#include <linux/arm-smccc.h>
 #include <linux/debugfs.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -50,6 +51,13 @@
 #define DACC_CFG 0x4000c
 #define DACC_STATUS 0x40010
 #define DACC_MONPC 0x40014
+/*
+ * BL31 display-channel firmware load: make_fid(FID_DISPLAY_GROUP=0x37, 0x05)
+ * == FID_BL31_DISPLAY_CH_DEFAUL_SEC_CONFIG, called by the vendor composer as
+ * dpu_dacc_load().  Without it the DACC core stays parked in WFI (mon_pc
+ * constant) and never executes the DM cmdlist, so no frame is produced.
+ */
+#define CHARLOTTE_FID_DACC_LOAD 0xc3003705UL
 /* Command-mode frame pump: vendor enable_dsi_ldi() writes both per TE. */
 #define DSI_LDI_CTRL 0x1b8
 #define DSI_LDI_FRM_MSK_UP 0x238
@@ -132,6 +140,7 @@ struct charlotte_dpu {
 	u64 irq_count, irq_window_ns;
 	u32 irq_window_count;
 	bool kms, kms_attempted, pending, latched;
+	bool ldi_pump;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
 	void *cmdlist_buf;
@@ -370,7 +379,7 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	if (status & DSI_VSYNC)
 		dpu->vsync_count++;
 	spin_unlock_irqrestore(&dpu->lock, flags);
-	if (dpu->kms && (status & DSI_LCD_TE0)) {
+	if ((dpu->kms || dpu->ldi_pump) && (status & DSI_LCD_TE0)) {
 		/* The panel is command mode with GRAM, so the DSI sends one frame
 		 * per TE. Vendor enable_dsi_ldi() re-arms both registers every
 		 * frame; without this the pipeline stalls after the first frame.
@@ -396,8 +405,8 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	struct charlotte_dpu *dpu = s->private;
 	unsigned long flags;
 	spin_lock_irqsave(&dpu->lock, flags);
-	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
-		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->irq_count, dpu->frame_count, dpu->vsync_count,
+	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u ldi_pump=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
+		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->ldi_pump, dpu->irq_count, dpu->frame_count, dpu->vsync_count,
 		dpu->te_count, dpu->frame_period_ns, dpu->underflows, dpu->flips);
 	seq_printf(s, "address=%02x%08x stride=%u pending=%u test_active=%u test_restoring=%u\n",
 		readl(dpu->regs + DM_ADDRESS_H) & 0xff,
@@ -703,6 +712,26 @@ static int charlotte_regseq_run(struct charlotte_dpu *dpu,
 	return ret;
 }
 
+/*
+ * Vendor dpu_dacc_load(): ask BL31 to load the DACC firmware for display
+ * channel 0 (configure_dss_service_security(DSS_CH_DEFAULT_SEC_CONFIG, 0, 0,
+ * BIG_DPU) -> arm_smccc_smc(func_id, channel, mode, dpu_index, ...)).  Log the
+ * SMC status together with the core state so the caller can see whether the
+ * core left WFI; a status of -1 means BL31 has no display handler (FID not
+ * supported) and is harmless.
+ */
+static void charlotte_dacc_load(struct charlotte_dpu *dpu)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(CHARLOTTE_FID_DACC_LOAD, 0, 0, 0, 0, 0, 0, 0, &res);
+	dev_info(dpu->dev,
+		"dacc_load smc ret=%d a1=%lu a2=%lu a3=%lu status=%08x monpc=%08x vstate=%08x\n",
+		(int)res.a0, (unsigned long)res.a1, (unsigned long)res.a2,
+		(unsigned long)res.a3, readl(dpu->regs + DACC_STATUS),
+		readl(dpu->regs + DACC_MONPC), readl(dpu->regs + DSI_VSTATE));
+}
+
 static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
 {
 	const struct charlotte_reg_init e = { addr, val, NULL };
@@ -820,6 +849,62 @@ static const struct file_operations charlotte_cmdlist_fops = {
 	.owner = THIS_MODULE, .open = charlotte_cmdlist_open,
 	.write = charlotte_cmdlist_write, .read = seq_read,
 	.llseek = seq_lseek, .release = single_release,
+};
+
+static ssize_t charlotte_daccload_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value != 1 || !probe_only || dpu->kms)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	charlotte_dacc_load(dpu);
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+static const struct file_operations charlotte_daccload_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_daccload_write,
+	.llseek = noop_llseek,
+};
+
+/*
+ * Vendor enable_dsi_ldi(): in command mode the DSI fetches exactly one frame
+ * per TE, so LDI_CTRL bit0 must be re-armed on every panel TE.  Arm it now so
+ * the frame starts, then let charlotte_irq() keep it pumped.  This exercises
+ * the DSI/ITF path without a full KMS takeover.
+ */
+static ssize_t charlotte_ldipump_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value > 1 || !probe_only || dpu->kms)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	dpu->ldi_pump = value;
+	if (value) {
+		writel(1, dpu->regs + DSI_LDI_FRM_MSK_UP);
+		writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0),
+			dpu->regs + DSI_LDI_CTRL);
+	} else {
+		writel(readl(dpu->regs + DSI_LDI_CTRL) & ~BIT(0),
+			dpu->regs + DSI_LDI_CTRL);
+	}
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+static const struct file_operations charlotte_ldipump_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_ldipump_write,
+	.llseek = noop_llseek,
 };
 
 static ssize_t charlotte_takeover_write(struct file *file, const char __user *buf,
@@ -1325,6 +1410,10 @@ static int charlotte_probe(struct platform_device *pdev)
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
 		debugfs_create_file("takeover", 0200, dpu->debugfs, dpu, &charlotte_takeover_fops);
+		debugfs_create_file("daccload", 0200, dpu->debugfs, dpu,
+			&charlotte_daccload_fops);
+		debugfs_create_file("ldipump", 0200, dpu->debugfs, dpu,
+			&charlotte_ldipump_fops);
 		dev_info(dev, "read-only handoff probe: %ux%u pitch=%u IRQ=%d; KMS retained by simpledrm\n",
 			WIDTH, HEIGHT, dpu->boot_stride, dpu->irq);
 		return 0;
