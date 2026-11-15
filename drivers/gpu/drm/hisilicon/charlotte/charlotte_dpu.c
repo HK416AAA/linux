@@ -1242,7 +1242,13 @@ static int charlotte_dm_restore(struct charlotte_dpu *dpu)
 struct charlotte_diag_sample {
 	u32 itf_size, itf_state, dsc_in, dsc_out, dsc_fifo, dsc_lb;
 	u32 ldi_h2, ldi_v2, vstate, pld_st;
+	u64 frames, te;
 };
+
+/* DSC_ST_DATAIN/OUT are 13-bit counters, so deltas only make sense modulo
+ * that width; frame and TE counts are the authoritative "did it advance".
+ */
+#define DSC_ST_MASK 0x1fff
 
 static void charlotte_diag_sample(struct charlotte_dpu *dpu,
 				  struct charlotte_diag_sample *s)
@@ -1257,6 +1263,8 @@ static void charlotte_diag_sample(struct charlotte_dpu *dpu,
 	s->ldi_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
 	s->vstate = readl(dpu->regs + DSI_VSTATE);
 	s->pld_st = readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS);
+	s->frames = dpu->frame_count;
+	s->te = dpu->te_count;
 }
 
 static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
@@ -1476,11 +1484,13 @@ static ssize_t charlotte_selftest_write(struct file *file,
 		msleep(150);
 		charlotte_diag_sample(dpu, &b);
 		dev_info(dpu->dev,
-			 "selftest mode=%u ret=%d itf=%08x state=%08x dsc in=%08x(%+d) out=%08x(%+d) fifo=%08x lb=%08x ldi=%08x/%08x vstate=%08x\n",
+			 "selftest mode=%u ret=%d itf=%08x state=%08x dsc in=%08x(%+d) out=%08x(%+d) fifo=%08x lb=%08x ldi=%08x/%08x vstate=%08x frames=%llu(+%llu) te=%llu(+%llu) pld=%08x\n",
 			 mode, ret, b.itf_size, b.itf_state, b.dsc_in,
-			 (int)(b.dsc_in - a.dsc_in), b.dsc_out,
-			 (int)(b.dsc_out - a.dsc_out), b.dsc_fifo, b.dsc_lb,
-			 b.ldi_h2, b.ldi_v2, b.vstate);
+			 (int)((b.dsc_in - a.dsc_in) & DSC_ST_MASK), b.dsc_out,
+			 (int)((b.dsc_out - a.dsc_out) & DSC_ST_MASK), b.dsc_fifo,
+			 b.dsc_lb, b.ldi_h2, b.ldi_v2, b.vstate,
+			 b.frames, b.frames - a.frames, b.te, b.te - a.te,
+			 b.pld_st);
 		a = b;
 	}
 	mutex_unlock(&dpu->diagnostic_lock);
