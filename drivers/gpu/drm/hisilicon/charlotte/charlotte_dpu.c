@@ -287,6 +287,7 @@ struct charlotte_dpu {
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
 	u32 boot_vfp;
+	u32 boot_h2, boot_v2, boot_vact;
 	u32 *dm_backup;
 	void *cmdlist_buf;
 	dma_addr_t cmdlist_dma;
@@ -1072,7 +1073,8 @@ static const struct file_operations charlotte_regcmd_fops = {
  *   window <w> <h>         LDI scan window registers (1ec/1f0/74/78)
  *   present <mode>         0 trigger only, 1 panel window, 2 vendor ITF seq,
  *                          3 vendor DM transport cmdlist, 4 DM window patch,
- *                          5 all of them, 9 restore the DM snapshot
+ *                          5 all of them, 8 restore the LDI window,
+ *                          9 restore the DM snapshot
  *   dmparam                dump the whole dpu_dm_param window
  *   selftest               run every present mode and print counters
  *
@@ -1133,6 +1135,16 @@ static void charlotte_ldi_window(struct charlotte_dpu *dpu, u32 w, u32 h)
 	writel(h - 1, dpu->regs + DSI_LDI_VRT_CTRL2);
 	writel(vfp, dpu->regs + DSI_VIDEO_VFP);
 	writel(h, dpu->regs + DSI_VIDEO_VACT);
+	wmb();
+}
+
+/* Put the LDI window back exactly as the bootloader left it. */
+static void charlotte_ldi_window_restore(struct charlotte_dpu *dpu)
+{
+	writel(dpu->boot_h2, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	writel(dpu->boot_v2, dpu->regs + DSI_LDI_VRT_CTRL2);
+	writel(dpu->boot_vfp, dpu->regs + DSI_VIDEO_VFP);
+	writel(dpu->boot_vact, dpu->regs + DSI_VIDEO_VACT);
 	wmb();
 }
 
@@ -1236,8 +1248,8 @@ static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
 	case 0:
 		break;
 	case 1:
+		/* Panel-side address window only: cannot disturb the DPU path. */
 		ret = charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1);
-		charlotte_ldi_window(dpu, WIDTH, HEIGHT);
 		break;
 	case 2:
 		ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
@@ -1259,13 +1271,16 @@ static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
 		break;
 	case 5:
 		ret = charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1);
-		charlotte_ldi_window(dpu, WIDTH, HEIGHT);
 		if (!ret)
 			ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
 					ARRAY_SIZE(charlotte_seq_itf));
 		if (!ret && !dpu->cmdlist_buf)
 			ret = charlotte_cmdlist_start(dpu);
 		break;
+	case 8:
+		charlotte_ldi_window_restore(dpu);
+		charlotte_ldi_arm(dpu);
+		return 0;
 	case 9:
 		return charlotte_dm_restore(dpu);
 	default:
@@ -2693,6 +2708,9 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu->boot_select = select;
 	dpu->boot_ov_fmt = readl(dpu->regs + DM_LAYER_OV_FMT);
 	dpu->boot_vfp = readl(dpu->regs + DSI_VIDEO_VFP);
+	dpu->boot_h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	dpu->boot_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+	dpu->boot_vact = readl(dpu->regs + DSI_VIDEO_VACT);
 	spin_lock_init(&dpu->lock);
 	mutex_init(&dpu->diagnostic_lock);
 	INIT_DELAYED_WORK(&dpu->restore_work, charlotte_restore_work);
