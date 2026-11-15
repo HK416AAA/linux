@@ -230,6 +230,10 @@ struct charlotte_dpu {
 	u32 video_saved_mode, video_saved_cmdmod, video_saved_frmmsk;
 	u32 video_saved_vidmode, video_saved_lpcmd, video_saved_totime;
 	u32 video_saved_ldi_h2, video_saved_ldi_v2, video_saved_cmdmodctl;
+	u32 video_saved_ldi_ctrl, video_saved_lpclk;
+	u32 video_saved_hsa, video_saved_hbp, video_saved_hline;
+	u32 video_saved_vsa, video_saved_vbp, video_saved_vact;
+	u32 video_saved_pktlen, video_saved_ldi_h3;
 	u32 video_saved_vfp;
 	u32 video_saved_dpp_dbg, video_saved_dsc_dbg, video_saved_itf_dbg;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
@@ -1206,6 +1210,16 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		dpu->video_saved_ldi_h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
 		dpu->video_saved_ldi_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
 		dpu->video_saved_cmdmodctl = readl(dpu->regs + DSI_CMD_MOD_CTRL);
+		dpu->video_saved_ldi_ctrl = readl(dpu->regs + DSI_LDI_CTRL);
+		dpu->video_saved_lpclk = readl(dpu->regs + DSI_LP_CLK_CTRL);
+		dpu->video_saved_hsa = readl(dpu->regs + DSI_VIDEO_HSA);
+		dpu->video_saved_hbp = readl(dpu->regs + DSI_VIDEO_HBP);
+		dpu->video_saved_hline = readl(dpu->regs + DSI_VIDEO_HLINE);
+		dpu->video_saved_vsa = readl(dpu->regs + DSI_VIDEO_VSA);
+		dpu->video_saved_vbp = readl(dpu->regs + DSI_VIDEO_VBP);
+		dpu->video_saved_vact = readl(dpu->regs + DSI_VIDEO_VACT);
+		dpu->video_saved_pktlen = readl(dpu->regs + DSI_VIDEO_PKT_LEN);
+		dpu->video_saved_ldi_h3 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3);
 		dpu->video_saved_vfp = readl(dpu->regs + DSI_VIDEO_VFP);
 		dpu->video_saved_dpp_dbg = readl(dpu->regs + DPP0_REG_CTRL_DEBUG);
 		dpu->video_saved_dsc_dbg = readl(dpu->regs + DSC0_REG_CTRL_DEBUG);
@@ -1241,8 +1255,11 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		 */
 		writel((dpu->video_saved_vidmode & ~GENMASK(13, 8)) |
 		       (0x3f << 8) | BIT(15), dpu->regs + DSI_VIDEO_MODE_CTRL);
-		writel(dpu->video_saved_lpcmd | (0x4 << 8),
-			dpu->regs + DSI_VIDEO_MODE_LP_CMD_TIMING);
+		/* outvact_lpcmd_time is bits [23:16], the same field the
+		 * vendor sets via set_reg(..., 0x4, 8, 16).
+		 */
+		writel((dpu->video_saved_lpcmd & ~GENMASK(23, 16)) |
+		       (0x4 << 16), dpu->regs + DSI_VIDEO_MODE_LP_CMD_TIMING);
 		writel((dpu->video_saved_totime & ~GENMASK(15, 0)) | 0x7ff,
 			dpu->regs + DSI_TO_TIME_CTRL);
 		/* LDI horizontal/vertical active are derived from the DSC output
@@ -1251,10 +1268,12 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		 */
 		h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
 		v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
-		if ((h2 & 0x1fff) == 0)
-			writel(0x3a7, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
-		if ((v2 & 0x1fff) == 0)
-			writel(0x72f, dpu->regs + DSI_LDI_VRT_CTRL2);
+		if ((h2 & GENMASK(12, 0)) == 0)
+			writel((h2 & ~GENMASK(12, 0)) | 0x3a7,
+				dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+		if ((v2 & GENMASK(12, 0)) == 0)
+			writel((v2 & ~GENMASK(12, 0)) | 0x72f,
+				dpu->regs + DSI_LDI_VRT_CTRL2);
 		/* If the bootloader left the video timing empty, seed the exact
 		 * MRO values recovered from the stock lcd_config DT: HSA 10,
 		 * HBP 12, HLINE 878, VSA 18, VBP 70, VFP 42, VACT 1840,
@@ -1327,11 +1346,19 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		writel(dpu->video_saved_cmdmodctl | BIT(1),
 			dpu->regs + DSI_CMD_MOD_CTRL);
 		writel(0, dpu->regs + DSI_LDI_FRM_MSK);
-		writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0),
+		writel(dpu->video_saved_ldi_ctrl | BIT(0),
 			dpu->regs + DSI_LDI_CTRL);
+		/* phy_txrequestclkhs must be on for video.  sub2 already turns it
+		 * on for command mode, so this is normally a no-op; keep it
+		 * explicit so a handoff that left it clear still transmits.
+		 */
+		writel(dpu->video_saved_lpclk | BIT(0), dpu->regs + DSI_LP_CLK_CTRL);
 		dpu->video_active = true;
 		msleep(30);
-	} else if (!value && dpu->video_active) {
+	} else if (value && dpu->video_active) {
+		dev_info(dpu->drm.dev,
+			"video: already active; echo 0 first to re-arm\n");
+	} else if (dpu->video_active) {
 		writel(dpu->video_saved_mode, dpu->regs + DSI_MODE_CTRL);
 		writel(dpu->video_saved_cmdmod, dpu->regs + DSI_CMD_MODE_CTRL);
 		writel(dpu->video_saved_frmmsk, dpu->regs + DSI_LDI_FRM_MSK);
@@ -1341,6 +1368,16 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		writel(dpu->video_saved_ldi_h2, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
 		writel(dpu->video_saved_ldi_v2, dpu->regs + DSI_LDI_VRT_CTRL2);
 		writel(dpu->video_saved_cmdmodctl, dpu->regs + DSI_CMD_MOD_CTRL);
+		writel(dpu->video_saved_ldi_ctrl, dpu->regs + DSI_LDI_CTRL);
+		writel(dpu->video_saved_lpclk, dpu->regs + DSI_LP_CLK_CTRL);
+		writel(dpu->video_saved_hsa, dpu->regs + DSI_VIDEO_HSA);
+		writel(dpu->video_saved_hbp, dpu->regs + DSI_VIDEO_HBP);
+		writel(dpu->video_saved_hline, dpu->regs + DSI_VIDEO_HLINE);
+		writel(dpu->video_saved_vsa, dpu->regs + DSI_VIDEO_VSA);
+		writel(dpu->video_saved_vbp, dpu->regs + DSI_VIDEO_VBP);
+		writel(dpu->video_saved_vact, dpu->regs + DSI_VIDEO_VACT);
+		writel(dpu->video_saved_pktlen, dpu->regs + DSI_VIDEO_PKT_LEN);
+		writel(dpu->video_saved_ldi_h3, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3);
 		writel(dpu->video_saved_vfp, dpu->regs + DSI_VIDEO_VFP);
 		writel(dpu->video_saved_itf_dbg, dpu->regs + ITF0_REG_CTRL_DEBUG);
 		writel(dpu->video_saved_dsc_dbg, dpu->regs + DSC0_REG_CTRL_DEBUG);
@@ -1348,6 +1385,11 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		dpu->video_active = false;
 		msleep(20);
 	}
+	/* Keep the diagnostic IRQ lifetime bounded even on a restore or a
+	 * no-op write; the entry cancelled any pending auto-stop.
+	 */
+	if (dpu->irq_running)
+		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
 	vcount0 = readl(dpu->regs + DSI_VCOUNT);
 	hcount0 = readl(dpu->regs + DSI_HCOUNT);
 	msleep(20);
