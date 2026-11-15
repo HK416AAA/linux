@@ -699,9 +699,9 @@
 	framebuffer@53458000 {
 		compatible = "simple-framebuffer";
 		reg = <0x0 0x53458000 0x0 0x13aa000>;
-		width = <1840>;
-		height = <2800>;
-		stride = <7360>;
+		width = <2800>;
+		height = <1840>;
+		stride = <11200>;
 		format = "x8b8g8r8";
 		memory-region = <&scanout_fb>;
 	};
