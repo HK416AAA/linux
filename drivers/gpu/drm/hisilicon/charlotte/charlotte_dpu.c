@@ -2049,7 +2049,8 @@ static const struct drm_mode_config_helper_funcs charlotte_mode_helpers = {
 	.atomic_commit_tail = charlotte_commit_tail,
 };
 static const struct drm_mode_config_funcs charlotte_mode_funcs = {
-	.fb_create = drm_gem_fb_create, .atomic_check = drm_atomic_helper_check,
+	.fb_create = drm_gem_fb_create_with_dirty,
+	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
 static const struct drm_encoder_funcs charlotte_encoder_funcs = {
