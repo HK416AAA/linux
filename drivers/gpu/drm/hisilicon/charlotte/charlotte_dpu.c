@@ -218,9 +218,14 @@ static struct ffa_driver charlotte_platdrv_ffa_driver = {
 };
 #endif
 
-static bool probe_only = true;
+/* The bootloader's command line is not under our control and shipped a
+ * stale probe_only=1, which silently kept simpledrm in charge. Keep the
+ * parameter so that argument stays accepted, but let the device tree make
+ * the decision: without "hisilicon,probe-only" the driver takes over.
+ */
+static bool probe_only;
 module_param(probe_only, bool, 0444);
-MODULE_PARM_DESC(probe_only, "Keep simpledrm and expose bounded handoff diagnostics instead of native KMS");
+MODULE_PARM_DESC(probe_only, "Keep simpledrm and expose bounded handoff diagnostics instead of native KMS (device tree: hisilicon,probe-only)");
 static bool strict_handoff;
 module_param(strict_handoff, bool, 0444);
 MODULE_PARM_DESC(strict_handoff, "Refuse to take over when the firmware register signature differs from the TGR one");
@@ -2150,6 +2155,10 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu = devm_drm_dev_alloc(dev, &charlotte_drm_driver, struct charlotte_dpu, drm);
 	if (IS_ERR(dpu))
 		return PTR_ERR(dpu);
+	/* Device tree decides, so a stale probe_only=1 on the bootloader
+	 * command line cannot keep simpledrm in charge of the panel.
+	 */
+	probe_only = of_property_read_bool(dev->of_node, "hisilicon,probe-only");
 	platform_set_drvdata(pdev, dpu);
 	dpu->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpu->regs))

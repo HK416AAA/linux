@@ -165,8 +165,8 @@
 
 	/* E880 DPU/DSI0 instance and SPI 480 are present together in the
 	 * stock composer_manager and dsi@E8800000 nodes (not the E890 DPU).
-	 * The native KMS takes over by default; pass probe_only=1 on the
-	 * kernel command line to retain simpledrm for bounded diagnostics.
+	 * The native KMS takes over by default; add hisilicon,probe-only to
+	 * this node to retain simpledrm for bounded diagnostics.
 	 */
 	dpu: display-controller@e8800000 {
 		compatible = "hisilicon,charlotte-dpu-handoff";
