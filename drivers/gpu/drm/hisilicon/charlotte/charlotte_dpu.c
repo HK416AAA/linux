@@ -473,14 +473,12 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 			dpu->frame_period_ns = now - dpu->last_frame_ns;
 		dpu->last_frame_ns = now;
 		dpu->frame_count++;
-		/* The DM samples the layer image only when a layer register is
-		 * written; a one-shot program therefore keeps the panel on the
-		 * first frame.  Re-arm the layer every frame so the SDMA fetches
-		 * the buffer again and buffer edits become visible.
+		/* The DSC flush re-latches the OPR chain and pulls a fresh frame
+		 * from DPP0/SDMA, so that pulse is the per-frame present.  A DM
+		 * layer register write on its own never reaches the panel.
 		 */
 		if (dpu->online_active)
-			program_scanout(dpu, dpu->test_address, TEST_PITCH,
-					DRM_FORMAT_XRGB8888);
+			writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
 		if (dpu->latched) {
 			dpu->latched = false;
 			event = dpu->event;
@@ -1644,8 +1642,8 @@ static ssize_t charlotte_online_write(struct file *file, const char __user *buf,
 			msleep(20);
 		}
 	} else if (dpu->online_active) {
-		/* Live recolour: charlotte_irq() re-arms the layer every frame,
-		 * so rewriting the buffer content is enough.
+		/* Live recolour: charlotte_irq() flushes the DSC every frame, so
+		 * rewriting the buffer content is enough.
 		 */
 		rgb = (value == 1) ? 0xff0000 :
 		      (value == 2) ? 0x00ff00 :
