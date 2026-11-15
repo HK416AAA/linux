@@ -396,22 +396,37 @@ error:
 	drm_err(&dpu->drm, "backlight %s failed: %d\n", on ? "on" : "off", ret);
 }
 
+static bool charlotte_hw_format(u32 format, u32 *hw)
+{
+	/* DPU_SDMA_STATIC_FORMAT values from soc_dpu_format.h. */
+	switch (format) {
+	case DRM_FORMAT_RGB565:   *hw = 0x0; return true;
+	case DRM_FORMAT_XRGB8888: *hw = 0x5; return true;
+	case DRM_FORMAT_ARGB8888: *hw = 0x6; return true;
+	case DRM_FORMAT_XBGR8888: *hw = 0xc; return true;
+	case DRM_FORMAT_ABGR8888: *hw = 0xd; return true;
+	}
+	return false;
+}
+
 static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
 {
 	u32 layer_size = ((HEIGHT - 1) << 16) | (WIDTH - 1);
 	u32 hw_format;
+	if (!charlotte_hw_format(format, &hw_format))
+		hw_format = 0xd;
 	if (dpu->cmdlist_item) {
 		dpu->cmdlist_item[DM_W_START_ADDR_H] = upper_32_bits(addr);
 		dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
 		dpu->cmdlist_item[DM_W_STRIDE] = pitch;
 		dpu->cmdlist_item[DM_W_LAYER_HEIGHT] = layer_size;
 		dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
-			(format == DRM_FORMAT_XRGB8888 ? 5U : 13U) << 8;
+			hw_format << 8;
 		wmb();
 	}
-	hw_format = format == DRM_FORMAT_XRGB8888 ? 5 : 13;
 	/* GPL opr_set_sdma_layer_fmt sets both the DMA and dynamic DFC formats.
-	 * Firmware uses ABGR (13); GNOME's opaque BGRA buffers use XRGB (5).
+	 * Firmware uses ABGR (13) for the logo; opaque DRM buffers map to the
+	 * matching SDMA format so 565/8888/RGB order stay correct.
 	 */
 	writel((dpu->boot_select & ~0xff00U) | hw_format << 8, dpu->regs + DM_LAYER_SELECT);
 	writel((dpu->boot_ov_fmt & ~0xffU) | hw_format, dpu->regs + DM_LAYER_OV_FMT);
@@ -1865,6 +1880,7 @@ static int charlotte_plane_check(struct drm_plane *drm_plane, struct drm_atomic_
 	struct drm_crtc_state *crtc;
 	struct drm_gem_dma_object *obj;
 	u64 end;
+	u32 hw_format;
 	int ret;
 	if (!plane->fb)
 		return 0;
@@ -1881,8 +1897,12 @@ static int charlotte_plane_check(struct drm_plane *drm_plane, struct drm_atomic_
 		return ret;
 	if (plane->src_x || plane->src_y || plane->src_w != WIDTH << 16 ||
 		plane->src_h != HEIGHT << 16 || plane->crtc_x || plane->crtc_y ||
-		plane->crtc_w != WIDTH || plane->crtc_h != HEIGHT ||
-		plane->fb->pitches[0] < WIDTH * 4 || plane->fb->pitches[0] % 16)
+		plane->crtc_w != WIDTH || plane->crtc_h != HEIGHT)
+		return -EINVAL;
+	if (!plane->fb->format || !charlotte_hw_format(plane->fb->format->format, &hw_format))
+		return -EINVAL;
+	if (plane->fb->pitches[0] < WIDTH * plane->fb->format->cpp[0] ||
+	    plane->fb->pitches[0] % 16)
 		return -EINVAL;
 	obj = drm_fb_dma_get_gem_obj(plane->fb, 0);
 	end = (u64)plane->fb->offsets[0] + (u64)plane->fb->pitches[0] * HEIGHT;
@@ -2014,7 +2034,11 @@ static const struct drm_encoder_funcs charlotte_encoder_funcs = {
 static int charlotte_kms_init(struct charlotte_dpu *dpu)
 {
 	struct drm_device *drm = &dpu->drm;
-	static const u32 formats[] = { DRM_FORMAT_XRGB8888 };
+	static const u32 formats[] = {
+		DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888,
+		DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888,
+		DRM_FORMAT_RGB565,
+	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	int ret;
 	ret = charlotte_backlight_init(dpu);
@@ -2040,6 +2064,10 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	if (ret)
 		return ret;
 	drm_plane_helper_add(&dpu->plane, &charlotte_plane_helpers);
+	/* Full-frame scanout ignores damage, but advertising the property lets
+	 * compositors submit partial-update commits without failing the check.
+	 */
+	drm_plane_enable_fb_damage_clips(&dpu->plane);
 	ret = drm_crtc_init_with_planes(drm, &dpu->crtc, &dpu->plane, NULL, &charlotte_crtc_funcs, NULL);
 	if (ret)
 		return ret;
@@ -2219,10 +2247,26 @@ static const struct of_device_id charlotte_match[] = {
 	{ .compatible = "hisilicon,charlotte-dpu-handoff" }, {}
 };
 MODULE_DEVICE_TABLE(of, charlotte_match);
+static int charlotte_pm_suspend(struct device *dev)
+{
+	struct charlotte_dpu *dpu = dev_get_drvdata(dev);
+	if (!dpu || !dpu->kms)
+		return 0;
+	return drm_mode_config_helper_suspend(&dpu->drm);
+}
+static int charlotte_pm_resume(struct device *dev)
+{
+	struct charlotte_dpu *dpu = dev_get_drvdata(dev);
+	if (!dpu || !dpu->kms)
+		return 0;
+	return drm_mode_config_helper_resume(&dpu->drm);
+}
+static DEFINE_SIMPLE_DEV_PM_OPS(charlotte_pm_ops, charlotte_pm_suspend, charlotte_pm_resume);
+
 static struct platform_driver charlotte_platform_driver = {
 	.probe = charlotte_probe, .remove = charlotte_remove, .shutdown = charlotte_shutdown,
 	.driver = { .name = "charlotte-dpu", .of_match_table = charlotte_match,
-		.suppress_bind_attrs = true },
+		.pm = &charlotte_pm_ops, .suppress_bind_attrs = true },
 };
 static int __init charlotte_init(void)
 {
