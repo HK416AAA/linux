@@ -2469,6 +2469,13 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 	 * the panel; without this every commit and flush is silently dropped.
 	 */
 	charlotte_pipeline_commit(dpu);
+	/* The bootloader leaves a partial column/row address window in the
+	 * panel controller, so a full-frame scanout only ever lands in the old
+	 * dirty region.  The vendor panel driver re-sends the whole-panel
+	 * window on every region change; do the same once per enable.
+	 */
+	if (charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1))
+		dev_warn(dpu->dev, "panel window update failed; keeping firmware region\n");
 	/* Open the LDI frame-valid gate before the first commit so the panel
 	 * receives pixels instead of only internal timing.
 	 */
