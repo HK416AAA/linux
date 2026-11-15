@@ -80,12 +80,15 @@
 #define DSI_LCD_TE0 BIT(12)
 /* Vendor MIPI APB low-power command channel (mipi_dsi_host.c).  The payload is
  * staged four bytes per word in APB_WR_LP_PLD_DATA; storing dtype/vc/wc into
- * APB_WR_LP_HDR issues the packet.  CMD_PLD_BUF_STATUS bit 4 stays set while a
- * packet is still draining, so it doubles as the completion poll.
+ * APB_WR_LP_HDR issues the packet.  CMD_PLD_BUF_STATUS reports FIFO occupancy
+ * with 1 meaning empty: bit 0 gen_cmd_empty, bit 2 gen_pld_w_empty, so both set
+ * means the host has taken the packet.  Bit 4 is gen_pld_r_empty, i.e. the
+ * read-reply buffer, and is unrelated to a write.
  */
 #define DSI_APB_WR_LP_HDR 0x00c
 #define DSI_APB_WR_LP_PLD 0x010
 #define DSI_CMD_PLD_BUF_STATUS 0x014
+#define DSI_PLD_STATUS_TX_IDLE (BIT(0) | BIT(2))
 #define DTYPE_DCS_LWRITE 0x39
 /* Online scene control: latching the DM shadow window into the active scene. */
 #define DACC_SCENE0_RELOAD 0x40408
@@ -263,6 +266,8 @@ struct charlotte_dpu {
 	void __iomem *regs;
 	spinlock_t lock;
 	struct mutex diagnostic_lock;
+	/* Serializes the MIPI APB low-power command channel only. */
+	struct mutex dcs_lock;
 	struct i2c_client *backlight;
 	bool backlight_on;
 	bool backlight_ro;
@@ -784,6 +789,11 @@ static void charlotte_cmdlist_release(struct charlotte_dpu *dpu)
 	}
 	if (!dpu->cmdlist_buf)
 		return;
+	/* Detach the DACC before the buffer disappears: a stale descriptor
+	 * would make the sequencer read freed DMA memory on the next frame.
+	 */
+	writel(0, dpu->regs + DM0 + 4);
+	wmb();
 	dma_free_coherent(dpu->dev, CMDLIST_HDR_SIZE + DM_PARAM_SIZE,
 		dpu->cmdlist_buf, dpu->cmdlist_dma);
 	dpu->cmdlist_buf = NULL;
@@ -1079,8 +1089,8 @@ static const struct file_operations charlotte_regcmd_fops = {
  *   selftest               run every present mode and print counters
  *
  * The vendor MIPI host stages payload words first and issues the packet by
- * writing the header, with no pre-write busy check; CMD_PLD_BUF_STATUS bit 4
- * tells whether the packet has drained.
+ * writing the header, with no pre-write busy check; the FIFO-empty bits are
+ * only polled afterwards as a completion hint.
  */
 static int charlotte_dsi_lwrite(struct charlotte_dpu *dpu, u8 dtype, u8 vc,
 				const u8 *data, u32 len)
@@ -1099,9 +1109,9 @@ static int charlotte_dsi_lwrite(struct charlotte_dpu *dpu, u8 dtype, u8 vc,
 	hdr = (u32)(dtype & 0x3f) | ((u32)(vc & 0x3) << 6) |
 		((len & 0xffff) << 8);
 	writel(hdr, dpu->regs + DSI_APB_WR_LP_HDR);
-	for (i = 0; i < 200; i++) {
+	for (i = 0; i < 100; i++) {
 		status = readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS);
-		if (!(status & BIT(4)))
+		if ((status & DSI_PLD_STATUS_TX_IDLE) == DSI_PLD_STATUS_TX_IDLE)
 			return 0;
 		udelay(50);
 	}
@@ -1116,10 +1126,17 @@ static int charlotte_dcs_region(struct charlotte_dpu *dpu, u32 x0, u32 x1,
 	u8 ra[5] = { 0x2b, (u8)(y0 >> 8), (u8)y0, (u8)(y1 >> 8), (u8)y1 };
 	int ret;
 
+	/* One APB channel: keep the two address packets of a region update
+	 * together.  This mutex is only ever taken around DCS traffic so it
+	 * cannot deadlock against diagnostic_lock (takeover holds that across
+	 * the modeset that calls this).
+	 */
+	mutex_lock(&dpu->dcs_lock);
 	ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, ca, sizeof(ca));
 	if (!ret)
 		ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, ra,
 					   sizeof(ra));
+	mutex_unlock(&dpu->dcs_lock);
 	return ret;
 }
 
@@ -1141,6 +1158,11 @@ static void charlotte_ldi_window(struct charlotte_dpu *dpu, u32 w, u32 h)
 /* Put the LDI window back exactly as the bootloader left it. */
 static void charlotte_ldi_window_restore(struct charlotte_dpu *dpu)
 {
+	/* Never write back an all-zero capture: a zero window would make the
+	 * LDI wait for one pixel per line and starve the frame pump.
+	 */
+	if (!dpu->boot_v2)
+		return;
 	writel(dpu->boot_h2, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
 	writel(dpu->boot_v2, dpu->regs + DSI_LDI_VRT_CTRL2);
 	writel(dpu->boot_vfp, dpu->regs + DSI_VIDEO_VFP);
@@ -1153,12 +1175,11 @@ static int charlotte_dm_snapshot(struct charlotte_dpu *dpu)
 {
 	unsigned int i;
 
-	if (!dpu->dm_backup) {
-		dpu->dm_backup = devm_kzalloc(dpu->dev, DM_PARAM_SIZE,
-					      GFP_KERNEL);
-		if (!dpu->dm_backup)
-			return -ENOMEM;
-	}
+	if (dpu->dm_backup)
+		return 0;
+	dpu->dm_backup = devm_kzalloc(dpu->dev, DM_PARAM_SIZE, GFP_KERNEL);
+	if (!dpu->dm_backup)
+		return -ENOMEM;
 	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
 		dpu->dm_backup[i] = readl(dpu->regs + DM0 + i * 4);
 	return 0;
@@ -1339,9 +1360,9 @@ static ssize_t charlotte_dcs_write(struct file *file, const char __user *buf,
 	}
 	if (!n)
 		return -EINVAL;
-	mutex_lock(&dpu->diagnostic_lock);
+	mutex_lock(&dpu->dcs_lock);
 	ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, data, n);
-	mutex_unlock(&dpu->diagnostic_lock);
+	mutex_unlock(&dpu->dcs_lock);
 	dev_info(dpu->dev, "dcs %d bytes: %d\n", n, ret);
 	return ret ? ret : len;
 }
@@ -2720,11 +2741,18 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu->boot_vact = readl(dpu->regs + DSI_VIDEO_VACT);
 	spin_lock_init(&dpu->lock);
 	mutex_init(&dpu->diagnostic_lock);
+	mutex_init(&dpu->dcs_lock);
 	INIT_DELAYED_WORK(&dpu->restore_work, charlotte_restore_work);
 	INIT_DELAYED_WORK(&dpu->irq_stop_work, charlotte_irq_stop_work);
 	INIT_WORK(&dpu->retire_work, charlotte_retire_work);
 	init_completion(&dpu->flip_done);
 	dpu->dev = dev;
+	/* Keep the firmware DM descriptor from probe time so "present 9" always
+	 * restores the handoff state, even after the transport cmdlist path has
+	 * rewritten the live window.
+	 */
+	if (charlotte_dm_snapshot(dpu))
+		dev_warn(dev, "cannot snapshot the DM descriptor; present 9 unavailable\n");
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
