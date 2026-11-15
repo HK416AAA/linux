@@ -102,6 +102,25 @@
 #define DPP0_REG_CTRL_DEBUG 0xb4064
 #define DSC0_REG_CTRL_DEBUG 0xd4258
 #define ITF0_REG_CTRL_DEBUG 0xcc060
+/* Online DPP0 -> DSC0 -> ITF0 pipeline.  The bootloader leaves these modules
+ * frozen with REG_CTRL_DEBUG bit10 and the DSI-facing ITF sized to 0, so the
+ * panel only ever shows the frame still held in its GRAM.  Enabling the three
+ * operators and routing DPP0 to ITF0 turns the handoff layer into a live scan
+ * source.  Offsets match the B236 soc_dpu_interface.h definitions:
+ *   DPP_REG_CTRL 0x58 / FLUSH_EN 0x60 / GMP_EN 0x9a0 / CLIP_EN 0x1610
+ *   DSC_REG_CTRL 0x250 / FLUSH_EN 0x254
+ *   ITF_CH_IMG_SIZE 0x00 / DPP_CLIP_EN 0x14 / DPP_CLRBAR_CTRL 0x30 /
+ *   REG_CTRL 0x58 / FLUSH_EN 0x5c / ITFSW_DATA_SEL 0x68
+ *   PIPE_SW SIG_CTRL 0x00 / SIG_EN 0x04 / DAT_CTRL 0x08 / DAT_EN 0x0c
+ */
+#define DPP0_OFFSET 0xb4000
+#define DSC0_OFFSET 0xd4000
+#define ITF0_OFFSET 0xcc000
+#define PIPE_SW_OFFSET 0xcc400
+#define DSC_OUT_WIDTH 936
+/* Vendor dpu_comp_itfch_config(): ITF consumes the DSC output geometry. */
+#define ITF_IMG_SIZE (((HEIGHT - 1) << 16) | (DSC_OUT_WIDTH - 1))
+#define CHARLOTTE_ONLINE_SNAP_MAX 40
 #define DM0 0x35400
 #define DM_LAYER_SIZE (DM0 + 0x1a0)
 #define DM_LAYER_SELECT (DM0 + 0x1ac)
@@ -263,6 +282,12 @@ struct charlotte_dpu {
 	void *blank_vaddr;
 	dma_addr_t blank_address;
 	bool test_active, test_restoring;
+	/* Online DPP0->DSC0->ITF0 continuous-scanout diagnostic. */
+	bool online_active;
+	bool online_saved_pump;
+	u32 online_snap_n;
+	u32 online_snap_off[CHARLOTTE_ONLINE_SNAP_MAX];
+	u32 online_snap_val[CHARLOTTE_ONLINE_SNAP_MAX];
 };
 static const struct drm_driver charlotte_drm_driver;
 static struct charlotte_dpu *crtc_to_dpu(struct drm_crtc *crtc)
@@ -569,6 +594,7 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "dpp0_int", 0xb4000 }, { "dpp0_clksel", 0xb4008 }, { "dpp0_clken", 0xb400c },
 	{ "dpp0_clrbar", 0xb4010 }, { "dpp0_ctrl", 0xb4058 }, { "dpp0_flush", 0xb4060 },
 	{ "dpp0_dbg", 0xb4064 }, { "dpp0_state", 0xb4068 },
+	{ "dpp0_gmp", 0xb49a0 }, { "dpp0_clip", 0xb5610 },
 	{ "dp0_stat", 0x13240 }, { "dp0_mask", 0x13244 }, { "dp1_stat", 0x13248 },
 	{ "dp1_mask", 0x1324c }, { "mdp_stat", 0x13250 }, { "mdp_mask", 0x13254 },
 	{ "sdp_stat", 0x13258 }, { "sdp_mask", 0x1325c },
@@ -584,7 +610,10 @@ static const struct charlotte_reg_desc charlotte_regs[] = {
 	{ "l0_sel", 0x355ac }, { "l0_sblk", 0x355b0 }, { "l0_crop", 0x355b4 },
 	{ "l0_addrh", 0x355dc }, { "l0_addrl", 0x355e0 }, { "l0_stride", 0x355f0 },
 	{ "l1_sel", 0x3562c }, { "l1_addrl", 0x35660 }, { "l1_stride", 0x35670 },
-	{ "itf0_size", 0xcc000 }, { "itf0_flush", 0xcc05c }, { "itf0_dbg", 0xcc060 },
+	{ "dsc0_ctrl", 0xd4250 }, { "dsc0_flush", 0xd4254 },
+	{ "itf0_size", 0xcc000 }, { "itf0_clipen", 0xcc014 },
+	{ "itf0_clrbar", 0xcc030 },
+	{ "itf0_ctrl", 0xcc058 }, { "itf0_flush", 0xcc05c }, { "itf0_dbg", 0xcc060 },
 	{ "itf0_datasel", 0xcc068 },
 	{ "psw_sig0", 0xcc400 }, { "psw_sigen0", 0xcc404 }, { "psw_dat0", 0xcc408 },
 	{ "psw_daten0", 0xcc40c }, { "psw_splith", 0xcc48c }, { "psw_splitc", 0xcc490 },
@@ -1243,10 +1272,14 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
 		if (!dpu->irq_running) {
 			ret = charlotte_irq_start(dpu);
-			if (ret && ret != -EBUSY) {
-				mutex_unlock(&dpu->diagnostic_lock);
-				return ret;
-			}
+			/* A storm trip returns -EIO and leaves the IRQ disabled.
+			 * Video mode can still be evaluated by polling vcount, so
+			 * never block the transport flip on the counter source.
+			 */
+			if (ret)
+				dev_info(dpu->drm.dev,
+					 "video: irq not started (%d); using vcount polling\n",
+					 ret);
 		}
 		/* mipi_dsi_video_mode_config(): LP mode on all lanes (bits
 		 * 13:8), send read command in LP (bit15).  Keep the burst-mode
@@ -1382,6 +1415,18 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		writel(dpu->video_saved_itf_dbg, dpu->regs + ITF0_REG_CTRL_DEBUG);
 		writel(dpu->video_saved_dsc_dbg, dpu->regs + DSC0_REG_CTRL_DEBUG);
 		writel(dpu->video_saved_dpp_dbg, dpu->regs + DPP0_REG_CTRL_DEBUG);
+		/* The video underflow flood trips the storm guard.  Back in
+		 * command mode the sources are TE-paced again, so clear the flag
+		 * and re-arm the diagnostic IRQ instead of forcing a reboot.
+		 */
+		if (dpu->irq_storm) {
+			dpu->irq_storm = false;
+			ret = charlotte_irq_start(dpu);
+			if (ret)
+				dev_warn(dpu->drm.dev,
+					 "video: cmd-mode irq recovery failed: %d\n",
+					 ret);
+		}
 		dpu->video_active = false;
 		msleep(20);
 	}
@@ -1414,6 +1459,263 @@ static const struct file_operations charlotte_videomode_fops = {
 	.llseek = noop_llseek,
 };
 
+/* Registers snapshotted for the online bring-up.  Reverse order restores. */
+static const u32 charlotte_online_regs[] = {
+	DPP0_OFFSET + 0x0014,	/* DPP_CLRBAR_CTRL */
+	DPP0_OFFSET + 0x09a0,	/* GMP_EN */
+	DPP0_OFFSET + 0x0800,	/* ROIGAMA0_EN */
+	DPP0_OFFSET + 0x0900,	/* ROIGAMA1_EN */
+	DPP0_OFFSET + 0x1730,	/* NLXCC_EN */
+	DPP0_OFFSET + 0x1780,	/* XCC_EN */
+	DPP0_OFFSET + 0x1610,	/* CLIP_EN */
+	DPP0_OFFSET + 0x1900,	/* ALSC_DEGAMMA_EN */
+	DPP0_OFFSET + 0x1914,	/* ALSC_EN */
+	DPP0_OFFSET + 0x0058,	/* REG_CTRL (scene id) */
+	DPP0_OFFSET + 0x0060,	/* REG_CTRL_FLUSH_EN */
+	DPP0_REG_CTRL_DEBUG,
+	DSC0_OFFSET + 0x0250,	/* REG_CTRL (scene id) */
+	DSC0_OFFSET + 0x0254,	/* REG_CTRL_FLUSH_EN */
+	DSC0_REG_CTRL_DEBUG,
+	ITF0_OFFSET + 0x0000,	/* ITF_CH_IMG_SIZE */
+	ITF0_OFFSET + 0x0014,	/* DPP_CLIP_EN */
+	ITF0_OFFSET + 0x0030,	/* DPP_CLRBAR_CTRL */
+	ITF0_OFFSET + 0x0058,	/* REG_CTRL (scene id) */
+	ITF0_OFFSET + 0x005c,	/* REG_CTRL_FLUSH_EN */
+	ITF0_REG_CTRL_DEBUG,
+	ITF0_OFFSET + 0x0068,	/* ITFSW_DATA_SEL */
+	PIPE_SW_OFFSET + 0x0000,/* SIG_CTRL */
+	PIPE_SW_OFFSET + 0x0004,/* SIG_EN */
+	PIPE_SW_OFFSET + 0x0008,/* DAT_CTRL */
+	PIPE_SW_OFFSET + 0x000c,/* DAT_EN */
+	DM_LAYER_SIZE,
+	DM_LAYER_SELECT,
+	DM_LAYER_OV_FMT,
+	DM_ADDRESS_H,
+	DM_ADDRESS_L,
+	DM_STRIDE,
+};
+
+static void charlotte_online_restore(struct charlotte_dpu *dpu)
+{
+	unsigned long flags;
+	u32 i;
+
+	/* The snapshot also holds the bootloader layer address, so the SDMA
+	 * stops touching the diagnostic buffer the moment this completes.
+	 * Serialise the layer words against the IRQ scanout latch.
+	 */
+	spin_lock_irqsave(&dpu->lock, flags);
+	for (i = dpu->online_snap_n; i-- > 0; )
+		writel(dpu->online_snap_val[i], dpu->regs + dpu->online_snap_off[i]);
+	wmb();
+	spin_unlock_irqrestore(&dpu->lock, flags);
+	dpu->online_snap_n = 0;
+}
+
+static void charlotte_online_fill(struct charlotte_dpu *dpu, u32 rgb)
+{
+	u32 x, y;
+
+	rgb &= 0x00ffffffU;
+	for (y = 0; y < HEIGHT; y++) {
+		u32 *row = (u32 *)((u8 *)dpu->test_vaddr + y * TEST_PITCH);
+		for (x = 0; x < WIDTH; x++)
+			row[x] = rgb;
+	}
+	wmb();
+}
+
+static int charlotte_online_enable(struct charlotte_dpu *dpu, u32 rgb)
+{
+	unsigned long flags;
+	u32 i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(charlotte_online_regs) > CHARLOTTE_ONLINE_SNAP_MAX);
+	if (!dpu->test_vaddr) {
+		dpu->test_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE,
+			&dpu->test_address, GFP_KERNEL | __GFP_NOWARN);
+		if (!dpu->test_vaddr)
+			return -ENOMEM;
+	}
+	charlotte_online_fill(dpu, rgb);
+
+	for (i = 0; i < ARRAY_SIZE(charlotte_online_regs); i++) {
+		dpu->online_snap_off[i] = charlotte_online_regs[i];
+		dpu->online_snap_val[i] = readl(dpu->regs + charlotte_online_regs[i]);
+	}
+	dpu->online_snap_n = ARRAY_SIZE(charlotte_online_regs);
+
+	/* The bootloader freezes each operator with REG_CTRL_DEBUG bit10;
+	 * a frozen block ignores the config commit below.
+	 */
+	writel(readl(dpu->regs + DPP0_REG_CTRL_DEBUG) & ~BIT(10),
+		dpu->regs + DPP0_REG_CTRL_DEBUG);
+	writel(readl(dpu->regs + DSC0_REG_CTRL_DEBUG) & ~BIT(10),
+		dpu->regs + DSC0_REG_CTRL_DEBUG);
+	writel(readl(dpu->regs + ITF0_REG_CTRL_DEBUG) & ~BIT(10),
+		dpu->regs + ITF0_REG_CTRL_DEBUG);
+
+	/* DM first: point layer 0 at the solid-color buffer. */
+	spin_lock_irqsave(&dpu->lock, flags);
+	program_scanout(dpu, dpu->test_address, TEST_PITCH, DRM_FORMAT_XRGB8888);
+	spin_unlock_irqrestore(&dpu->lock, flags);
+
+	/* DPP0: bypass every optional block, then commit scene 0. */
+	writel(0x2, dpu->regs + DPP0_OFFSET + 0x09a0);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x0800);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x0900);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x1730);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x1780);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x1610);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x1900);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x1914);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x0014);
+	writel(0, dpu->regs + DPP0_OFFSET + 0x0058);
+	writel(1, dpu->regs + DPP0_OFFSET + 0x0060);
+
+	/* DSC0: the bootloader already programmed PIC/slice; only commit it. */
+	writel(0, dpu->regs + DSC0_OFFSET + 0x0250);
+	writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
+
+	/* ITF0: it now consumes the DSC output geometry instead of zero. */
+	writel(0, dpu->regs + ITF0_OFFSET + 0x0014);
+	writel(0, dpu->regs + ITF0_OFFSET + 0x0030);
+	writel(ITF_IMG_SIZE, dpu->regs + ITF0_OFFSET + 0x0000);
+	writel(0, dpu->regs + ITF0_OFFSET + 0x0068);
+	writel(0, dpu->regs + ITF0_OFFSET + 0x0058);
+	writel(1, dpu->regs + ITF0_OFFSET + 0x005c);
+
+	/* Route DPP0 onto ITF0 (single panel: SIG_EN=1, DAT_EN=1). */
+	writel(BIT(0), dpu->regs + PIPE_SW_OFFSET + 0x0000);
+	writel(1, dpu->regs + PIPE_SW_OFFSET + 0x0004);
+	writel(BIT(0), dpu->regs + PIPE_SW_OFFSET + 0x0008);
+	writel(1, dpu->regs + PIPE_SW_OFFSET + 0x000c);
+	wmb();
+
+	/* Command-mode panels need one LDI frame per TE; video panels free-run.
+	 * Keep the pump armed either way so the node works in both transports.
+	 */
+	dpu->online_saved_pump = dpu->ldi_pump;
+	dpu->ldi_pump = true;
+	dpu->online_active = true;
+	dpu->test_active = true;
+	return 0;
+}
+
+/* Online bring-up: a single command that builds the whole DPP0 -> DSC0 -> ITF0
+ * path and scans one solid-color frame out of the handoff layer.
+ *   echo 1        red
+ *   echo 2        green
+ *   echo 3        blue
+ *   echo 0xRRGGBB any other colour
+ *   echo 0        restore every touched register
+ * The transport (command vs video) is orthogonal: run "videomode 1" first for
+ * a free-running stream, or leave it alone for TE-paced command mode.
+ */
+static ssize_t charlotte_online_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	u32 rgb = 0, mode, vstate, vcount0, vcount1, hcount0, hcount1;
+	u64 frames0, te0, under0;
+	unsigned value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value > 0xffffffU || !probe_only || dpu->kms)
+		return -EINVAL;
+	cancel_delayed_work_sync(&dpu->irq_stop_work);
+	mutex_lock(&dpu->diagnostic_lock);
+	if (value == 0) {
+		if (dpu->online_active) {
+			charlotte_online_restore(dpu);
+			dpu->ldi_pump = dpu->online_saved_pump;
+			dpu->test_active = false;
+			dpu->online_active = false;
+			msleep(20);
+		}
+	} else if (dpu->online_active) {
+		/* Live recolour: the SDMA re-reads the buffer every frame, so a
+		 * fill is enough to prove the pipeline is actually scanning.
+		 */
+		rgb = (value == 1) ? 0xff0000 :
+		      (value == 2) ? 0x00ff00 :
+		      (value == 3) ? 0x0000ff : value;
+		charlotte_online_fill(dpu, rgb);
+	} else {
+		if (dpu->test_active) {
+			ret = -EBUSY;
+			goto out;
+		}
+		if (value == 1)
+			rgb = 0xff0000;
+		else if (value == 2)
+			rgb = 0x00ff00;
+		else if (value == 3)
+			rgb = 0x0000ff;
+		else
+			rgb = value;
+		ret = charlotte_online_enable(dpu, rgb);
+		if (ret)
+			goto out;
+		if (!dpu->irq_running) {
+			ret = charlotte_irq_start(dpu);
+			if (ret)
+				dev_info(dpu->drm.dev,
+					 "online: irq not started (%d); checked by polling\n",
+					 ret);
+			/* A storm trip only disables the counter source; the
+			 * register path above is still programmed.
+			 */
+			ret = 0;
+		}
+		msleep(30);
+	}
+	if (dpu->irq_running)
+		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
+	vcount0 = readl(dpu->regs + DSI_VCOUNT);
+	hcount0 = readl(dpu->regs + DSI_HCOUNT);
+	frames0 = dpu->frame_count;
+	te0 = dpu->te_count;
+	under0 = dpu->underflows;
+	msleep(20);
+	vcount1 = readl(dpu->regs + DSI_VCOUNT);
+	hcount1 = readl(dpu->regs + DSI_HCOUNT);
+	mode = readl(dpu->regs + DSI_MODE_CTRL);
+	vstate = readl(dpu->regs + DSI_VSTATE);
+	/* Self-check: every block must read back the value just committed, and
+	 * the frame/TE counters must advance for the panel to be refreshing.
+	 */
+	dev_info(dpu->drm.dev,
+		 "online: active=%u rgb=%06x itf_size=%08x itf_ctrl=%08x dsc_ctrl=%08x dpp_ctrl=%08x psw=%08x/%08x/%08x/%08x\n",
+		 dpu->online_active, rgb,
+		 readl(dpu->regs + ITF0_OFFSET + 0x0000),
+		 readl(dpu->regs + ITF0_OFFSET + 0x0058),
+		 readl(dpu->regs + DSC0_OFFSET + 0x0250),
+		 readl(dpu->regs + DPP0_OFFSET + 0x0058),
+		 readl(dpu->regs + PIPE_SW_OFFSET + 0x0000),
+		 readl(dpu->regs + PIPE_SW_OFFSET + 0x0004),
+		 readl(dpu->regs + PIPE_SW_OFFSET + 0x0008),
+		 readl(dpu->regs + PIPE_SW_OFFSET + 0x000c));
+	dev_info(dpu->drm.dev,
+		 "online: mode=%08x vstate=%08x vcount=%u->%u hcount=%u->%u frames=%llu(+%llu) te=%llu(+%llu) underflows=%llu(+%llu)\n",
+		 mode, vstate, vcount0, vcount1, hcount0, hcount1,
+		 dpu->frame_count, dpu->frame_count - frames0,
+		 dpu->te_count, dpu->te_count - te0,
+		 dpu->underflows, dpu->underflows - under0);
+	if (dpu->online_active && dpu->frame_count == frames0)
+		dev_warn(dpu->drm.dev,
+			 "online: no frame advanced; the ITF is still starved\n");
+out:
+	mutex_unlock(&dpu->diagnostic_lock);
+	return ret ? ret : len;
+}
+static const struct file_operations charlotte_online_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_online_write,
+	.llseek = noop_llseek,
+};
+
 /* The MRO panel hangs off a Richtek RT4539 at i2c 0x3c.  Register 0x0b bit7 is
  * the LED enable the firmware path used.  Writing 2 dumps 0x00..0x15 to dmesg so
  * the real chip state can be read back before toggling anything.
@@ -1430,6 +1732,16 @@ static ssize_t charlotte_backlight_write(struct file *file, const char __user *b
 	if (value > 2 || !probe_only || dpu->kms)
 		return -EINVAL;
 	mutex_lock(&dpu->diagnostic_lock);
+	if (!dpu->backlight) {
+		/* probe_only skips charlotte_kms_init(), which is the only other
+		 * caller.  Resolve the supplier lazily here so the diagnostic
+		 * works before the native KMS path takes over.
+		 */
+		ret = charlotte_backlight_init(dpu);
+		if (ret)
+			dev_info(dpu->drm.dev,
+				 "backlight: supplier not ready (%d)\n", ret);
+	}
 	if (!dpu->backlight) {
 		dev_info(dpu->drm.dev, "backlight: no RT4539 supplier bound\n");
 	} else if (value == 2) {
@@ -1865,6 +2177,8 @@ static int charlotte_probe(struct platform_device *pdev)
 			&charlotte_ldipump_fops);
 		debugfs_create_file("videomode", 0200, dpu->debugfs, dpu,
 			&charlotte_videomode_fops);
+		debugfs_create_file("online", 0200, dpu->debugfs, dpu,
+			&charlotte_online_fops);
 		debugfs_create_file("backlight", 0200, dpu->debugfs, dpu,
 			&charlotte_backlight_fops);
 		dev_info(dev, "read-only handoff probe: %ux%u pitch=%u IRQ=%d; KMS retained by simpledrm\n",
