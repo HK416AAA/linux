@@ -1554,40 +1554,25 @@ static void charlotte_online_fill(struct charlotte_dpu *dpu, u32 rgb)
 	wmb();
 }
 
-static int charlotte_online_enable(struct charlotte_dpu *dpu, u32 rgb)
+/* Bring the DPP0 -> DSC0 -> ITF0 chain up from the bootloader handoff.
+ *
+ * The bootloader leaves every operator frozen (REG_CTRL_DEBUG bit10) and the
+ * pipe unrouted, so config commits and flushes are ignored until this runs.
+ * The diagnostic online path proved this is what makes the panel take our
+ * frames; the KMS path needs the same sequence. Register programming only:
+ * the layer descriptor is owned by the atomic commit.
+ */
+static void charlotte_pipeline_commit(struct charlotte_dpu *dpu)
 {
 	unsigned long flags;
-	u32 i;
 
-	BUILD_BUG_ON(ARRAY_SIZE(charlotte_online_regs) > CHARLOTTE_ONLINE_SNAP_MAX);
-	if (!dpu->test_vaddr) {
-		dpu->test_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE,
-			&dpu->test_address, GFP_KERNEL | __GFP_NOWARN);
-		if (!dpu->test_vaddr)
-			return -ENOMEM;
-	}
-	charlotte_online_fill(dpu, rgb);
-
-	for (i = 0; i < ARRAY_SIZE(charlotte_online_regs); i++) {
-		dpu->online_snap_off[i] = charlotte_online_regs[i];
-		dpu->online_snap_val[i] = readl(dpu->regs + charlotte_online_regs[i]);
-	}
-	dpu->online_snap_n = ARRAY_SIZE(charlotte_online_regs);
-
-	/* The bootloader freezes each operator with REG_CTRL_DEBUG bit10;
-	 * a frozen block ignores the config commit below.
-	 */
+	spin_lock_irqsave(&dpu->lock, flags);
 	writel(readl(dpu->regs + DPP0_REG_CTRL_DEBUG) & ~BIT(10),
 		dpu->regs + DPP0_REG_CTRL_DEBUG);
 	writel(readl(dpu->regs + DSC0_REG_CTRL_DEBUG) & ~BIT(10),
 		dpu->regs + DSC0_REG_CTRL_DEBUG);
 	writel(readl(dpu->regs + ITF0_REG_CTRL_DEBUG) & ~BIT(10),
 		dpu->regs + ITF0_REG_CTRL_DEBUG);
-
-	/* DM first: point layer 0 at the solid-color buffer. */
-	spin_lock_irqsave(&dpu->lock, flags);
-	program_scanout(dpu, dpu->test_address, TEST_PITCH, DRM_FORMAT_XRGB8888);
-	spin_unlock_irqrestore(&dpu->lock, flags);
 
 	/* DPP0: bypass every optional block, then commit scene 0. */
 	writel(0x2, dpu->regs + DPP0_OFFSET + 0x09a0);
@@ -1620,6 +1605,35 @@ static int charlotte_online_enable(struct charlotte_dpu *dpu, u32 rgb)
 	writel(BIT(0), dpu->regs + PIPE_SW_OFFSET + 0x0008);
 	writel(1, dpu->regs + PIPE_SW_OFFSET + 0x000c);
 	wmb();
+	spin_unlock_irqrestore(&dpu->lock, flags);
+}
+
+static int charlotte_online_enable(struct charlotte_dpu *dpu, u32 rgb)
+{
+	unsigned long flags;
+	u32 i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(charlotte_online_regs) > CHARLOTTE_ONLINE_SNAP_MAX);
+	if (!dpu->test_vaddr) {
+		dpu->test_vaddr = dma_alloc_wc(dpu->dev, TEST_SIZE,
+			&dpu->test_address, GFP_KERNEL | __GFP_NOWARN);
+		if (!dpu->test_vaddr)
+			return -ENOMEM;
+	}
+	charlotte_online_fill(dpu, rgb);
+
+	for (i = 0; i < ARRAY_SIZE(charlotte_online_regs); i++) {
+		dpu->online_snap_off[i] = charlotte_online_regs[i];
+		dpu->online_snap_val[i] = readl(dpu->regs + charlotte_online_regs[i]);
+	}
+	dpu->online_snap_n = ARRAY_SIZE(charlotte_online_regs);
+
+	/* DM first: point layer 0 at the solid-color buffer. */
+	spin_lock_irqsave(&dpu->lock, flags);
+	program_scanout(dpu, dpu->test_address, TEST_PITCH, DRM_FORMAT_XRGB8888);
+	spin_unlock_irqrestore(&dpu->lock, flags);
+
+	charlotte_pipeline_commit(dpu);
 
 	/* Command-mode panels need one LDI frame per TE; video panels free-run.
 	 * Keep the pump armed either way so the node works in both transports.
@@ -1957,8 +1971,14 @@ static void charlotte_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 }
 static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
 {
+	struct charlotte_dpu *dpu = crtc_to_dpu(crtc);
+
+	/* Take the handoff chain out of the bootloader freeze and route it to
+	 * the panel; without this every commit and flush is silently dropped.
+	 */
+	charlotte_pipeline_commit(dpu);
 	drm_crtc_vblank_on(crtc);
-	charlotte_backlight_power(crtc_to_dpu(crtc), true);
+	charlotte_backlight_power(dpu, true);
 }
 static void charlotte_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
 {
