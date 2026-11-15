@@ -23,6 +23,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_dma_helper.h>
@@ -481,10 +482,6 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 		dpu->underflows++;
 	if (status & (DSI_VACT_END | DSI_LCD_TE0) && dpu->pending) {
 		program_scanout(dpu, dpu->next_address, dpu->next_stride, dpu->next_format);
-		/* Pulse the DSC flush so the descriptor just programmed is really
-		 * fetched. Register writes alone never reach the panel.
-		 */
-		writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
 		dpu->pending = false;
 		dpu->latched = true;
 		dpu->flips++;
@@ -497,11 +494,13 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 			dpu->frame_period_ns = now - dpu->last_frame_ns;
 		dpu->last_frame_ns = now;
 		dpu->frame_count++;
-		/* The DSC flush re-latches the OPR chain and pulls a fresh frame
-		 * from DPP0/SDMA, so that pulse is the per-frame present.  A DM
-		 * layer register write on its own never reaches the panel.
+		/* The DSC serves frames from the last latched descriptor, so the
+		 * chain has to be flushed again for the panel to fetch the
+		 * buffer: without this, fbdev/fbcon writes and any commit that
+		 * does not change the address stay invisible. Flush every frame
+		 * while we own the pipeline, after any latch above.
 		 */
-		if (dpu->online_active)
+		if (dpu->kms || dpu->online_active)
 			writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
 		if (dpu->latched) {
 			dpu->latched = false;
@@ -2069,6 +2068,13 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	if (ret)
 		return ret;
 	drm_plane_helper_add(&dpu->plane, &charlotte_plane_helpers);
+	/* The single DM layer cannot blend, so alpha is ignored at scanout.
+	 * Advertising the modes keeps alpha-capable clients working and
+	 * silences the core's "alpha exposed but blend mode not setup" check.
+	 */
+	drm_plane_create_blend_mode_property(&dpu->plane,
+		BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI) |
+		BIT(DRM_MODE_BLEND_COVERAGE));
 	/* Full-frame scanout ignores damage, but advertising the property lets
 	 * compositors submit partial-update commits without failing the check.
 	 */
