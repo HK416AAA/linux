@@ -68,6 +68,11 @@
 #define DSI_LDI_CTRL 0x1b8
 #define DSI_LDI_FRM_MSK 0x1d4
 #define DSI_LDI_FRM_MSK_UP 0x238
+/* Frame-valid gate: with bit 29 clear the LDI keeps scanning but the DSI drops
+ * every pixel, so a command-mode panel only refreshes its own GRAM.
+ */
+#define DSI_FRM_VALID_DBG 0x1d8
+#define DSI_FRM_VALID_GATE BIT(29)
 #define DSI_VSYNC BIT(4)
 #define DSI_VACT_START BIT(7)
 #define DSI_VACT_END BIT(8)
@@ -449,6 +454,19 @@ static void queue_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch,
 	dpu->next_format = format;
 	dpu->pending = true;
 }
+/* Command-mode frame pump.  The frame-valid bit gates LDI pixels into the DSI
+ * and single_frm_update is edge triggered: a write of 1 while the bit already
+ * reads 1 starts no new transfer, which is why the panel kept showing the one
+ * frame that was pumped when the gate first opened.
+ */
+static void charlotte_ldi_arm(struct charlotte_dpu *dpu)
+{
+	writel(readl(dpu->regs + DSI_FRM_VALID_DBG) | DSI_FRM_VALID_GATE,
+		dpu->regs + DSI_FRM_VALID_DBG);
+	writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0), dpu->regs + DSI_LDI_CTRL);
+	writel(0, dpu->regs + DSI_LDI_FRM_MSK_UP);
+	writel(1, dpu->regs + DSI_LDI_FRM_MSK_UP);
+}
 static irqreturn_t charlotte_irq(int irq, void *data)
 {
 	struct charlotte_dpu *dpu = data;
@@ -533,9 +551,7 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 		 * per TE. Vendor enable_dsi_ldi() re-arms both registers every
 		 * frame; without this the pipeline stalls after the first frame.
 		 */
-		writel(readl(dpu->regs + DSI_LDI_CTRL) | BIT(0),
-			dpu->regs + DSI_LDI_CTRL);
-		writel(1, dpu->regs + DSI_LDI_FRM_MSK_UP);
+		charlotte_ldi_arm(dpu);
 	}
 	if (dpu->kms && status & frame_bit) {
 		drm_crtc_handle_vblank(&dpu->crtc);
@@ -1005,6 +1021,29 @@ static ssize_t charlotte_regcmd_write(struct file *file, const char __user *buf,
 }
 static const struct file_operations charlotte_regcmd_fops = {
 	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_regcmd_write,
+	.llseek = noop_llseek,
+};
+static ssize_t charlotte_refresh_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	unsigned int value;
+	char tmp[16];
+	int ret;
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	ret = kstrtouint(tmp, 0, &value);
+	if (ret)
+		return ret;
+	charlotte_ldi_arm(dpu);
+	return len;
+}
+static const struct file_operations charlotte_refresh_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_refresh_write,
 	.llseek = noop_llseek,
 };
 static ssize_t charlotte_cmdlist_write(struct file *file, const char __user *buf,
@@ -1983,6 +2022,10 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 	 * the panel; without this every commit and flush is silently dropped.
 	 */
 	charlotte_pipeline_commit(dpu);
+	/* Open the LDI frame-valid gate before the first commit so the panel
+	 * receives pixels instead of only internal timing.
+	 */
+	charlotte_ldi_arm(dpu);
 	drm_crtc_vblank_on(crtc);
 	charlotte_backlight_power(dpu, true);
 }
@@ -2245,6 +2288,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("daccw", 0200, dpu->debugfs, dpu, &charlotte_regcmd_fops);
 	debugfs_create_file("vendorseq", 0200, dpu->debugfs, dpu,
 		&charlotte_vendorseq_fops);
+	debugfs_create_file("refresh", 0200, dpu->debugfs, dpu,
+		&charlotte_refresh_fops);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
