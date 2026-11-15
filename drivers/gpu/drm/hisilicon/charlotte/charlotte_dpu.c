@@ -461,6 +461,10 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 		dpu->underflows++;
 	if (status & (DSI_VACT_END | DSI_LCD_TE0) && dpu->pending) {
 		program_scanout(dpu, dpu->next_address, dpu->next_stride, dpu->next_format);
+		/* Pulse the DSC flush so the descriptor just programmed is really
+		 * fetched. Register writes alone never reach the panel.
+		 */
+		writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
 		dpu->pending = false;
 		dpu->latched = true;
 		dpu->flips++;
