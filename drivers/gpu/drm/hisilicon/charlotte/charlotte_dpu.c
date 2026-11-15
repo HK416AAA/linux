@@ -78,6 +78,23 @@
 #define DSI_VACT_END BIT(8)
 #define DSI_UNDERFLOW BIT(2)
 #define DSI_LCD_TE0 BIT(12)
+/* Vendor MIPI APB low-power command channel (mipi_dsi_host.c).  The payload is
+ * staged four bytes per word in APB_WR_LP_PLD_DATA; storing dtype/vc/wc into
+ * APB_WR_LP_HDR issues the packet.  CMD_PLD_BUF_STATUS bit 4 stays set while a
+ * packet is still draining, so it doubles as the completion poll.
+ */
+#define DSI_APB_WR_LP_HDR 0x00c
+#define DSI_APB_WR_LP_PLD 0x010
+#define DSI_CMD_PLD_BUF_STATUS 0x014
+#define DTYPE_DCS_LWRITE 0x39
+/* Online scene control: latching the DM shadow window into the active scene. */
+#define DACC_SCENE0_RELOAD 0x40408
+/* DSC0 pipeline counters (soc_dpu_interface.h DSC_ST_*). */
+#define DSC0_ST_DATAIN 0x088
+#define DSC0_ST_DATAOUT 0x08c
+#define DSC0_ST_FIFO 0x0a0
+#define DSC0_ST_LINEBUF 0x0a8
+#define ITF0_STATE 0x064
 /* DSI video-mode timing block (mipi v700).  A video panel free-runs from these
  * instead of the TE-paced EDPI path.  The bootloader already programmed the
  * timing for this panel, so the videomode diagnostic keeps those values and
@@ -269,6 +286,8 @@ struct charlotte_dpu {
 	u32 video_saved_dpp_dbg, video_saved_dsc_dbg, video_saved_itf_dbg;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
+	u32 boot_vfp;
+	u32 *dm_backup;
 	void *cmdlist_buf;
 	dma_addr_t cmdlist_dma;
 	u32 *cmdlist_item;
@@ -601,6 +620,19 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DACC_SCENE0), readl(dpu->regs + DACC_SCENE0 + 0x04),
 		readl(dpu->regs + DACC_SCENE0 + 0x10), readl(dpu->regs + DACC_SCENE0 + 0x1c),
 		readl(dpu->regs + DACC_SCENE0 + 0x24));
+	seq_printf(s, "pipeline itf=%08x state=%08x dsc_in=%08x out=%08x fifo=%08x lb=%08x\n",
+		readl(dpu->regs + ITF0_OFFSET + 0x000),
+		readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
+		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN),
+		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT),
+		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
+		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_LINEBUF));
+	seq_printf(s, "ldi h2=%08x v2=%08x vact=%08x vfp=%08x boot_vfp=%u pld_st=%08x\n",
+		readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
+		readl(dpu->regs + DSI_LDI_VRT_CTRL2),
+		readl(dpu->regs + DSI_VIDEO_VACT),
+		readl(dpu->regs + DSI_VIDEO_VFP),
+		dpu->boot_vfp, readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS));
 	seq_printf(s, "backlight_on=%u\n", READ_ONCE(dpu->backlight_on));
 	return 0;
 }
@@ -1026,6 +1058,402 @@ static ssize_t charlotte_regcmd_write(struct file *file, const char __user *buf,
 static const struct file_operations charlotte_regcmd_fops = {
 	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_regcmd_write,
 	.llseek = noop_llseek,
+};
+
+/*
+ * Unified bring-up console.
+ *
+ * Every path that can put pixels on this panel is reachable from debugfs on a
+ * normal KMS boot, so one image can be probed without rebuilding:
+ *
+ *   dcs <hex bytes>        raw DCS long write over the APB LP channel
+ *   region full|<x0 x1 y0 y1>
+ *                          panel-side window (DCS 0x2A/0x2B, five-byte writes)
+ *   window <w> <h>         LDI scan window registers (1ec/1f0/74/78)
+ *   present <mode>         0 trigger only, 1 panel window, 2 vendor ITF seq,
+ *                          3 vendor DM transport cmdlist, 4 DM window patch,
+ *                          5 all of them, 9 restore the DM snapshot
+ *   dmparam                dump the whole dpu_dm_param window
+ *   selftest               run every present mode and print counters
+ *
+ * The vendor MIPI host stages payload words first and issues the packet by
+ * writing the header, with no pre-write busy check; CMD_PLD_BUF_STATUS bit 4
+ * tells whether the packet has drained.
+ */
+static int charlotte_dsi_lwrite(struct charlotte_dpu *dpu, u8 dtype, u8 vc,
+				const u8 *data, u32 len)
+{
+	u32 hdr, pld, status;
+	u32 i, j;
+
+	if (!len || len > 64)
+		return -EINVAL;
+	for (i = 0; i < len; i += 4) {
+		pld = 0;
+		for (j = 0; j < 4 && i + j < len; j++)
+			pld |= (u32)data[i + j] << (8 * j);
+		writel(pld, dpu->regs + DSI_APB_WR_LP_PLD);
+	}
+	hdr = (u32)(dtype & 0x3f) | ((u32)(vc & 0x3) << 6) |
+		((len & 0xffff) << 8);
+	writel(hdr, dpu->regs + DSI_APB_WR_LP_HDR);
+	for (i = 0; i < 200; i++) {
+		status = readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS);
+		if (!(status & BIT(4)))
+			return 0;
+		udelay(50);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Vendor lcd_set_display_region(): column then row address, DCS long write. */
+static int charlotte_dcs_region(struct charlotte_dpu *dpu, u32 x0, u32 x1,
+				u32 y0, u32 y1)
+{
+	u8 ca[5] = { 0x2a, (u8)(x0 >> 8), (u8)x0, (u8)(x1 >> 8), (u8)x1 };
+	u8 ra[5] = { 0x2b, (u8)(y0 >> 8), (u8)y0, (u8)(y1 >> 8), (u8)y1 };
+	int ret;
+
+	ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, ca, sizeof(ca));
+	if (!ret)
+		ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, ra,
+					   sizeof(ra));
+	return ret;
+}
+
+/* Vendor partial_update_set_reg(): window width/height plus the VFP delta. */
+static void charlotte_ldi_window(struct charlotte_dpu *dpu, u32 w, u32 h)
+{
+	u32 vfp;
+
+	if (!w || !h || w > WIDTH || h > HEIGHT)
+		return;
+	vfp = dpu->boot_vfp + HEIGHT - h;
+	writel(w - 1, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	writel(h - 1, dpu->regs + DSI_LDI_VRT_CTRL2);
+	writel(vfp, dpu->regs + DSI_VIDEO_VFP);
+	writel(h, dpu->regs + DSI_VIDEO_VACT);
+	wmb();
+}
+
+/* Snapshot the firmware DM descriptor once so a failed patch is reversible. */
+static int charlotte_dm_snapshot(struct charlotte_dpu *dpu)
+{
+	unsigned int i;
+
+	if (!dpu->dm_backup) {
+		dpu->dm_backup = devm_kzalloc(dpu->dev, DM_PARAM_SIZE,
+					      GFP_KERNEL);
+		if (!dpu->dm_backup)
+			return -ENOMEM;
+	}
+	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
+		dpu->dm_backup[i] = readl(dpu->regs + DM0 + i * 4);
+	return 0;
+}
+
+/*
+ * Patch the DACC-owned DM descriptor without knowing its field layout: only
+ * words that still hold the bootloader framebuffer address or stride are
+ * rewritten, so unrelated configuration stays untouched.
+ */
+static int charlotte_dm_patch(struct charlotte_dpu *dpu, dma_addr_t addr,
+			      u32 stride)
+{
+	u32 old_l = dpu->boot_address_l;
+	u32 old_h = dpu->boot_address_h & 0xff;
+	u32 new_l = lower_32_bits(addr);
+	u32 new_h = upper_32_bits(addr) & 0xff;
+	unsigned int i, hit_addr = 0, hit_stride = 0;
+	int ret;
+
+	ret = charlotte_dm_snapshot(dpu);
+	if (ret)
+		return ret;
+	for (i = 0; i < DM_PARAM_SIZE / 4; i++) {
+		u32 v = readl(dpu->regs + DM0 + i * 4);
+
+		if (old_l && v == old_l) {
+			writel(new_l, dpu->regs + DM0 + i * 4);
+			hit_addr++;
+		} else if (old_h && v == old_h) {
+			writel(new_h, dpu->regs + DM0 + i * 4);
+			hit_addr++;
+		} else if (dpu->boot_stride && stride != dpu->boot_stride &&
+			   v == dpu->boot_stride) {
+			writel(stride, dpu->regs + DM0 + i * 4);
+			hit_stride++;
+		}
+	}
+	wmb();
+	writel(1, dpu->regs + DACC_SCENE0_RELOAD);
+	dev_info(dpu->dev, "dm patch %pad/%u hits addr=%u stride=%u\n", &addr,
+		 stride, hit_addr, hit_stride);
+	return 0;
+}
+
+static int charlotte_dm_restore(struct charlotte_dpu *dpu)
+{
+	unsigned int i;
+
+	if (!dpu->dm_backup)
+		return -ENODATA;
+	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
+		writel(dpu->dm_backup[i], dpu->regs + DM0 + i * 4);
+	wmb();
+	writel(1, dpu->regs + DACC_SCENE0_RELOAD);
+	dev_info(dpu->dev, "dm descriptor restored\n");
+	return 0;
+}
+
+struct charlotte_diag_sample {
+	u32 itf_size, itf_state, dsc_in, dsc_out, dsc_fifo, dsc_lb;
+	u32 ldi_h2, ldi_v2, vstate, pld_st;
+};
+
+static void charlotte_diag_sample(struct charlotte_dpu *dpu,
+				  struct charlotte_diag_sample *s)
+{
+	s->itf_size = readl(dpu->regs + ITF0_OFFSET + 0x000);
+	s->itf_state = readl(dpu->regs + ITF0_OFFSET + ITF0_STATE);
+	s->dsc_in = readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN);
+	s->dsc_out = readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT);
+	s->dsc_fifo = readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO);
+	s->dsc_lb = readl(dpu->regs + DSC0_OFFSET + DSC0_ST_LINEBUF);
+	s->ldi_h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	s->ldi_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+	s->vstate = readl(dpu->regs + DSI_VSTATE);
+	s->pld_st = readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS);
+}
+
+static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
+{
+	dma_addr_t addr;
+	u32 stride;
+	int ret = 0;
+
+	switch (mode) {
+	case 0:
+		break;
+	case 1:
+		ret = charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1);
+		charlotte_ldi_window(dpu, WIDTH, HEIGHT);
+		break;
+	case 2:
+		ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
+					   ARRAY_SIZE(charlotte_seq_itf));
+		break;
+	case 3:
+		if (!dpu->cmdlist_buf) {
+			ret = charlotte_cmdlist_start(dpu);
+			break;
+		}
+		writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
+		writel(1, dpu->regs + DACC_SCENE0_RELOAD);
+		break;
+	case 4:
+		addr = ((u64)(readl(dpu->regs + DM_ADDRESS_H) & 0xff) << 32) |
+			readl(dpu->regs + DM_ADDRESS_L);
+		stride = readl(dpu->regs + DM_STRIDE);
+		ret = charlotte_dm_patch(dpu, addr, stride);
+		break;
+	case 5:
+		ret = charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1);
+		charlotte_ldi_window(dpu, WIDTH, HEIGHT);
+		if (!ret)
+			ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
+					ARRAY_SIZE(charlotte_seq_itf));
+		if (!ret && !dpu->cmdlist_buf)
+			ret = charlotte_cmdlist_start(dpu);
+		break;
+	case 9:
+		return charlotte_dm_restore(dpu);
+	default:
+		return -EINVAL;
+	}
+	/* Command-mode panels only move pixels on an LDI frame trigger. */
+	charlotte_ldi_arm(dpu);
+	return ret;
+}
+
+static ssize_t charlotte_present_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	unsigned int mode;
+	int ret;
+
+	ret = kstrtouint_from_user(buf, len, 0, &mode);
+	if (ret)
+		return ret;
+	mutex_lock(&dpu->diagnostic_lock);
+	ret = charlotte_present_run(dpu, mode);
+	mutex_unlock(&dpu->diagnostic_lock);
+	dev_info(dpu->dev, "present %u: %d\n", mode, ret);
+	return ret ? ret : len;
+}
+
+static const struct file_operations charlotte_present_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_present_write, .llseek = noop_llseek,
+};
+
+static ssize_t charlotte_dcs_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	char tmp[160], *p, *tok;
+	u8 data[64];
+	unsigned int v;
+	int n = 0, ret;
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	p = tmp;
+	while ((tok = strsep(&p, " \t\n,")) != NULL) {
+		if (!*tok)
+			continue;
+		if (n >= ARRAY_SIZE(data))
+			return -EINVAL;
+		if (kstrtouint(tok, 16, &v) || v > 0xff)
+			return -EINVAL;
+		data[n++] = (u8)v;
+	}
+	if (!n)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	ret = charlotte_dsi_lwrite(dpu, DTYPE_DCS_LWRITE, 0, data, n);
+	mutex_unlock(&dpu->diagnostic_lock);
+	dev_info(dpu->dev, "dcs %d bytes: %d\n", n, ret);
+	return ret ? ret : len;
+}
+
+static const struct file_operations charlotte_dcs_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_dcs_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t charlotte_region_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	unsigned int x0, x1, y0, y1;
+	char tmp[64];
+	int ret;
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	if (sscanf(tmp, "%u %u %u %u", &x0, &x1, &y0, &y1) != 4) {
+		if (strncmp(tmp, "full", 4))
+			return -EINVAL;
+		x0 = 0;
+		x1 = WIDTH - 1;
+		y0 = 0;
+		y1 = HEIGHT - 1;
+	}
+	if (x1 >= WIDTH || y1 >= HEIGHT || x0 > x1 || y0 > y1)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	ret = charlotte_dcs_region(dpu, x0, x1, y0, y1);
+	mutex_unlock(&dpu->diagnostic_lock);
+	dev_info(dpu->dev, "panel region %u..%u/%u..%u: %d\n", x0, x1, y0, y1,
+		 ret);
+	return ret ? ret : len;
+}
+
+static const struct file_operations charlotte_region_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_region_write, .llseek = noop_llseek,
+};
+
+static ssize_t charlotte_window_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	unsigned int w, h;
+	char tmp[32];
+
+	if (!len || len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = '\0';
+	if (sscanf(tmp, "%u %u", &w, &h) != 2)
+		return -EINVAL;
+	charlotte_ldi_window(dpu, w, h);
+	charlotte_ldi_arm(dpu);
+	dev_info(dpu->dev, "ldi window %ux%u (h2=%08x v2=%08x vact=%08x)\n", w,
+		 h, readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
+		 readl(dpu->regs + DSI_LDI_VRT_CTRL2),
+		 readl(dpu->regs + DSI_VIDEO_VACT));
+	return len;
+}
+
+static const struct file_operations charlotte_window_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_window_write, .llseek = noop_llseek,
+};
+
+static int charlotte_dmparam_show(struct seq_file *s, void *unused)
+{
+	struct charlotte_dpu *dpu = s->private;
+	unsigned int i;
+
+	seq_printf(s, "dpu_dm_param window %06x..%06x (%u bytes)\n", DM0,
+		   DM0 + DM_PARAM_SIZE, DM_PARAM_SIZE);
+	for (i = 0; i < DM_PARAM_SIZE / 16; i++) {
+		u32 off = DM0 + i * 16;
+
+		seq_printf(s, "%06x: %08x %08x %08x %08x\n", off,
+			   readl(dpu->regs + off + 0x0),
+			   readl(dpu->regs + off + 0x4),
+			   readl(dpu->regs + off + 0x8),
+			   readl(dpu->regs + off + 0xc));
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(charlotte_dmparam);
+
+static ssize_t charlotte_selftest_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->f_inode->i_private;
+	struct charlotte_diag_sample a, b;
+	unsigned int mode;
+	int ret;
+
+	/* Any value triggers the sweep; modes run in increasing escalation. */
+	mutex_lock(&dpu->diagnostic_lock);
+	charlotte_diag_sample(dpu, &a);
+	dev_info(dpu->dev,
+		 "selftest base itf=%08x state=%08x dsc in=%08x out=%08x fifo=%08x lb=%08x ldi=%08x/%08x vstate=%08x pld=%08x\n",
+		 a.itf_size, a.itf_state, a.dsc_in, a.dsc_out, a.dsc_fifo,
+		 a.dsc_lb, a.ldi_h2, a.ldi_v2, a.vstate, a.pld_st);
+	for (mode = 0; mode <= 5; mode++) {
+		ret = charlotte_present_run(dpu, mode);
+		msleep(150);
+		charlotte_diag_sample(dpu, &b);
+		dev_info(dpu->dev,
+			 "selftest mode=%u ret=%d itf=%08x state=%08x dsc in=%08x(%+d) out=%08x(%+d) fifo=%08x lb=%08x ldi=%08x/%08x vstate=%08x\n",
+			 mode, ret, b.itf_size, b.itf_state, b.dsc_in,
+			 (int)(b.dsc_in - a.dsc_in), b.dsc_out,
+			 (int)(b.dsc_out - a.dsc_out), b.dsc_fifo, b.dsc_lb,
+			 b.ldi_h2, b.ldi_v2, b.vstate);
+		a = b;
+	}
+	mutex_unlock(&dpu->diagnostic_lock);
+	return len;
+}
+
+static const struct file_operations charlotte_selftest_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_selftest_write, .llseek = noop_llseek,
 };
 static ssize_t charlotte_refresh_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
@@ -2264,6 +2692,7 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu->boot_mask = readl(dpu->regs + DSI_MASK);
 	dpu->boot_select = select;
 	dpu->boot_ov_fmt = readl(dpu->regs + DM_LAYER_OV_FMT);
+	dpu->boot_vfp = readl(dpu->regs + DSI_VIDEO_VFP);
 	spin_lock_init(&dpu->lock);
 	mutex_init(&dpu->diagnostic_lock);
 	INIT_DELAYED_WORK(&dpu->restore_work, charlotte_restore_work);
@@ -2296,22 +2725,38 @@ static int charlotte_probe(struct platform_device *pdev)
 		&charlotte_refresh_fops);
 	/* 0 = one transfer per latched commit, N = also every Nth TE. */
 	debugfs_create_u32("pump", 0600, dpu->debugfs, &dpu->pump_div);
+	/* Bring-up console: registered on every boot so one image probes all. */
+	debugfs_create_file("present", 0200, dpu->debugfs, dpu,
+		&charlotte_present_fops);
+	debugfs_create_file("dcs", 0200, dpu->debugfs, dpu, &charlotte_dcs_fops);
+	debugfs_create_file("region", 0200, dpu->debugfs, dpu,
+		&charlotte_region_fops);
+	debugfs_create_file("window", 0200, dpu->debugfs, dpu,
+		&charlotte_window_fops);
+	debugfs_create_file("dmparam", 0400, dpu->debugfs, dpu,
+		&charlotte_dmparam_fops);
+	debugfs_create_file("selftest", 0200, dpu->debugfs, dpu,
+		&charlotte_selftest_fops);
+	/* Diagnostics that reprogram the pipeline stay available as well: the
+	 * handoff is identical in probe-only and KMS mode, and having them in
+	 * one build avoids a rebuild per experiment.
+	 */
+	debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
+	debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
+	debugfs_create_file("takeover", 0200, dpu->debugfs, dpu, &charlotte_takeover_fops);
+	debugfs_create_file("daccload", 0200, dpu->debugfs, dpu,
+		&charlotte_daccload_fops);
+	debugfs_create_file("daccffa", 0200, dpu->debugfs, dpu,
+		&charlotte_daccffa_fops);
+	debugfs_create_file("ldipump", 0200, dpu->debugfs, dpu,
+		&charlotte_ldipump_fops);
+	debugfs_create_file("videomode", 0200, dpu->debugfs, dpu,
+		&charlotte_videomode_fops);
+	debugfs_create_file("online", 0200, dpu->debugfs, dpu,
+		&charlotte_online_fops);
+	debugfs_create_file("backlight", 0200, dpu->debugfs, dpu,
+		&charlotte_backlight_fops);
 	if (probe_only) {
-		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
-		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
-		debugfs_create_file("takeover", 0200, dpu->debugfs, dpu, &charlotte_takeover_fops);
-		debugfs_create_file("daccload", 0200, dpu->debugfs, dpu,
-			&charlotte_daccload_fops);
-		debugfs_create_file("daccffa", 0200, dpu->debugfs, dpu,
-			&charlotte_daccffa_fops);
-		debugfs_create_file("ldipump", 0200, dpu->debugfs, dpu,
-			&charlotte_ldipump_fops);
-		debugfs_create_file("videomode", 0200, dpu->debugfs, dpu,
-			&charlotte_videomode_fops);
-		debugfs_create_file("online", 0200, dpu->debugfs, dpu,
-			&charlotte_online_fops);
-		debugfs_create_file("backlight", 0200, dpu->debugfs, dpu,
-			&charlotte_backlight_fops);
 		dev_info(dev, "read-only handoff probe: %ux%u pitch=%u IRQ=%d; KMS retained by simpledrm\n",
 			WIDTH, HEIGHT, dpu->boot_stride, dpu->irq);
 		return 0;
