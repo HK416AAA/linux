@@ -255,6 +255,7 @@ struct charlotte_dpu {
 	u32 irq_window_count;
 	bool kms, kms_attempted, pending, latched;
 	bool ldi_pump;
+	u32 pump_div;
 	/* V0 experiment: reversible DSI command->video transport flip. */
 	bool video_active;
 	u32 video_saved_mode, video_saved_cmdmod, video_saved_frmmsk;
@@ -456,8 +457,9 @@ static void queue_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch,
 }
 /* Command-mode frame pump.  The frame-valid bit gates LDI pixels into the DSI
  * and single_frm_update is edge triggered: a write of 1 while the bit already
- * reads 1 starts no new transfer, which is why the panel kept showing the one
- * frame that was pumped when the gate first opened.
+ * reads 1 starts no new transfer, so the bit has to be toggled for every
+ * transfer that is wanted.  One transfer per latched commit is what the panel
+ * needs; toggling on every TE aborts the previous transfer mid-frame.
  */
 static void charlotte_ldi_arm(struct charlotte_dpu *dpu)
 {
@@ -474,6 +476,7 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	u32 status = raw & ~readl(dpu->regs + DSI_MASK);
 	struct drm_pending_vblank_event *event = NULL;
 	bool event_ref = false;
+	bool arm_now = false;
 	unsigned long flags;
 	u64 now;
 	/* Command-mode panels pace frames with TE; video panels use LDI VACT. */
@@ -522,6 +525,8 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 			writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
 		if (dpu->latched) {
 			dpu->latched = false;
+			/* One transfer for this freshly latched descriptor. */
+			arm_now = true;
 			event = dpu->event;
 			dpu->event = NULL;
 			event_ref = dpu->event_ref;
@@ -546,13 +551,11 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 	if (status & DSI_VSYNC)
 		dpu->vsync_count++;
 	spin_unlock_irqrestore(&dpu->lock, flags);
-	if ((dpu->kms || dpu->ldi_pump) && (status & DSI_LCD_TE0)) {
-		/* The panel is command mode with GRAM, so the DSI sends one frame
-		 * per TE. Vendor enable_dsi_ldi() re-arms both registers every
-		 * frame; without this the pipeline stalls after the first frame.
-		 */
+	if ((dpu->ldi_pump || dpu->pump_div) && (status & DSI_LCD_TE0) &&
+	    (!dpu->pump_div || !(dpu->te_count % dpu->pump_div)))
+		arm_now = true;
+	if (arm_now)
 		charlotte_ldi_arm(dpu);
-	}
 	if (dpu->kms && status & frame_bit) {
 		drm_crtc_handle_vblank(&dpu->crtc);
 		if (event) {
@@ -570,8 +573,9 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	struct charlotte_dpu *dpu = s->private;
 	unsigned long flags;
 	spin_lock_irqsave(&dpu->lock, flags);
-	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u ldi_pump=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
-		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->ldi_pump, dpu->irq_count, dpu->frame_count, dpu->vsync_count,
+	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u ldi_pump=%u pump_div=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
+		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->ldi_pump, dpu->pump_div,
+		dpu->irq_count, dpu->frame_count, dpu->vsync_count,
 		dpu->te_count, dpu->frame_period_ns, dpu->underflows, dpu->flips);
 	seq_printf(s, "address=%02x%08x stride=%u pending=%u test_active=%u test_restoring=%u\n",
 		readl(dpu->regs + DM_ADDRESS_H) & 0xff,
@@ -2290,6 +2294,8 @@ static int charlotte_probe(struct platform_device *pdev)
 		&charlotte_vendorseq_fops);
 	debugfs_create_file("refresh", 0200, dpu->debugfs, dpu,
 		&charlotte_refresh_fops);
+	/* 0 = one transfer per latched commit, N = also every Nth TE. */
+	debugfs_create_u32("pump", 0600, dpu->debugfs, &dpu->pump_div);
 	if (probe_only) {
 		debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 		debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
