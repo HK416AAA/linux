@@ -107,6 +107,20 @@
 #define DSI_VIDEO_MODE_CTRL 0x050
 #define DSI_VIDEO_MODE_LP_CMD_TIMING 0x03c
 #define DSI_VIDEO_PKT_LEN 0x054
+/* mipi_dsi_config_dpi_interface(): the DPI pin config that the command-mode
+ * skip in mipi_dsi_on_sub2() never programs.  A video panel needs all three.
+ */
+#define DSI_VIDEO_VCID 0x030
+#define DSI_VIDEO_COLOR_FORMAT 0x034
+#define DSI_VIDEO_POL_CTRL 0x038
+/* POL_CTRL bit1/bit2 = vsync/hsync active low, matching the vendor union
+ * initialiser (dataen 0, vsync 1, hsync 1, shutd 0, colorm 0).
+ */
+#define DSI_VIDEO_POL_VENDOR 0x6
+/* lcd-kit,mipi-burst-mode = 2 (burst with sync events). */
+#define DSI_VIDEO_BURST_MODE 0x2
+/* lcd-kit,mipi-color-mode = 0x0f, the RGB888 DPI packing this panel uses. */
+#define DSI_VIDEO_COLOR_MODE 0xf
 #define DSI_VIDEO_HSA 0x060
 #define DSI_VIDEO_HBP 0x064
 #define DSI_VIDEO_HLINE 0x068
@@ -298,6 +312,7 @@ struct charlotte_dpu {
 	u32 video_saved_vsa, video_saved_vbp, video_saved_vact;
 	u32 video_saved_pktlen, video_saved_ldi_h3;
 	u32 video_saved_vfp;
+	u32 video_saved_vcid, video_saved_colorfmt, video_saved_polctrl;
 	u32 video_saved_dpp_dbg, video_saved_dsc_dbg, video_saved_itf_dbg;
 	u32 boot_address_h, boot_address_l, boot_stride, boot_mask;
 	u32 boot_select, boot_ov_fmt;
@@ -726,6 +741,17 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DSI_LDI_VRT_CTRL2),
 		readl(dpu->regs + DSI_VIDEO_VACT),
 		readl(dpu->regs + DSI_VIDEO_VFP), DSC_OUT_WIDTH);
+	seq_printf(s, "video active=%u mode=%08x vidctl=%08x pktlen=%u hsa=%u hbp=%u hline=%u vsa=%u vbp=%u vfp=%u vact=%u pol=%02x fmt=%02x vcount=%u hcount=%u\n",
+		dpu->video_active, readl(dpu->regs + DSI_MODE_CTRL),
+		readl(dpu->regs + DSI_VIDEO_MODE_CTRL),
+		readl(dpu->regs + DSI_VIDEO_PKT_LEN),
+		readl(dpu->regs + DSI_VIDEO_HSA), readl(dpu->regs + DSI_VIDEO_HBP),
+		readl(dpu->regs + DSI_VIDEO_HLINE), readl(dpu->regs + DSI_VIDEO_VSA),
+		readl(dpu->regs + DSI_VIDEO_VBP), readl(dpu->regs + DSI_VIDEO_VFP),
+		readl(dpu->regs + DSI_VIDEO_VACT),
+		readl(dpu->regs + DSI_VIDEO_POL_CTRL),
+		readl(dpu->regs + DSI_VIDEO_COLOR_FORMAT),
+		readl(dpu->regs + DSI_VCOUNT), readl(dpu->regs + DSI_HCOUNT));
 	seq_printf(s, "boot_ldi h2=%08x v2=%08x vact=%08x vfp=%08x pld_st=%08x\n",
 		dpu->boot_h2, dpu->boot_v2, dpu->boot_vact, dpu->boot_vfp,
 		readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS));
@@ -1162,7 +1188,7 @@ static void charlotte_bypass_sample(struct charlotte_dpu *dpu, const char *stage
  * separate CONFIG_MODE chain, which also proves the chain engine survives
  * repeated use.
  */
-static int charlotte_bypass_run(struct charlotte_dpu *dpu)
+static int charlotte_bypass_run(struct charlotte_dpu *dpu, bool push_frames)
 {
 	unsigned int i;
 	int ret;
@@ -1192,6 +1218,9 @@ static int charlotte_bypass_run(struct charlotte_dpu *dpu)
 	ret = charlotte_regseq_run(dpu, charlotte_seq_sdma,
 				   ARRAY_SIZE(charlotte_seq_sdma));
 	charlotte_bypass_sample(dpu, ret ? "b5 sdma (failed)" : "b5 +sdma dbg");
+
+	if (!push_frames)
+		return 0;
 
 	/* The DACC used to deliver one descriptor per frame; deliver 200. */
 	for (i = 0; i < 200; i++) {
@@ -1227,7 +1256,7 @@ static ssize_t charlotte_bypass_write(struct file *file,
 	if (value != 1)
 		return -EINVAL;
 	mutex_lock(&dpu->diagnostic_lock);
-	ret = charlotte_bypass_run(dpu);
+	ret = charlotte_bypass_run(dpu, true);
 	mutex_unlock(&dpu->diagnostic_lock);
 	dev_info(dpu->drm.dev, "bypass run: %d\n", ret);
 	return ret ? ret : len;
@@ -2265,9 +2294,11 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 	if (ret)
 		return ret;
 	/* 1 = video at the bootloader rate, 2 = video at roughly half rate by
-	 * expanding VFP only (lane clock and PHY stay untouched).
+	 * expanding VFP only (lane clock and PHY stay untouched).  3 = video
+	 * plus the full DACC-free frame push, 4 = video plus a single latch so
+	 * 3 and 4 together answer whether the DPP needs a per-frame commit.
 	 */
-	if (value > 2 || !probe_only || dpu->kms)
+	if (value > 4 || dpu->kms)
 		return -EINVAL;
 	cancel_delayed_work_sync(&dpu->irq_stop_work);
 	mutex_lock(&dpu->diagnostic_lock);
@@ -2292,6 +2323,9 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		dpu->video_saved_pktlen = readl(dpu->regs + DSI_VIDEO_PKT_LEN);
 		dpu->video_saved_ldi_h3 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3);
 		dpu->video_saved_vfp = readl(dpu->regs + DSI_VIDEO_VFP);
+		dpu->video_saved_vcid = readl(dpu->regs + DSI_VIDEO_VCID);
+		dpu->video_saved_colorfmt = readl(dpu->regs + DSI_VIDEO_COLOR_FORMAT);
+		dpu->video_saved_polctrl = readl(dpu->regs + DSI_VIDEO_POL_CTRL);
 		dpu->video_saved_dpp_dbg = readl(dpu->regs + DPP0_REG_CTRL_DEBUG);
 		dpu->video_saved_dsc_dbg = readl(dpu->regs + DSC0_REG_CTRL_DEBUG);
 		dpu->video_saved_itf_dbg = readl(dpu->regs + ITF0_REG_CTRL_DEBUG);
@@ -2324,12 +2358,14 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 					 ret);
 		}
 		/* mipi_dsi_video_mode_config(): LP mode on all lanes (bits
-		 * 13:8), send read command in LP (bit15).  Keep the burst-mode
-		 * field (bits 1:0) the bootloader already chose.  The
-		 * cmd-mode skip in mipi_dsi_on_sub2() left these at default.
+		 * 13:8), send read command in LP (bit15), burst mode in bits
+		 * 1:0.  The command-mode skip in mipi_dsi_on_sub2() left these
+		 * at default, so program the DT values rather than inherit them.
 		 */
-		writel((dpu->video_saved_vidmode & ~GENMASK(13, 8)) |
-		       (0x3f << 8) | BIT(15), dpu->regs + DSI_VIDEO_MODE_CTRL);
+		writel((dpu->video_saved_vidmode &
+			~(GENMASK(13, 8) | GENMASK(1, 0))) |
+		       (0x3f << 8) | BIT(15) | DSI_VIDEO_BURST_MODE,
+			dpu->regs + DSI_VIDEO_MODE_CTRL);
 		/* outvact_lpcmd_time is bits [23:16], the same field the
 		 * vendor sets via set_reg(..., 0x4, 8, 16).
 		 */
@@ -2412,6 +2448,18 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		/* Backlight is intentionally left alone here so this stays a
 		 * single-variable test; the separate "backlight" node toggles it.
 		 */
+		/* mipi_dsi_config_dpi_interface(): virtual channel, DPI colour
+		 * packing and pin polarity.  Command mode never programs these,
+		 * so a video flip without them shows wrong colours or a shifted
+		 * image even when the timing is right.
+		 */
+		writel(0, dpu->regs + DSI_VIDEO_VCID);
+		writel(DSI_VIDEO_COLOR_MODE, dpu->regs + DSI_VIDEO_COLOR_FORMAT);
+		writel(DSI_VIDEO_POL_VENDOR, dpu->regs + DSI_VIDEO_POL_CTRL);
+		dev_info(dpu->drm.dev,
+			 "video: dpi vcid=0 colorfmt=%02x pol=%02x burst=%u\n",
+			 DSI_VIDEO_COLOR_MODE, DSI_VIDEO_POL_VENDOR,
+			 DSI_VIDEO_BURST_MODE);
 		/* Vendor video path only clears MODE_CTRL bit0; CMD_MODE_CTRL
 		 * keeps the mipi_init values for video panels.  mipi_ldi_init()
 		 * additionally sets CMD_MOD_CTRL bit1 (dsi_halt_video_en) and
@@ -2430,6 +2478,18 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		writel(dpu->video_saved_lpclk | BIT(0), dpu->regs + DSI_LP_CLK_CTRL);
 		dpu->video_active = true;
 		msleep(30);
+		/* 3/4: hand the DACC's job to the cmdlist engine while the DSI
+		 * timing generator is running.  3 pushes frames, 4 latches the
+		 * pipeline once; comparing the two says whether the DPP needs a
+		 * per-frame commit in video mode.
+		 */
+		if (value >= 3) {
+			int bypass_ret = charlotte_bypass_run(dpu, value == 3);
+
+			dev_info(dpu->drm.dev, "video: bypass(%s) ret=%d\n",
+				 value == 3 ? "frame push" : "single latch",
+				 bypass_ret);
+		}
 	} else if (value && dpu->video_active) {
 		dev_info(dpu->drm.dev,
 			"video: already active; echo 0 first to re-arm\n");
@@ -2454,6 +2514,9 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		writel(dpu->video_saved_pktlen, dpu->regs + DSI_VIDEO_PKT_LEN);
 		writel(dpu->video_saved_ldi_h3, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL3);
 		writel(dpu->video_saved_vfp, dpu->regs + DSI_VIDEO_VFP);
+		writel(dpu->video_saved_vcid, dpu->regs + DSI_VIDEO_VCID);
+		writel(dpu->video_saved_colorfmt, dpu->regs + DSI_VIDEO_COLOR_FORMAT);
+		writel(dpu->video_saved_polctrl, dpu->regs + DSI_VIDEO_POL_CTRL);
 		writel(dpu->video_saved_itf_dbg, dpu->regs + ITF0_REG_CTRL_DEBUG);
 		writel(dpu->video_saved_dsc_dbg, dpu->regs + DSC0_REG_CTRL_DEBUG);
 		writel(dpu->video_saved_dpp_dbg, dpu->regs + DPP0_REG_CTRL_DEBUG);
