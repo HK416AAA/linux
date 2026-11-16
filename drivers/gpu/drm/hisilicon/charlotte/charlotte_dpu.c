@@ -194,6 +194,23 @@
 #define CMDLIST_TWO_SAME_FRAME_BYPASS (CMDLIST0 + 0x7a0)
 #define CMDLIST_SCENE_MAX 9
 #define CMDLIST_SCENE_INIT 7
+/* CMD block debug/state: SCE0 exposes the scene engine FSM and whether its
+ * descriptor fifo is empty, so it shows whether anything ever got fetched.
+ */
+#define CMDLIST_DBG (CMDLIST0 + 0x700)
+#define CMDLIST_BUF_DBG_CNT_CLR (CMDLIST0 + 0x708)
+#define CMDLIST_BUF_DBG_CNT (CMDLIST0 + 0x70c)
+#define CMDLIST_ADDR_MASK_STATUS (CMDLIST0 + 0x720)
+#define CMDLIST_TASK_STATUS (CMDLIST0 + 0x728)
+#define CMDLIST_SYNC_MODE (CMDLIST0 + 0x74c)
+#define CMDLIST_SCE0_CFG_SIGNAL (CMDLIST0 + 0x780)
+/* DACC scene 0 command interfaces: the RISC-V side dispatches through these. */
+#define DACC_SCENE0_SW_START (DACC_SCENE0 + 0x10)
+#define DACC_SCENE0_ST_FRM_SEL (DACC_SCENE0 + 0x1c)
+#define DACC_SCENE0_CFG_MODE (DACC_SCENE0 + 0x24)
+#define DACC_SCENE0_SCMD_STATUS (DACC_SCENE0 + 0x6c)
+#define DACC_SCENE0_DCMD_STATUS (DACC_SCENE0 + 0x78)
+#define DACC_SCENE0_LAYER_NUM (DACC_SCENE0 + 0x7c)
 #define DACC_GLB_DP0_STATUS (DACC_GLB0 + 0x240)
 #define DACC_GLB_DP0_MASK (DACC_GLB0 + 0x244)
 #define DACC_GLB_DP1_STATUS (DACC_GLB0 + 0x248)
@@ -673,6 +690,18 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DM0 + 4), readl(dpu->regs + DM0 + 8),
 		readl(dpu->regs + CMDLIST_CH_INTS(0)),
 		readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT)));
+	seq_printf(s, "snapshot cmd sce0=%08x dbg=%08x sync=%08x taskst=%08x maskst=%08x bufdbg=%08x\n",
+		readl(dpu->regs + CMDLIST_SCE0_CFG_SIGNAL),
+		readl(dpu->regs + CMDLIST_DBG),
+		readl(dpu->regs + CMDLIST_SYNC_MODE),
+		readl(dpu->regs + CMDLIST_TASK_STATUS),
+		readl(dpu->regs + CMDLIST_ADDR_MASK_STATUS),
+		readl(dpu->regs + CMDLIST_BUF_DBG_CNT));
+	seq_printf(s, "snapshot dacc scmd_st=%08x dcmd_st=%08x layers=%08x reload=%08x\n",
+		readl(dpu->regs + DACC_SCENE0_SCMD_STATUS),
+		readl(dpu->regs + DACC_SCENE0_DCMD_STATUS),
+		readl(dpu->regs + DACC_SCENE0_LAYER_NUM),
+		readl(dpu->regs + DACC_SCENE0_RELOAD));
 	seq_printf(s, "pipeline itf=%08x state=%08x dsc_in=%08x out=%08x fifo=%08x lb=%08x\n",
 		readl(dpu->regs + ITF0_OFFSET + 0x000),
 		readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
@@ -1733,18 +1762,52 @@ static const struct file_operations charlotte_cmdlist_fops = {
 };
 
 /*
- * One-shot chain verdict.  Restores the pristine descriptor image, clears the
- * channel status words, arms the chain and then waits for the transport's own
- * write signature in the DM window.  Everything is reported to dmesg so a
- * single write answers "did the sequencer execute our chain, and if not, why".
+ * Chain execution matrix.  The transport overwrites DM0+0/+4 with 0 and the
+ * chain address and fills every client slot with 0xFF, so DM0+8 reading
+ * 0xffffffff is a signature only the DMA transport can produce.  Restore the
+ * pristine image, then try every plausible way of starting the scene and
+ * report which one (if any) made the transfer happen.
  */
+static void charlotte_cmdldiag_reset(struct charlotte_dpu *dpu)
+{
+	charlotte_dm_restore(dpu);
+	writel(0, dpu->regs + DACC_SCENE0_SW_START);
+	writel(0, dpu->regs + DACC_SCENE0_ST_FRM_SEL);
+	writel(0xff, dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+	writel(0xff, dpu->regs + CMDLIST_CH_INTS(0));
+}
+static int charlotte_cmdldiag_wait(struct charlotte_dpu *dpu, const char *label,
+				   unsigned int ms)
+{
+	unsigned int i;
+	u32 ints0, ints7, sce0;
+
+	for (i = 0; i < ms; i++) {
+		if (readl(dpu->regs + DM0 + 8) == 0xffffffff) {
+			ints0 = readl(dpu->regs + CMDLIST_CH_INTS(0));
+			ints7 = readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+			sce0 = readl(dpu->regs + CMDLIST_SCE0_CFG_SIGNAL);
+			dev_info(dpu->drm.dev,
+				 "cmdldiag: %s => TRANSPORT-RAN after %ums s0_ints=%02x init_ints=%02x sce0=%08x\n",
+				 label, i, ints0, ints7, sce0);
+			return 0;
+		}
+		msleep(1);
+	}
+	dev_info(dpu->drm.dev,
+		 "cmdldiag: %s => no transfer (%ums) stfrm=%08x swstart=%08x cfgmode=%08x sce0=%08x\n",
+		 label, ms, readl(dpu->regs + DACC_SCENE0_ST_FRM_SEL),
+		 readl(dpu->regs + DACC_SCENE0_SW_START),
+		 readl(dpu->regs + DACC_SCENE0_CFG_MODE),
+		 readl(dpu->regs + CMDLIST_SCE0_CFG_SIGNAL));
+	return -ETIMEDOUT;
+}
 static ssize_t charlotte_cmdldiag_write(struct file *file, const char __user *buf,
 	size_t len, loff_t *pos)
 {
 	struct charlotte_dpu *dpu = file->private_data;
 	unsigned int value;
-	u32 ints7, ints0, probe;
-	int ret, i;
+	int ret;
 
 	ret = kstrtouint_from_user(buf, len, 0, &value);
 	if (ret)
@@ -1753,31 +1816,42 @@ static ssize_t charlotte_cmdldiag_write(struct file *file, const char __user *bu
 		return -EINVAL;
 
 	charlotte_cmdlist_release(dpu);
-	charlotte_dm_restore(dpu);
-	writel(0xff, dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
-	writel(0xff, dpu->regs + CMDLIST_CH_INTS(0));
-	probe = readl(dpu->regs + DM0 + 8);
 	ret = charlotte_cmdlist_start(dpu);
 	if (ret) {
 		dev_info(dpu->drm.dev, "cmdldiag: chain start failed %d\n", ret);
 		return ret;
 	}
-	/* Payload slot 2 (DM0+8) is 0xFF and pristine is 0, so only the
-	 * transport can turn it into 0xffffffff.
-	 */
-	for (i = 0; i < 200; i++) {
-		if (readl(dpu->regs + DM0 + 8) == 0xffffffff)
-			break;
-		msleep(1);
-	}
-	ints7 = readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
-	ints0 = readl(dpu->regs + CMDLIST_CH_INTS(0));
+	dev_info(dpu->drm.dev, "cmdldiag: chain=%pad dm_cmd4=%08x\n",
+		 &dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4));
+
+	/* 1. Exactly what the vendor present path does. */
+	charlotte_cmdldiag_wait(dpu, "vendor cfgmode", 300);
+
+	/* 2. Scene software start. */
+	charlotte_cmdldiag_reset(dpu);
+	charlotte_dacc_arm(dpu);
+	writel(1, dpu->regs + DACC_SCENE0_SW_START);
+	charlotte_cmdldiag_wait(dpu, "sw_start", 300);
+
+	/* 3. Let the DACC generate the start frame itself. */
+	charlotte_cmdldiag_reset(dpu);
+	charlotte_dacc_arm(dpu);
+	writel(1, dpu->regs + DACC_SCENE0_ST_FRM_SEL);
+	charlotte_cmdldiag_wait(dpu, "st_frm_sel", 300);
+
+	/* 4. Both triggers together. */
+	charlotte_cmdldiag_reset(dpu);
+	charlotte_dacc_arm(dpu);
+	writel(1, dpu->regs + DACC_SCENE0_ST_FRM_SEL);
+	writel(1, dpu->regs + DACC_SCENE0_SW_START);
+	charlotte_cmdldiag_wait(dpu, "sw_start+st_frm_sel", 300);
+
 	dev_info(dpu->drm.dev,
-		 "cmdldiag: chain=%pad dfw=%08x probe0=%08x probe=%08x after %dms init_ints=%02x scene0_ints=%02x => %s\n",
-		 &dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4), probe,
-		 readl(dpu->regs + DM0 + 8), i, ints7, ints0,
-		 (readl(dpu->regs + DM0 + 8) == 0xffffffff) ?
-			"TRANSPORT-RAN" : "TRANSPORT-DID-NOT-RUN");
+		 "cmdldiag: end dacc_status=%08x monpc=%08x scmd_st=%08x dcmd_st=%08x layers=%08x\n",
+		 readl(dpu->regs + DACC_STATUS), readl(dpu->regs + DACC_MONPC),
+		 readl(dpu->regs + DACC_SCENE0_SCMD_STATUS),
+		 readl(dpu->regs + DACC_SCENE0_DCMD_STATUS),
+		 readl(dpu->regs + DACC_SCENE0_LAYER_NUM));
 	return len;
 }
 static const struct file_operations charlotte_cmdldiag_fops = {
