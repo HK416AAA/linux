@@ -644,14 +644,19 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 			dpu->frame_period_ns = now - dpu->last_frame_ns;
 		dpu->last_frame_ns = now;
 		dpu->frame_count++;
-		/* The DSC serves frames from the last latched descriptor, so the
-		 * chain has to be flushed again for the panel to fetch the
-		 * buffer: without this, fbdev/fbcon writes and any commit that
-		 * does not change the address stay invisible. Flush every frame
-		 * while we own the pipeline, after any latch above.
+		/* The chain serves frames from the last latched descriptor, so
+		 * every operator has to be pulsed again for the panel to fetch
+		 * the buffer: without this, fbdev/fbcon writes and any commit
+		 * that does not change the address stay invisible. The DPP is
+		 * the frame source of the DSC, so flushing the DSC alone leaves
+		 * it waiting for input that never comes (19 lines, then stall).
+		 * Pulse DPP, DSC and ITF together every frame, after any latch.
 		 */
-		if (dpu->kms || dpu->online_active)
+		if (dpu->kms || dpu->online_active) {
+			writel(1, dpu->regs + DPP0_OFFSET + 0x0060);
 			writel(1, dpu->regs + DSC0_OFFSET + 0x0254);
+			writel(1, dpu->regs + ITF0_OFFSET + 0x005c);
+		}
 		if (dpu->latched) {
 			dpu->latched = false;
 			/* One transfer for this freshly latched descriptor. */
