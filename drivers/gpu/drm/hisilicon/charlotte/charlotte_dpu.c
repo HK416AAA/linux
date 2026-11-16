@@ -2298,7 +2298,7 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 	 * plus the full DACC-free frame push, 4 = video plus a single latch so
 	 * 3 and 4 together answer whether the DPP needs a per-frame commit.
 	 */
-	if (value > 4 || dpu->kms)
+	if (value > 4)
 		return -EINVAL;
 	cancel_delayed_work_sync(&dpu->irq_stop_work);
 	mutex_lock(&dpu->diagnostic_lock);
