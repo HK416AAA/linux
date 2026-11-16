@@ -75,6 +75,40 @@ int charlotte_ffa_gpu_power(struct device *dev, bool enable)
 }
 EXPORT_SYMBOL_GPL(charlotte_ffa_gpu_power);
 
+/* Display security channel requests (vendor configure_dss_service_security).
+ * The partition answers in data0, so the caller gets the whole register image
+ * back instead of the USB/PCIe status shortcut above.
+ */
+int charlotte_ffa_dss_sec_config(struct device *dev, u32 func_id, u32 channel,
+				 u32 mode, u32 dpu_index,
+				 struct ffa_send_direct_data *reply)
+{
+	struct ffa_send_direct_data args = {
+		.data0 = func_id, .data1 = channel, .data2 = mode,
+		.data3 = dpu_index,
+	};
+	int ret;
+
+	mutex_lock(&charlotte_ffa_lock);
+	if (!charlotte_ffa_dev) {
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+	if (dev && !device_link_add(dev, &charlotte_ffa_dev->dev,
+				    DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = charlotte_ffa_dev->ops->msg_ops->sync_send_receive(
+		charlotte_ffa_dev, &args);
+	if (!ret && reply)
+		*reply = args;
+out:
+	mutex_unlock(&charlotte_ffa_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(charlotte_ffa_dss_sec_config);
+
 int charlotte_ffa_pcie_access(u32 rc_id)
 {
 	struct ffa_send_direct_data args = { .data0 = PCIE_MEM_UNSEC, .data1 = rc_id };

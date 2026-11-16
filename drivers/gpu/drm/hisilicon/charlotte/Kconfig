@@ -2,6 +2,7 @@
 config DRM_CHARLOTTE_DPU
 	tristate "Charlotte DPU v700 firmware-handoff KMS"
 	depends on DRM && OF && ARM64 && I2C
+	select CHARLOTTE_FFA if ARM_FFA_TRANSPORT
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER
 	help

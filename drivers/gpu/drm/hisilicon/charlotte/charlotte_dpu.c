@@ -7,6 +7,7 @@
 #include <linux/aperture.h>
 #include <linux/arm-smccc.h>
 #include <linux/arm_ffa.h>
+#include <linux/firmware/charlotte-ffa.h>
 #include <linux/debugfs.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -204,49 +205,10 @@
  * The stock firmware routes display security calls through the FF-A
  * "platdrv" secure partition instead of the raw BL31 SMC dispatcher
  * (CONFIG_DPU_FFA_SUPPORT=y).  The raw CHARLOTTE_FID_DACC_LOAD SMC comes back
- * with the FID echoed, i.e. an unsupported-function return, so the DACC core
- * never leaves WFI.  Bind the same partition the vendor ffa_plat_drv.c uses
- * (UUID f9e75f33-a1ca-4f82-98e6-c8020f20ecb4) and send the load request over
- * FFA_MSG_SEND_DIRECT_REQ with data0=func_id, data1=channel, data2=mode,
- * data3=dpu_index, exactly like configure_dss_service_security().
+ * with the FID echoed, i.e. an unsupported-function return.  That partition
+ * has a single owner, drivers/firmware/charlotte-ffa.c, so the request goes
+ * through its shared platform ABI rather than a second binding here.
  */
-#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
-static const struct ffa_device_id charlotte_platdrv_ffa_ids[] = {
-	{ .uuid = { .b = { 0x33, 0x5f, 0xe7, 0xf9, 0x82, 0x4f, 0xca, 0xa1,
-			   0x02, 0xc8, 0xe6, 0x98, 0xb4, 0xec, 0x20, 0x0f } } },
-	{}
-};
-
-static const struct ffa_ops *charlotte_ffa_ops;
-static struct ffa_device *charlotte_ffa_dev;
-
-static int charlotte_platdrv_ffa_probe(struct ffa_device *ffa_dev)
-{
-	charlotte_ffa_dev = ffa_dev;
-	charlotte_ffa_ops = ffa_dev->ops;
-	if (charlotte_ffa_ops && charlotte_ffa_ops->msg_ops &&
-	    charlotte_ffa_ops->msg_ops->mode_32bit_set)
-		charlotte_ffa_ops->msg_ops->mode_32bit_set(ffa_dev);
-	pr_info("charlotte-dpu: platdrv FF-A probe ok vm_id=0x%04x\n",
-		ffa_dev->vm_id);
-	return 0;
-}
-
-static void charlotte_platdrv_ffa_remove(struct ffa_device *ffa_dev)
-{
-	if (charlotte_ffa_dev == ffa_dev) {
-		charlotte_ffa_dev = NULL;
-		charlotte_ffa_ops = NULL;
-	}
-}
-
-static struct ffa_driver charlotte_platdrv_ffa_driver = {
-	.name = "charlotte_platdrv_ffa",
-	.probe = charlotte_platdrv_ffa_probe,
-	.remove = charlotte_platdrv_ffa_remove,
-	.id_table = charlotte_platdrv_ffa_ids,
-};
-#endif
 
 /* The bootloader's command line is not under our control and shipped a
  * stale probe_only=1, which silently kept simpledrm in charge. Keep the
@@ -301,6 +263,8 @@ struct charlotte_dpu {
 	u32 boot_select, boot_ov_fmt;
 	u32 boot_vfp;
 	u32 boot_h2, boot_v2, boot_vact;
+	u32 boot_dpp[5];
+	u32 boot_dm[3];
 	u32 *dm_backup;
 	void *cmdlist_buf;
 	dma_addr_t cmdlist_dma;
@@ -664,6 +628,11 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "boot_ldi h2=%08x v2=%08x vact=%08x vfp=%08x pld_st=%08x\n",
 		dpu->boot_h2, dpu->boot_v2, dpu->boot_vact, dpu->boot_vfp,
 		readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS));
+	seq_printf(s, "boot_dpp clken=%08x ctrl=%08x state=%08x gmp=%08x clrbar=%08x\n",
+		dpu->boot_dpp[0], dpu->boot_dpp[1], dpu->boot_dpp[2],
+		dpu->boot_dpp[3], dpu->boot_dpp[4]);
+	seq_printf(s, "boot_dm num=%08x scene=%08x ovwidth=%08x\n",
+		dpu->boot_dm[0], dpu->boot_dm[1], dpu->boot_dm[2]);
 	seq_printf(s, "dsc pic=%08x slice=%08x chunk=%08x out=%08x\n",
 		readl(dpu->regs + DSC0_OFFSET + 0x010),
 		readl(dpu->regs + DSC0_OFFSET + 0x014),
@@ -994,32 +963,26 @@ static void charlotte_dacc_load(struct charlotte_dpu *dpu)
 /* Same load request, routed through the platdrv secure partition via FF-A. */
 static void charlotte_dacc_ffa_load(struct charlotte_dpu *dpu)
 {
-#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
-	struct ffa_send_direct_data args = {
-		.data0 = CHARLOTTE_FID_DACC_LOAD,
-		.data1 = 0,
-		.data2 = 0,
-		.data3 = 0,
-	};
+	struct ffa_send_direct_data reply = { };
+	u32 status = readl(dpu->regs + DACC_STATUS);
+	u32 monpc = readl(dpu->regs + DACC_MONPC);
 	int ret;
 
-	if (!charlotte_ffa_dev || !charlotte_ffa_ops ||
-	    !charlotte_ffa_ops->msg_ops ||
-	    !charlotte_ffa_ops->msg_ops->sync_send_receive) {
+#if IS_ENABLED(CONFIG_CHARLOTTE_FFA)
+	ret = charlotte_ffa_dss_sec_config(dpu->dev, CHARLOTTE_FID_DACC_LOAD,
+					   0, 0, 0, &reply);
+	if (ret)
 		dev_warn(dpu->dev,
-			"dacc_load ffa: platdrv SP not bound (check arm_ffa bus)\n");
-		return;
-	}
-	ret = charlotte_ffa_ops->msg_ops->sync_send_receive(charlotte_ffa_dev,
-							    &args);
-	dev_info(dpu->dev,
-		"dacc_load ffa ret=%d d0=%08lx d1=%08lx d2=%08lx d3=%08lx d4=%08lx status=%08x monpc=%08x vstate=%08x\n",
-		ret, args.data0, args.data1, args.data2, args.data3, args.data4,
-		readl(dpu->regs + DACC_STATUS), readl(dpu->regs + DACC_MONPC),
-		readl(dpu->regs + DSI_VSTATE));
+			 "dacc_load ffa: platform service failed (%d)\n", ret);
 #else
-	dev_warn(dpu->dev, "dacc_load ffa: CONFIG_ARM_FFA_TRANSPORT unavailable\n");
+	ret = -ENOTSUPP;
+	dev_warn(dpu->dev, "dacc_load ffa: CONFIG_CHARLOTTE_FFA unavailable\n");
 #endif
+	dev_info(dpu->dev,
+		 "dacc_load ffa ret=%d d0=%08lx d1=%08lx d2=%08lx d3=%08lx d4=%08lx status=%08x->%08x monpc=%08x->%08x vstate=%08x\n",
+		 ret, reply.data0, reply.data1, reply.data2, reply.data3,
+		 reply.data4, status, readl(dpu->regs + DACC_STATUS), monpc,
+		 readl(dpu->regs + DACC_MONPC), readl(dpu->regs + DSI_VSTATE));
 }
 
 static int charlotte_regcmd_run(struct charlotte_dpu *dpu, u32 addr, u32 val)
@@ -2839,6 +2802,17 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu->boot_h2 = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
 	dpu->boot_v2 = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
 	dpu->boot_vact = readl(dpu->regs + DSI_VIDEO_VACT);
+	/* Keep the handoff composer state: it is the only sample of a working
+	 * DPP/DM image once this driver has touched the pipeline.
+	 */
+	dpu->boot_dpp[0] = readl(dpu->regs + DPP0_OFFSET + 0x00c);
+	dpu->boot_dpp[1] = readl(dpu->regs + DPP0_OFFSET + 0x058);
+	dpu->boot_dpp[2] = readl(dpu->regs + DPP0_OFFSET + 0x068);
+	dpu->boot_dpp[3] = readl(dpu->regs + DPP0_OFFSET + 0x9a0);
+	dpu->boot_dpp[4] = readl(dpu->regs + DPP0_OFFSET + 0x010);
+	dpu->boot_dm[0] = readl(dpu->regs + DM0 + 0x58);
+	dpu->boot_dm[1] = readl(dpu->regs + DM0 + 0x5c);
+	dpu->boot_dm[2] = readl(dpu->regs + DM0 + 0x60);
 	spin_lock_init(&dpu->lock);
 	mutex_init(&dpu->diagnostic_lock);
 	mutex_init(&dpu->dcs_lock);
@@ -2974,12 +2948,6 @@ static int __init charlotte_init(void)
 		i2c_del_driver(&charlotte_backlight_driver);
 		return ret;
 	}
-#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
-	ret = ffa_register(&charlotte_platdrv_ffa_driver);
-	if (ret)
-		pr_warn("charlotte-dpu: platdrv FF-A driver register failed: %d\n",
-			ret);
-#endif
 	return 0;
 }
 #ifdef MODULE
@@ -2989,9 +2957,6 @@ late_initcall_sync(charlotte_init);
 #endif
 static void __exit charlotte_exit(void)
 {
-#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
-	ffa_unregister(&charlotte_platdrv_ffa_driver);
-#endif
 	platform_driver_unregister(&charlotte_platform_driver);
 	i2c_del_driver(&charlotte_backlight_driver);
 }
