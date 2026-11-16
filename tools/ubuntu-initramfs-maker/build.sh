@@ -56,9 +56,38 @@ apt-get install -y --no-install-recommends \
 	iproute2 iputils-ping net-tools ethtool iw rfkill \
 	usbutils pciutils i2c-tools gpiod spi-tools \
 	ca-certificates curl wget e2fsprogs dosfstools fdisk parted \
-	f2fs-tools python3 strace lsof
+	f2fs-tools python3 strace lsof \
+	xserver-xorg-core xserver-xorg-video-fbdev xinit xauth xterm \
+	libgl1-mesa-dri dbus-x11 mesa-utils x11-xserver-utils \
+	xfce4 xfce4-terminal
 
 echo 'root:charlotte' | chpasswd
+
+# 3a. Graphical session on the panel.  The panel is driven through the
+#     driver's fbdev emulation (/dev/fb0), so Xorg uses the fbdev driver and
+#     never negotiates modes with the DPU.  The image carries the whole stack
+#     so a flashed tablet reaches a desktop with no network at all.
+mkdir -p /etc/X11/xorg.conf.d
+cat > /etc/X11/xorg.conf.d/10-fbdev.conf <<'XORG'
+Section "Device"
+	Identifier "charlotte-fb"
+	Driver "fbdev"
+	Option "fbdev" "/dev/fb0"
+EndSection
+XORG
+
+cat > /root/.xinitrc <<'XINIT'
+#!/bin/sh
+exec startxfce4
+XINIT
+chmod 0755 /root/.xinitrc
+
+# Only tty1 starts X; the serial consoles keep a plain shell for recovery.
+cat > /root/.bash_profile <<'PROFILE'
+if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ] && command -v startx >/dev/null; then
+	startx -- -keeptty >>/var/log/charlotte-x.log 2>&1
+fi
+PROFILE
 
 mkdir -p /etc/systemd/network /etc/ssh/sshd_config.d /run/sshd
 mkdir -p /etc/systemd/system/getty@tty1.service.d
