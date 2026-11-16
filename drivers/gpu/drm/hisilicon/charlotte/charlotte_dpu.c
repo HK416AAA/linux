@@ -181,6 +181,14 @@
 #define CMDLIST_CH_CTRL(i) (CMDLIST0 + 0x04 + 0x40 * (i))
 #define CMDLIST_CH_STAAD(i) (CMDLIST0 + 0x0c + 0x40 * (i))
 #define CMDLIST_CH_INTE(i) (CMDLIST0 + 0x14 + 0x40 * (i))
+/* Write-1-to-clear: taskdone(7) timeout(6) badcmd(5) axi_err(2) alldone(1)
+ * onedone(0).  INTE is 0xe4, so only the error and taskdone bits are enabled.
+ */
+#define CMDLIST_CH_INTS(i) (CMDLIST0 + 0x1c + 0x40 * (i))
+#define CMDLIST_INTS_TASKDONE BIT(7)
+#define CMDLIST_INTS_TIMEOUT BIT(6)
+#define CMDLIST_INTS_BADCMD BIT(5)
+#define CMDLIST_INTS_AXI_ERR BIT(2)
 #define CMDLIST_START (CMDLIST0 + 0x714)
 #define CMDLIST_ADDR_MASK_DIS (CMDLIST0 + 0x71c)
 #define CMDLIST_TWO_SAME_FRAME_BYPASS (CMDLIST0 + 0x7a0)
@@ -661,6 +669,10 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DACC_SCENE0), readl(dpu->regs + DACC_SCENE0 + 0x04),
 		readl(dpu->regs + DACC_SCENE0 + 0x10), readl(dpu->regs + DACC_SCENE0 + 0x1c),
 		readl(dpu->regs + DACC_SCENE0 + 0x24));
+	seq_printf(s, "snapshot cmdlist dm_cmd4=%08x dm0_w2=%08x s0_ints=%02x init_ints=%02x\n",
+		readl(dpu->regs + DM0 + 4), readl(dpu->regs + DM0 + 8),
+		readl(dpu->regs + CMDLIST_CH_INTS(0)),
+		readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT)));
 	seq_printf(s, "pipeline itf=%08x state=%08x dsc_in=%08x out=%08x fifo=%08x lb=%08x\n",
 		readl(dpu->regs + ITF0_OFFSET + 0x000),
 		readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
@@ -906,8 +918,11 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	/* valid_flag 0xA5, cmd_mode TRANSPORT, task_end, last. */
 	hdr[0] = (0xa5U << 24) | BIT(23) | BIT(22) | BIT(1);
 	hdr[1] = 0;
-	/* dma_dst_addr is a word offset, items_count excludes the header item. */
-	hdr[2] = ((DM0 >> 2) << 14) | (DM_PARAM_ITEMS - 1);
+	/* dma_dst_addr is a word offset.  Vendor cmdlist_alloc_items() derives
+	 * items_count as node_size / 16 - 1, where node_size covers the header
+	 * plus the payload, so the count equals the payload item count.
+	 */
+	hdr[2] = ((DM0 >> 2) << 14) | DM_PARAM_ITEMS;
 	hdr[3] = lower_32_bits(dpu->cmdlist_dma) + CMDLIST_HDR_SIZE;
 	wmb();
 
@@ -937,7 +952,7 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	writel(0, dpu->regs + DACC_GLB_SDP_MASK);
 	charlotte_dacc_arm(dpu);
 	dev_info(dev, "cmdlist started at %pad (%u items)\n", &dpu->cmdlist_dma,
-		DM_PARAM_ITEMS - 1);
+		DM_PARAM_ITEMS);
 	return 0;
 }
 /*
@@ -1665,19 +1680,46 @@ static ssize_t charlotte_cmdlist_write(struct file *file, const char __user *buf
 		charlotte_cmdlist_release(dpu);
 	return ret ? ret : len;
 }
+static const char *charlotte_cmdlist_ints_str(u32 ints, char *buf, size_t len)
+{
+	snprintf(buf, len, "%s%s%s%s%s%s",
+		 ints & CMDLIST_INTS_TASKDONE ? "taskdone " : "",
+		 ints & CMDLIST_INTS_TIMEOUT ? "timeout " : "",
+		 ints & CMDLIST_INTS_BADCMD ? "badcmd " : "",
+		 ints & CMDLIST_INTS_AXI_ERR ? "axi_err " : "",
+		 ints & BIT(1) ? "alldone " : "",
+		 ints & BIT(0) ? "onedone " : "");
+	return buf;
+}
 static int charlotte_cmdlist_show(struct seq_file *s, void *unused)
 {
 	struct charlotte_dpu *dpu = s->private;
-	seq_printf(s, "active=%u dma=%pad dm_cmd0=%08x\n", dpu->cmdlist_buf != NULL,
+	char d0[64], d7[64];
+	u32 ints0 = readl(dpu->regs + CMDLIST_CH_INTS(0));
+	u32 ints7 = readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+
+	seq_printf(s, "active=%u dma=%pad dm_cmd4=%08x\n", dpu->cmdlist_buf != NULL,
 		&dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4));
-	seq_printf(s, "monpc=%08x ch0_ctrl=%08x ch0_status=%08x ch0_curad=%08x\n",
-		readl(dpu->regs + 0x40014), readl(dpu->regs + CMDLIST_CH_CTRL(0)),
-		readl(dpu->regs + CMDLIST0 + 0x08), readl(dpu->regs + CMDLIST0 + 0x10));
-	seq_printf(s, "ch7_ctrl=%08x ch7_status=%08x start=%08x mask_dis=%08x\n",
-		readl(dpu->regs + CMDLIST_CH_CTRL(7)),
-		readl(dpu->regs + CMDLIST0 + 0x08 + 0x40 * 7),
+	/* The transport overwrites DM0+0/+4 with 0 and the chain address, then
+	 * fills the client slots with 0xFF, so dm0+8 only reads 0xffffffff
+	 * after the sequencer really performed the transfer.
+	 */
+	seq_printf(s, "dm0_w0=%08x dm0_w2=%08x (%s)\n",
+		readl(dpu->regs + DM0), readl(dpu->regs + DM0 + 8),
+		readl(dpu->regs + DM0 + 8) == 0xffffffff ? "transport ran" : "no transfer");
+	seq_printf(s, "scene0 ints=%08x [%s] ctrl=%08x staad=%08x\n", ints0,
+		charlotte_cmdlist_ints_str(ints0, d0, sizeof(d0)),
+		readl(dpu->regs + CMDLIST_CH_CTRL(0)),
+		readl(dpu->regs + CMDLIST_CH_STAAD(0)));
+	seq_printf(s, "init7  ints=%08x [%s] ctrl=%08x staad=%08x\n", ints7,
+		charlotte_cmdlist_ints_str(ints7, d7, sizeof(d7)),
+		readl(dpu->regs + CMDLIST_CH_CTRL(CMDLIST_SCENE_INIT)),
+		readl(dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT)));
+	seq_printf(s, "monpc=%08x start=%08x mask_dis=%08x bypass=%08x\n",
+		readl(dpu->regs + 0x40014),
 		readl(dpu->regs + CMDLIST_START),
-		readl(dpu->regs + CMDLIST_ADDR_MASK_DIS));
+		readl(dpu->regs + CMDLIST_ADDR_MASK_DIS),
+		readl(dpu->regs + CMDLIST_TWO_SAME_FRAME_BYPASS));
 	return 0;
 }
 static int charlotte_cmdlist_open(struct inode *inode, struct file *file)
@@ -1688,6 +1730,59 @@ static const struct file_operations charlotte_cmdlist_fops = {
 	.owner = THIS_MODULE, .open = charlotte_cmdlist_open,
 	.write = charlotte_cmdlist_write, .read = seq_read,
 	.llseek = seq_lseek, .release = single_release,
+};
+
+/*
+ * One-shot chain verdict.  Restores the pristine descriptor image, clears the
+ * channel status words, arms the chain and then waits for the transport's own
+ * write signature in the DM window.  Everything is reported to dmesg so a
+ * single write answers "did the sequencer execute our chain, and if not, why".
+ */
+static ssize_t charlotte_cmdldiag_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned int value;
+	u32 ints7, ints0, probe;
+	int ret, i;
+
+	ret = kstrtouint_from_user(buf, len, 0, &value);
+	if (ret)
+		return ret;
+	if (value != 1)
+		return -EINVAL;
+
+	charlotte_cmdlist_release(dpu);
+	charlotte_dm_restore(dpu);
+	writel(0xff, dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+	writel(0xff, dpu->regs + CMDLIST_CH_INTS(0));
+	probe = readl(dpu->regs + DM0 + 8);
+	ret = charlotte_cmdlist_start(dpu);
+	if (ret) {
+		dev_info(dpu->drm.dev, "cmdldiag: chain start failed %d\n", ret);
+		return ret;
+	}
+	/* Payload slot 2 (DM0+8) is 0xFF and pristine is 0, so only the
+	 * transport can turn it into 0xffffffff.
+	 */
+	for (i = 0; i < 200; i++) {
+		if (readl(dpu->regs + DM0 + 8) == 0xffffffff)
+			break;
+		msleep(1);
+	}
+	ints7 = readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+	ints0 = readl(dpu->regs + CMDLIST_CH_INTS(0));
+	dev_info(dpu->drm.dev,
+		 "cmdldiag: chain=%pad dfw=%08x probe0=%08x probe=%08x after %dms init_ints=%02x scene0_ints=%02x => %s\n",
+		 &dpu->cmdlist_dma, readl(dpu->regs + DM0 + 4), probe,
+		 readl(dpu->regs + DM0 + 8), i, ints7, ints0,
+		 (readl(dpu->regs + DM0 + 8) == 0xffffffff) ?
+			"TRANSPORT-RAN" : "TRANSPORT-DID-NOT-RUN");
+	return len;
+}
+static const struct file_operations charlotte_cmdldiag_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_cmdldiag_write, .llseek = noop_llseek,
 };
 
 static ssize_t charlotte_daccload_write(struct file *file, const char __user *buf,
@@ -2956,6 +3051,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("reg", 0600, dpu->debugfs, dpu, &charlotte_reg_fops);
 	debugfs_create_file("dacc", 0200, dpu->debugfs, dpu, &charlotte_dacc_fops);
 	debugfs_create_file("cmdl", 0600, dpu->debugfs, dpu, &charlotte_cmdlist_fops);
+	debugfs_create_file("cmdldiag", 0200, dpu->debugfs, dpu,
+		&charlotte_cmdldiag_fops);
 	debugfs_create_file("daccw", 0200, dpu->debugfs, dpu, &charlotte_regcmd_fops);
 	debugfs_create_file("vendorseq", 0200, dpu->debugfs, dpu,
 		&charlotte_vendorseq_fops);
