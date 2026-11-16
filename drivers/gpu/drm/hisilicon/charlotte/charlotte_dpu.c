@@ -165,6 +165,8 @@
 #define CMDLIST_HDR_SIZE 16
 #define CMDLIST_ITEM_SIZE 16
 #define DM_PARAM_ITEMS ((DM_PARAM_SIZE) / (CMDLIST_ITEM_SIZE))
+/* struct dpu_dm_cmdlist_addr: 17 client pointers plus 3 reserved words. */
+#define DM_CMDLIST_ADDR_SIZE 0x50
 /* Layer0 fields inside the DM image, as word indices. */
 #define DM_W_START_ADDR_H ((0x1dc) / 4)
 #define DM_W_START_ADDR_L ((0x1e0) / 4)
@@ -431,21 +433,52 @@ static bool charlotte_hw_format(u32 format, u32 *hw)
 	return false;
 }
 
+/*
+ * Point the online scene at the cmdlist chain and put it in cmdlist config
+ * mode.  The vendor reissues this on every present because the sequencer
+ * clears CFG_MODE once the chain has run, so this is not a one-shot setup.
+ */
+static void charlotte_dacc_arm(struct charlotte_dpu *dpu)
+{
+	if (!dpu->cmdlist_buf)
+		return;
+	writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
+	writel(readl(dpu->regs + DACC_SCENE0) | 1, dpu->regs + DACC_SCENE0);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x04) | 1,
+	       dpu->regs + DACC_SCENE0 + 0x04);
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) | 1,
+	       dpu->regs + DACC_SCENE0 + 0x24);
+	/* Online scenes take their frame select from the panel, not SW_START. */
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x1c) & ~1U,
+	       dpu->regs + DACC_SCENE0 + 0x1c);
+	wmb();
+}
+
+static void charlotte_cmdlist_patch(struct charlotte_dpu *dpu, dma_addr_t addr,
+				    u32 pitch, u32 format)
+{
+	u32 hw_format;
+
+	if (!dpu->cmdlist_item)
+		return;
+	if (!charlotte_hw_format(format, &hw_format))
+		hw_format = 0xd;
+	dpu->cmdlist_item[DM_W_START_ADDR_H] = upper_32_bits(addr);
+	dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
+	dpu->cmdlist_item[DM_W_STRIDE] = pitch;
+	dpu->cmdlist_item[DM_W_LAYER_HEIGHT] = ((HEIGHT - 1) << 16) | (WIDTH - 1);
+	dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
+		hw_format << 8;
+	wmb();
+}
+
 static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
 {
 	u32 layer_size = ((HEIGHT - 1) << 16) | (WIDTH - 1);
 	u32 hw_format;
 	if (!charlotte_hw_format(format, &hw_format))
 		hw_format = 0xd;
-	if (dpu->cmdlist_item) {
-		dpu->cmdlist_item[DM_W_START_ADDR_H] = upper_32_bits(addr);
-		dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
-		dpu->cmdlist_item[DM_W_STRIDE] = pitch;
-		dpu->cmdlist_item[DM_W_LAYER_HEIGHT] = layer_size;
-		dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
-			hw_format << 8;
-		wmb();
-	}
+	charlotte_cmdlist_patch(dpu, addr, pitch, format);
 	/* GPL opr_set_sdma_layer_fmt sets both the DMA and dynamic DFC formats.
 	 * Firmware uses ABGR (13) for the logo; opaque DRM buffers map to the
 	 * matching SDMA format so 565/8888/RGB order stay correct.
@@ -457,6 +490,8 @@ static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitc
 	writel(pitch, dpu->regs + DM_STRIDE);
 	writel(layer_size, dpu->regs + DM_LAYER_SIZE);
 	wmb();
+	/* composer_scene_present(): hand the scene the chain for this frame. */
+	charlotte_dacc_arm(dpu);
 }
 static void queue_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitch, u32 format)
 {
@@ -852,11 +887,20 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	 * firmware itself validated.
 	 */
 	memcpy(item, dpu->dm_backup, DM_PARAM_SIZE);
-	/* Self-linked DM node: cmdlist_h_addr and cmdlist_addr0 (DM0 + 0/4). */
-	item[0] = upper_32_bits(dpu->cmdlist_dma);
+	/* request_dm_client() blanks every cmdlist client slot to 0xFF (absent)
+	 * before filling in only the DM chain pointer.  A zero slot reads as
+	 * "follow chain at address 0", which stalls the sequencer.
+	 */
+	memset(item, 0xFF, DM_CMDLIST_ADDR_SIZE);
+	item[0] = 0;
 	item[1] = lower_32_bits(dpu->cmdlist_dma);
-	item[2] = 0;
-	item[3] = 0;
+	/* The transport owns the DM window from now on, so the payload has to
+	 * carry the buffer we are actually scanning out.
+	 */
+	charlotte_cmdlist_patch(dpu,
+		dpu->next_address ? dpu->next_address : dpu->boot_address_l,
+		dpu->next_stride ? dpu->next_stride : dpu->boot_stride,
+		dpu->next_format);
 
 	hdr = dpu->cmdlist_buf;
 	/* valid_flag 0xA5, cmd_mode TRANSPORT, task_end, last. */
@@ -877,10 +921,7 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 	}
 
 	/* Online scene keeps the firmware clocks; only the fetch mode changes. */
-	writel(readl(dpu->regs + DACC_SCENE0) | 1, dpu->regs + DACC_SCENE0);
-	writel(readl(dpu->regs + DACC_SCENE0 + 0x04) | 1, dpu->regs + DACC_SCENE0 + 0x04);
-	writel(readl(dpu->regs + DACC_SCENE0 + 0x1c) & ~1U, dpu->regs + DACC_SCENE0 + 0x1c);
-	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) | 1, dpu->regs + DACC_SCENE0 + 0x24);
+	charlotte_dacc_arm(dpu);
 
 	/* Vendor dpu_cmdlist_init_commit(): run the INITIAL scene once. */
 	writel(lower_32_bits(dpu->cmdlist_dma),
@@ -890,11 +931,11 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 
 	/* Hand the online scene the same buffer; it re-runs every frame. */
 	writel(0, dpu->regs + DM0);
-	writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
 	writel(0, dpu->regs + DACC_GLB_DP0_MASK);
 	writel(0, dpu->regs + DACC_GLB_DP1_MASK);
 	writel(0, dpu->regs + DACC_GLB_MDP_MASK);
 	writel(0, dpu->regs + DACC_GLB_SDP_MASK);
+	charlotte_dacc_arm(dpu);
 	dev_info(dev, "cmdlist started at %pad (%u items)\n", &dpu->cmdlist_dma,
 		DM_PARAM_ITEMS - 1);
 	return 0;
@@ -1274,6 +1315,11 @@ static int charlotte_dm_restore(struct charlotte_dpu *dpu)
 		return -ENODATA;
 	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
 		writel(dpu->dm_backup[i], dpu->regs + DM0 + i * 4);
+	/* Hand the scene back exactly as the bootloader left it: no chain and
+	 * register-config mode.
+	 */
+	writel(readl(dpu->regs + DACC_SCENE0 + 0x24) & ~1U,
+	       dpu->regs + DACC_SCENE0 + 0x24);
 	wmb();
 	writel(1, dpu->regs + DACC_SCENE0_RELOAD);
 	dev_info(dpu->dev, "dm descriptor restored\n");
@@ -1324,8 +1370,10 @@ static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
 			ret = charlotte_cmdlist_start(dpu);
 			break;
 		}
-		writel(lower_32_bits(dpu->cmdlist_dma), dpu->regs + DM0 + 4);
-		writel(1, dpu->regs + DACC_SCENE0_RELOAD);
+		/* Re-point the scene and re-enable cmdlist mode for this frame. */
+		charlotte_cmdlist_patch(dpu, dpu->next_address, dpu->next_stride,
+					dpu->next_format);
+		charlotte_dacc_arm(dpu);
 		break;
 	case 4:
 		addr = ((u64)(readl(dpu->regs + DM_ADDRESS_H) & 0xff) << 32) |
@@ -1344,6 +1392,8 @@ static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
 					   ARRAY_SIZE(charlotte_seq_itf));
 		if (!ret && !dpu->cmdlist_buf)
 			ret = charlotte_cmdlist_start(dpu);
+		if (!ret)
+			charlotte_dacc_arm(dpu);
 		break;
 	case 6:
 		/* LDI window alone, in the post-DSC domain: isolates the frame
@@ -2593,6 +2643,15 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 	 * the panel; without this every commit and flush is silently dropped.
 	 */
 	charlotte_pipeline_commit(dpu);
+	/* The bootloader left the online scene in register-config mode with no
+	 * cmdlist (cfgmode=0, cmdlist_addr0=0), which is why the panel can hold
+	 * the last frame but never accepts a new one.  Start the vendor
+	 * composer chain from the probe-time descriptor so the sequencer has
+	 * something valid to fetch.
+	 */
+	if (!dpu->cmdlist_buf && charlotte_cmdlist_start(dpu))
+		dev_warn(dpu->dev, "cmdlist start failed; keeping register-config mode\n");
+	charlotte_dacc_arm(dpu);
 	/* The bootloader leaves a partial column/row address window in the
 	 * panel controller, so a full-frame scanout only ever lands in the old
 	 * dirty region.  The vendor panel driver re-sends the whole-panel
