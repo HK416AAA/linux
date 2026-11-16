@@ -277,6 +277,10 @@ struct charlotte_dpu {
 	bool backlight_ro;
 	int irq;
 	bool irq_requested, irq_running, irq_storm;
+	/* The starved-pipeline storm is muted rather than fatal: the pump is
+	 * what actually moves pixels, so it has to keep running.
+	 */
+	bool underflow_muted;
 	u64 irq_count, irq_window_ns;
 	u32 irq_window_count;
 	bool kms, kms_attempted, pending, latched;
@@ -518,6 +522,20 @@ static irqreturn_t charlotte_irq(int irq, void *data)
 		dpu->irq_window_count = 0;
 	}
 	if (++dpu->irq_window_count > 100) {
+		dpu->irq_window_ns = now;
+		dpu->irq_window_count = 0;
+		if (!dpu->underflow_muted && (readl(dpu->regs + DSI_MASK) &
+					      DSI_UNDERFLOW) == 0) {
+			/* First flood: mute the starved-FIFO source and stay
+			 * alive, otherwise a stalled pipeline permanently
+			 * kills the frame pump it needs to recover.
+			 */
+			writel(readl(dpu->regs + DSI_MASK) | DSI_UNDERFLOW,
+				dpu->regs + DSI_MASK);
+			dpu->underflow_muted = true;
+			dpu->irq_storm = true;
+			return IRQ_HANDLED;
+		}
 		writel(~0U, dpu->regs + DSI_MASK);
 		disable_irq_nosync(irq);
 		dpu->irq_storm = true;
@@ -602,8 +620,9 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 	struct charlotte_dpu *dpu = s->private;
 	unsigned long flags;
 	spin_lock_irqsave(&dpu->lock, flags);
-	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u ldi_pump=%u pump_div=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
-		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm, dpu->ldi_pump, dpu->pump_div,
+	seq_printf(s, "kms=%u irq=%d irq_running=%u irq_storm=%u underflow_muted=%u ldi_pump=%u pump_div=%u irq_count=%llu frames=%llu vsyncs=%llu te=%llu period_ns=%llu underflows=%llu flips=%llu\n",
+		dpu->kms, dpu->irq, dpu->irq_running, dpu->irq_storm,
+		dpu->underflow_muted, dpu->ldi_pump, dpu->pump_div,
 		dpu->irq_count, dpu->frame_count, dpu->vsync_count,
 		dpu->te_count, dpu->frame_period_ns, dpu->underflows, dpu->flips);
 	seq_printf(s, "address=%02x%08x stride=%u pending=%u test_active=%u test_restoring=%u\n",
@@ -1737,13 +1756,22 @@ static void charlotte_irq_stop_work(struct work_struct *work)
 	charlotte_irq_stop(dpu);
 	mutex_unlock(&dpu->diagnostic_lock);
 }
-static int charlotte_irq_start(struct charlotte_dpu *dpu)
+/* recover=true lets an operator clear a tripped storm guard; the plain start
+ * path still refuses to run on top of a fault that was never explained.
+ */
+static int charlotte_irq_start(struct charlotte_dpu *dpu, bool recover)
 {
 	int ret;
-	if (dpu->irq_storm)
+	if (dpu->irq_storm && !recover)
 		return -EIO;
 	if (dpu->irq_running)
 		return -EBUSY;
+	if (recover) {
+		dpu->irq_storm = false;
+		dpu->underflow_muted = false;
+		dpu->irq_window_count = 0;
+		dpu->irq_window_ns = 0;
+	}
 	if (!dpu->irq_requested) {
 		ret = devm_request_irq(dpu->drm.dev, dpu->irq, charlotte_irq,
 			IRQF_NO_AUTOEN, "charlotte-dpu", dpu);
@@ -1768,14 +1796,24 @@ static ssize_t charlotte_irq_write(struct file *file, const char __user *buf,
 	int ret = kstrtouint_from_user(buf, len, 0, &value);
 	if (ret)
 		return ret;
-	if (value > 1 || !probe_only || dpu->kms || dpu->test_active)
+	if (value > 2)
+		return -EINVAL;
+	/* 2 = clear a tripped storm guard and restart the pump; it is the only
+	 * form allowed while KMS owns the pipeline, because a storm leaves the
+	 * display frozen until someone re-enables the handler.
+	 */
+	if (value != 2 && (!probe_only || dpu->kms || dpu->test_active))
 		return -EINVAL;
 	cancel_delayed_work_sync(&dpu->irq_stop_work);
 	mutex_lock(&dpu->diagnostic_lock);
 	if (value) {
-		/* Arm restoration before any interrupt mutation. */
-		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
-		ret = charlotte_irq_start(dpu);
+		/* Arm restoration before any interrupt mutation.  KMS owns the
+		 * display, so its handler has to keep running.
+		 */
+		if (!dpu->kms)
+			schedule_delayed_work(&dpu->irq_stop_work,
+					      msecs_to_jiffies(60000));
+		ret = charlotte_irq_start(dpu, value == 2);
 	} else {
 		charlotte_irq_stop(dpu);
 	}
@@ -1864,7 +1902,7 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		 */
 		schedule_delayed_work(&dpu->irq_stop_work, msecs_to_jiffies(60000));
 		if (!dpu->irq_running) {
-			ret = charlotte_irq_start(dpu);
+			ret = charlotte_irq_start(dpu, false);
 			/* A storm trip returns -EIO and leaves the IRQ disabled.
 			 * Video mode can still be evaluated by polling vcount, so
 			 * never block the transport flip on the counter source.
@@ -2014,7 +2052,7 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		 */
 		if (dpu->irq_storm) {
 			dpu->irq_storm = false;
-			ret = charlotte_irq_start(dpu);
+			ret = charlotte_irq_start(dpu, false);
 			if (ret)
 				dev_warn(dpu->drm.dev,
 					 "video: cmd-mode irq recovery failed: %d\n",
@@ -2267,7 +2305,7 @@ static ssize_t charlotte_online_write(struct file *file, const char __user *buf,
 		if (ret)
 			goto out;
 		if (!dpu->irq_running) {
-			ret = charlotte_irq_start(dpu);
+			ret = charlotte_irq_start(dpu, false);
 			if (ret)
 				dev_info(dpu->drm.dev,
 					 "online: irq not started (%d); checked by polling\n",
@@ -2705,7 +2743,7 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	if (ret)
 		return ret;
 	drm_mode_config_reset(drm);
-	ret = charlotte_irq_start(dpu);
+	ret = charlotte_irq_start(dpu, false);
 	if (ret)
 		return ret;
 	dpu->kms = true;
