@@ -144,6 +144,12 @@
 #define DSC0_OFFSET 0xd4000
 #define ITF0_OFFSET 0xcc000
 #define PIPE_SW_OFFSET 0xcc400
+/* Per-frame transport and output counters: the only two registers that prove
+ * the DPP read a layer instead of just holding the previous frame in its
+ * line buffer.
+ */
+#define DPP0_CH_DBG_CNT (DPP0_OFFSET + 0x02c)
+#define DPP0_CRC_FRM_CNT (DPP0_OFFSET + 0x034)
 /* Vendor get_dsc_out_width(): two slices of half the panel line plus the
  * four insert bytes each, mapped onto a 3x compressed 24bpp stream.
  */
@@ -702,6 +708,12 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DACC_SCENE0_DCMD_STATUS),
 		readl(dpu->regs + DACC_SCENE0_LAYER_NUM),
 		readl(dpu->regs + DACC_SCENE0_RELOAD));
+	seq_printf(s, "snapshot dpp dbgcnt=%04x crc=%06x ctrl=%08x flush=%08x state=%08x\n",
+		readl(dpu->regs + DPP0_CH_DBG_CNT) & 0xffff,
+		readl(dpu->regs + DPP0_CRC_FRM_CNT),
+		readl(dpu->regs + DPP0_OFFSET + 0x058),
+		readl(dpu->regs + DPP0_OFFSET + 0x060),
+		readl(dpu->regs + DPP0_OFFSET + 0x068));
 	seq_printf(s, "pipeline itf=%08x state=%08x dsc_in=%08x out=%08x fifo=%08x lb=%08x\n",
 		readl(dpu->regs + ITF0_OFFSET + 0x000),
 		readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
@@ -1054,6 +1066,177 @@ static int charlotte_regseq_run(struct charlotte_dpu *dpu,
 	}
 	return ret;
 }
+
+/*
+ * Everything below exists because the DACC never dispatches a per-frame
+ * command on this board: DACC_SCENE0_DCMD_STATUS stays 0 while the static
+ * command bit is set, so the layer descriptor sitting in the DM window is
+ * never transferred into the DPP.  The cmdlist engine itself works, so the
+ * plan is to replace the DACC as the frame engine with the engine we already
+ * have: one CONFIG_MODE chain that transfers the descriptor and then flushes
+ * the DPP -> DSC -> ITF shadow registers.
+ *
+ * Vendor never touches these blocks with writel(): while the display is
+ * firmware-owned the CPU stores are dropped, so the sequence runs through
+ * charlotte_regseq_run().
+ */
+static const struct charlotte_reg_init charlotte_seq_dpp[] = {
+	{ DPP0_OFFSET + 0x058, 0x00000000, "dpp0: REG_CTRL scene0" },
+	{ DPP0_OFFSET + 0x06c, 0x00000000, "dpp0: REG_CTRL_LAYER_ID" },
+	{ DPP0_OFFSET + 0x060, 0x00000001, "dpp0: FLUSH_EN" },
+};
+
+static const struct charlotte_reg_init charlotte_seq_dsc[] = {
+	{ DSC0_OFFSET + 0x250, 0x00000000, "dsc0: REG_CTRL scene0" },
+	{ DSC0_OFFSET + 0x254, 0x00000001, "dsc0: FLUSH_EN" },
+};
+
+static const struct charlotte_reg_init charlotte_seq_itf2[] = {
+	{ ITF0_OFFSET + 0x000, ITF_IMG_SIZE, "itf0: IMG_SIZE (DSC out)" },
+	{ ITF0_OFFSET + 0x014, 0x00000000, "itf0: DPP_CLIP_EN" },
+	{ ITF0_OFFSET + 0x030, 0x00000000, "itf0: DPP_CLRBAR_CTRL" },
+	{ ITF0_OFFSET + 0x068, 0x00000000, "itf0: ITFSW_DATA_SEL" },
+	{ ITF0_OFFSET + 0x074, 0x000001a1, "itf0: VSYNC_DELAY_CNT_CTRL" },
+	{ ITF0_OFFSET + 0x058, 0x00000000, "itf0: REG_CTRL scene0" },
+	{ ITF0_OFFSET + 0x05c, 0x00000001, "itf0: FLUSH_EN" },
+};
+
+static const struct charlotte_reg_init charlotte_seq_pipesw[] = {
+	{ PIPE_SW_OFFSET + 0x00, 0x00000001, "pipe_sw: SIG_CTRL ch0" },
+	{ PIPE_SW_OFFSET + 0x04, 0x00000001, "pipe_sw: SIG_EN ch0" },
+	{ PIPE_SW_OFFSET + 0x08, 0x00000001, "pipe_sw: DAT_CTRL ch0" },
+	{ PIPE_SW_OFFSET + 0x0c, 0x00000001, "pipe_sw: DAT_EN ch0" },
+};
+
+static const struct charlotte_reg_init charlotte_seq_sdma[] = {
+	{ DACC_GLB0 + 0x538, 0x80090001, "sdma0: dbg reserved1" },
+	{ DACC_GLB0 + 0x578, 0x80090001, "sdma1: dbg reserved1" },
+	{ DACC_GLB0 + 0x5b8, 0x80090001, "sdma2: dbg reserved1" },
+	{ DACC_GLB0 + 0x5f8, 0x80090001, "sdma3: dbg reserved1" },
+};
+
+/*
+ * Re-run the transport chain the DACC already handed to the INIT scene.  The
+ * chain address lives in dpu->cmdlist_dma, so this is a pure "one more frame"
+ * request that never rebuilds the payload.
+ */
+static int charlotte_chain_kick(struct charlotte_dpu *dpu)
+{
+	unsigned int i;
+	u32 status = 0;
+
+	if (!dpu->cmdlist_buf)
+		return -ENODEV;
+	writel(0xffffffff, dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+	wmb();
+	writel(lower_32_bits(dpu->cmdlist_dma),
+		dpu->regs + CMDLIST_CH_STAAD(CMDLIST_SCENE_INIT));
+	writel((u32)~BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_ADDR_MASK_DIS);
+	writel(BIT(CMDLIST_SCENE_INIT), dpu->regs + CMDLIST_START);
+	for (i = 0; i < 200; i++) {
+		status = readl(dpu->regs + CMDLIST_CH_INTS(CMDLIST_SCENE_INIT));
+		if (status & CMDLIST_INTS_TASKDONE)
+			return 0;
+		udelay(50);
+	}
+	return -EIO;
+}
+
+static void charlotte_bypass_sample(struct charlotte_dpu *dpu, const char *stage)
+{
+	dev_info(dpu->drm.dev,
+		 "bypass: %-20s dsc_in=%04x out=%04x fifo=%05x dppcnt=%04x crc=%06x itfst=%08x vstate=%08x\n",
+		 stage,
+		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN) & 0x1fff,
+		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT) & 0x1fff,
+		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
+		 readl(dpu->regs + DPP0_CH_DBG_CNT) & 0xffff,
+		 readl(dpu->regs + DPP0_CRC_FRM_CNT),
+		 readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
+		 readl(dpu->regs + DSI_VSTATE));
+}
+
+/*
+ * Stage one block at a time so a single dead block shows up as "the counters
+ * did not move here" instead of a single opaque failure.  Every stage is a
+ * separate CONFIG_MODE chain, which also proves the chain engine survives
+ * repeated use.
+ */
+static int charlotte_bypass_run(struct charlotte_dpu *dpu)
+{
+	unsigned int i;
+	int ret;
+
+	charlotte_cmdlist_release(dpu);
+	ret = charlotte_cmdlist_start(dpu);
+	if (ret)
+		return ret;
+	charlotte_bypass_sample(dpu, "b0 transport");
+
+	ret = charlotte_regseq_run(dpu, charlotte_seq_dpp,
+				   ARRAY_SIZE(charlotte_seq_dpp));
+	charlotte_bypass_sample(dpu, ret ? "b1 dpp (failed)" : "b1 +dpp flush");
+
+	ret = charlotte_regseq_run(dpu, charlotte_seq_dsc,
+				   ARRAY_SIZE(charlotte_seq_dsc));
+	charlotte_bypass_sample(dpu, ret ? "b2 dsc (failed)" : "b2 +dsc flush");
+
+	ret = charlotte_regseq_run(dpu, charlotte_seq_itf2,
+				   ARRAY_SIZE(charlotte_seq_itf2));
+	charlotte_bypass_sample(dpu, ret ? "b3 itf (failed)" : "b3 +itf latch");
+
+	ret = charlotte_regseq_run(dpu, charlotte_seq_pipesw,
+				   ARRAY_SIZE(charlotte_seq_pipesw));
+	charlotte_bypass_sample(dpu, ret ? "b4 sw (failed)" : "b4 +pipe_sw route");
+
+	ret = charlotte_regseq_run(dpu, charlotte_seq_sdma,
+				   ARRAY_SIZE(charlotte_seq_sdma));
+	charlotte_bypass_sample(dpu, ret ? "b5 sdma (failed)" : "b5 +sdma dbg");
+
+	/* The DACC used to deliver one descriptor per frame; deliver 200. */
+	for (i = 0; i < 200; i++) {
+		if (charlotte_chain_kick(dpu))
+			break;
+	}
+	charlotte_bypass_sample(dpu, "b6 200x transport");
+
+	/* Real per-frame shape: transfer then latch then push. */
+	charlotte_chain_kick(dpu);
+	charlotte_regseq_run(dpu, charlotte_seq_dpp,
+			     ARRAY_SIZE(charlotte_seq_dpp));
+	charlotte_regseq_run(dpu, charlotte_seq_dsc,
+			     ARRAY_SIZE(charlotte_seq_dsc));
+	charlotte_regseq_run(dpu, charlotte_seq_itf2,
+			     ARRAY_SIZE(charlotte_seq_itf2));
+	charlotte_ldi_arm(dpu);
+	msleep(40);
+	charlotte_bypass_sample(dpu, "b7 frame push");
+	return 0;
+}
+
+static ssize_t charlotte_bypass_write(struct file *file,
+	const char __user *buf, size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint_from_user(buf, len, 0, &value);
+	if (ret)
+		return ret;
+	if (value != 1)
+		return -EINVAL;
+	mutex_lock(&dpu->diagnostic_lock);
+	ret = charlotte_bypass_run(dpu);
+	mutex_unlock(&dpu->diagnostic_lock);
+	dev_info(dpu->drm.dev, "bypass run: %d\n", ret);
+	return ret ? ret : len;
+}
+
+static const struct file_operations charlotte_bypass_fops = {
+	.owner = THIS_MODULE, .open = simple_open,
+	.write = charlotte_bypass_write, .llseek = noop_llseek,
+};
 
 /*
  * Vendor dpu_dacc_load(): ask BL31 to load the DACC firmware for display
@@ -3127,6 +3310,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	debugfs_create_file("cmdl", 0600, dpu->debugfs, dpu, &charlotte_cmdlist_fops);
 	debugfs_create_file("cmdldiag", 0200, dpu->debugfs, dpu,
 		&charlotte_cmdldiag_fops);
+	debugfs_create_file("bypass", 0200, dpu->debugfs, dpu,
+		&charlotte_bypass_fops);
 	debugfs_create_file("daccw", 0200, dpu->debugfs, dpu, &charlotte_regcmd_fops);
 	debugfs_create_file("vendorseq", 0200, dpu->debugfs, dpu,
 		&charlotte_vendorseq_fops);
