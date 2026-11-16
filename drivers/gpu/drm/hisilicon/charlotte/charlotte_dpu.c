@@ -143,7 +143,11 @@
 #define DSC0_OFFSET 0xd4000
 #define ITF0_OFFSET 0xcc000
 #define PIPE_SW_OFFSET 0xcc400
-#define DSC_OUT_WIDTH 936
+/* Vendor get_dsc_out_width(): two slices of half the panel line plus the
+ * four insert bytes each, mapped onto a 3x compressed 24bpp stream.
+ */
+#define DSC_CHUNK_SIZE (WIDTH / 2)
+#define DSC_OUT_WIDTH ((DSC_CHUNK_SIZE + 4) * 2 / 3)
 /* Vendor dpu_comp_itfch_config(): ITF consumes the DSC output geometry. */
 #define ITF_IMG_SIZE (((HEIGHT - 1) << 16) | (DSC_OUT_WIDTH - 1))
 #define CHARLOTTE_ONLINE_SNAP_MAX 40
@@ -633,12 +637,19 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT),
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_LINEBUF));
-	seq_printf(s, "ldi h2=%08x v2=%08x vact=%08x vfp=%08x boot_vfp=%u pld_st=%08x\n",
+	seq_printf(s, "ldi h2=%08x v2=%08x vact=%08x vfp=%08x dsc_out_w=%u\n",
 		readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
 		readl(dpu->regs + DSI_LDI_VRT_CTRL2),
 		readl(dpu->regs + DSI_VIDEO_VACT),
-		readl(dpu->regs + DSI_VIDEO_VFP),
-		dpu->boot_vfp, readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS));
+		readl(dpu->regs + DSI_VIDEO_VFP), DSC_OUT_WIDTH);
+	seq_printf(s, "boot_ldi h2=%08x v2=%08x vact=%08x vfp=%08x pld_st=%08x\n",
+		dpu->boot_h2, dpu->boot_v2, dpu->boot_vact, dpu->boot_vfp,
+		readl(dpu->regs + DSI_CMD_PLD_BUF_STATUS));
+	seq_printf(s, "dsc pic=%08x slice=%08x chunk=%08x out=%08x\n",
+		readl(dpu->regs + DSC0_OFFSET + 0x010),
+		readl(dpu->regs + DSC0_OFFSET + 0x014),
+		readl(dpu->regs + DSC0_OFFSET + 0x018),
+		readl(dpu->regs + DSC0_OFFSET + 0x008));
 	seq_printf(s, "backlight_on=%u\n", READ_ONCE(dpu->backlight_on));
 	return 0;
 }
@@ -1140,33 +1151,51 @@ static int charlotte_dcs_region(struct charlotte_dpu *dpu, u32 x0, u32 x1,
 	return ret;
 }
 
-/* Vendor partial_update_set_reg(): window width/height plus the VFP delta. */
-static void charlotte_ldi_window(struct charlotte_dpu *dpu, u32 w, u32 h)
+/* Vendor partial_update_set_reg(): window width/height plus the VFP delta,
+ * expressed in the post-DSC domain (w is the compressed stream width).  The
+ * fields are narrower than the registers, hence the read-modify-write.
+ */
+static int charlotte_ldi_window(struct charlotte_dpu *dpu, u32 w, u32 h)
 {
-	u32 vfp;
+	u32 vfp, v;
 
-	if (!w || !h || w > WIDTH || h > HEIGHT)
-		return;
+	if (!w || !h || w > DSC_OUT_WIDTH || h > HEIGHT)
+		return -EINVAL;
 	vfp = dpu->boot_vfp + HEIGHT - h;
-	writel(w - 1, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
-	writel(h - 1, dpu->regs + DSI_LDI_VRT_CTRL2);
-	writel(vfp, dpu->regs + DSI_VIDEO_VFP);
-	writel(h, dpu->regs + DSI_VIDEO_VACT);
+	v = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	writel((v & ~GENMASK(12, 0)) | (w - 1), dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	v = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+	writel((v & ~GENMASK(12, 0)) | (h - 1), dpu->regs + DSI_LDI_VRT_CTRL2);
+	v = readl(dpu->regs + DSI_VIDEO_VFP);
+	writel((v & ~GENMASK(19, 0)) | vfp, dpu->regs + DSI_VIDEO_VFP);
+	v = readl(dpu->regs + DSI_VIDEO_VACT);
+	writel((v & ~GENMASK(23, 0)) | h, dpu->regs + DSI_VIDEO_VACT);
 	wmb();
+	return 0;
 }
 
 /* Put the LDI window back exactly as the bootloader left it. */
 static void charlotte_ldi_window_restore(struct charlotte_dpu *dpu)
 {
+	u32 v;
+
 	/* Never write back an all-zero capture: a zero window would make the
 	 * LDI wait for one pixel per line and starve the frame pump.
 	 */
 	if (!dpu->boot_v2)
 		return;
-	writel(dpu->boot_h2, dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
-	writel(dpu->boot_v2, dpu->regs + DSI_LDI_VRT_CTRL2);
-	writel(dpu->boot_vfp, dpu->regs + DSI_VIDEO_VFP);
-	writel(dpu->boot_vact, dpu->regs + DSI_VIDEO_VACT);
+	v = readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	writel((v & ~GENMASK(12, 0)) | (dpu->boot_h2 & GENMASK(12, 0)),
+	       dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2);
+	v = readl(dpu->regs + DSI_LDI_VRT_CTRL2);
+	writel((v & ~GENMASK(12, 0)) | (dpu->boot_v2 & GENMASK(12, 0)),
+	       dpu->regs + DSI_LDI_VRT_CTRL2);
+	v = readl(dpu->regs + DSI_VIDEO_VFP);
+	writel((v & ~GENMASK(19, 0)) | (dpu->boot_vfp & GENMASK(19, 0)),
+	       dpu->regs + DSI_VIDEO_VFP);
+	v = readl(dpu->regs + DSI_VIDEO_VACT);
+	writel((v & ~GENMASK(23, 0)) | (dpu->boot_vact & GENMASK(23, 0)),
+	       dpu->regs + DSI_VIDEO_VACT);
 	wmb();
 }
 
@@ -1300,11 +1329,21 @@ static int charlotte_present_run(struct charlotte_dpu *dpu, unsigned int mode)
 		break;
 	case 5:
 		ret = charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1);
-		if (!ret)
-			ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
-					ARRAY_SIZE(charlotte_seq_itf));
+		if (ret)
+			break;
+		ret = charlotte_ldi_window(dpu, DSC_OUT_WIDTH, HEIGHT);
+		if (ret)
+			break;
+		ret = charlotte_regseq_run(dpu, charlotte_seq_itf,
+					   ARRAY_SIZE(charlotte_seq_itf));
 		if (!ret && !dpu->cmdlist_buf)
 			ret = charlotte_cmdlist_start(dpu);
+		break;
+	case 6:
+		/* LDI window alone, in the post-DSC domain: isolates the frame
+		 * pump from the panel-side address window.
+		 */
+		ret = charlotte_ldi_window(dpu, DSC_OUT_WIDTH, HEIGHT);
 		break;
 	case 8:
 		charlotte_ldi_window_restore(dpu);
@@ -1422,6 +1461,7 @@ static ssize_t charlotte_window_write(struct file *file,
 	struct charlotte_dpu *dpu = file->f_inode->i_private;
 	unsigned int w, h;
 	char tmp[32];
+	int ret;
 
 	if (!len || len >= sizeof(tmp))
 		return -EINVAL;
@@ -1430,11 +1470,18 @@ static ssize_t charlotte_window_write(struct file *file,
 	tmp[len] = '\0';
 	if (sscanf(tmp, "%u %u", &w, &h) != 2)
 		return -EINVAL;
-	charlotte_ldi_window(dpu, w, h);
-	charlotte_ldi_arm(dpu);
-	dev_info(dpu->dev, "ldi window %ux%u (h2=%08x v2=%08x vact=%08x)\n", w,
-		 h, readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
+	mutex_lock(&dpu->diagnostic_lock);
+	ret = charlotte_ldi_window(dpu, w, h);
+	if (!ret)
+		charlotte_ldi_arm(dpu);
+	mutex_unlock(&dpu->diagnostic_lock);
+	if (ret)
+		return ret;
+	dev_info(dpu->dev, "ldi window %ux%u of %ux%u (h2=%08x v2=%08x vfp=%08x vact=%08x)\n",
+		 w, h, DSC_OUT_WIDTH, HEIGHT,
+		 readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
 		 readl(dpu->regs + DSI_LDI_VRT_CTRL2),
+		 readl(dpu->regs + DSI_VIDEO_VFP),
 		 readl(dpu->regs + DSI_VIDEO_VACT));
 	return len;
 }
@@ -1479,7 +1526,7 @@ static ssize_t charlotte_selftest_write(struct file *file,
 		 "selftest base itf=%08x state=%08x dsc in=%08x out=%08x fifo=%08x lb=%08x ldi=%08x/%08x vstate=%08x pld=%08x\n",
 		 a.itf_size, a.itf_state, a.dsc_in, a.dsc_out, a.dsc_fifo,
 		 a.dsc_lb, a.ldi_h2, a.ldi_v2, a.vstate, a.pld_st);
-	for (mode = 0; mode <= 5; mode++) {
+	for (mode = 0; mode <= 6; mode++) {
 		ret = charlotte_present_run(dpu, mode);
 		msleep(150);
 		charlotte_diag_sample(dpu, &b);
@@ -2506,6 +2553,12 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 	 */
 	if (charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1))
 		dev_warn(dpu->dev, "panel window update failed; keeping firmware region\n");
+	/* The LDI window is expressed in the post-DSC domain, so ask for the
+	 * compressed stream width with the full panel height.  A window left
+	 * in panel pixels would make the LDI carry more data per line than
+	 * the DSC produces.
+	 */
+	charlotte_ldi_window(dpu, DSC_OUT_WIDTH, HEIGHT);
 	/* Open the LDI frame-valid gate before the first commit so the panel
 	 * receives pixels instead of only internal timing.
 	 */
