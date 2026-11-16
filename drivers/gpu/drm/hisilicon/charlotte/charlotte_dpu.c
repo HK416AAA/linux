@@ -170,6 +170,18 @@
  * layer data looks exactly like this colour.
  */
 #define DPP0_CLRBAR_CTRL (DPP0_OFFSET + 0x014)
+/* DACC global block (dmc_base, 0x40000): the core's fetch engine and its
+ * per-scene output routing.  WLT is the DDR table the RISC-V core walks, so
+ * WLT_EN=0 means it has nothing to fetch no matter how many frames the DSI
+ * generates.
+ */
+#define DACC_MON_LR 0x40018
+#define DACC_CTL_LDI_SEL0 0x4001c
+#define DACC_DBG_REG0 0x40038
+#define DACC_DBG_SEL 0x4003c
+#define DACC_CKG_EN 0x40048
+#define DACC_WLT_EN 0x40060
+#define DACC_WLT_SLICE0_ADDR0 0x40064
 /* Vendor get_dsc_out_width(): two slices of half the panel line plus the
  * four insert bytes each, mapped onto a 3x compressed 24bpp stream.
  */
@@ -519,8 +531,14 @@ static void charlotte_cmdlist_patch(struct charlotte_dpu *dpu, dma_addr_t addr,
 	dpu->cmdlist_item[DM_W_START_ADDR_L] = lower_32_bits(addr);
 	dpu->cmdlist_item[DM_W_STRIDE] = pitch;
 	dpu->cmdlist_item[DM_W_LAYER_HEIGHT] = ((HEIGHT - 1) << 16) | (WIDTH - 1);
-	dpu->cmdlist_item[DM_W_DMA_SEL] = (dpu->cmdlist_item[DM_W_DMA_SEL] & ~0xff00U) |
-		hw_format << 8;
+	/* layer_dma_sel packs mask_en:8 | dma_fmt:8 | fbc_type:8 | dma_sel:8.
+	 * A linear layer needs mask_en 0, fbc_type 0 and dma_sel BIT(0) for
+	 * SDMA0; vendor opr_set_sdma_layer_fmt() derives dma_sel the same way.
+	 * Inheriting the bootloader value left whichever bits it had, and a
+	 * non-zero mask_en with a degenerate mask rect silently drops every
+	 * pixel while the line syncs keep running.
+	 */
+	dpu->cmdlist_item[DM_W_DMA_SEL] = (1U << 24) | (hw_format << 8);
 	wmb();
 }
 
@@ -535,7 +553,7 @@ static void program_scanout(struct charlotte_dpu *dpu, dma_addr_t addr, u32 pitc
 	 * Firmware uses ABGR (13) for the logo; opaque DRM buffers map to the
 	 * matching SDMA format so 565/8888/RGB order stay correct.
 	 */
-	writel((dpu->boot_select & ~0xff00U) | hw_format << 8, dpu->regs + DM_LAYER_SELECT);
+	writel((1U << 24) | hw_format << 8, dpu->regs + DM_LAYER_SELECT);
 	writel((dpu->boot_ov_fmt & ~0xffU) | hw_format, dpu->regs + DM_LAYER_OV_FMT);
 	writel(upper_32_bits(addr) & 0xff, dpu->regs + DM_ADDRESS_H);
 	writel(lower_32_bits(addr), dpu->regs + DM_ADDRESS_L);
@@ -742,6 +760,21 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT),
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
 		readl(dpu->regs + DSC0_OFFSET + DSC0_ST_LINEBUF));
+	seq_printf(s, "layer0 size=%08x mask0=%08x mask1=%08x dmaselect=%08x sblk=%08x crop=%08x addr=%02x%08x stride=%u\n",
+		readl(dpu->regs + DM_LAYER_SIZE),
+		readl(dpu->regs + DM0 + 0x1a4),
+		readl(dpu->regs + DM0 + 0x1a8),
+		readl(dpu->regs + DM_LAYER_SELECT),
+		readl(dpu->regs + DM0 + 0x1b0),
+		readl(dpu->regs + DM_LAYER_OV_FMT),
+		readl(dpu->regs + DM_ADDRESS_H), readl(dpu->regs + DM_ADDRESS_L),
+		readl(dpu->regs + DM_STRIDE));
+	seq_printf(s, "dacc ctl ckg=%08x wlt=%08x wltaddr=%08x ldisel0=%08x monlr=%08x dbgsel=%08x dbg=%08x\n",
+		readl(dpu->regs + DACC_CKG_EN), readl(dpu->regs + DACC_WLT_EN),
+		readl(dpu->regs + DACC_WLT_SLICE0_ADDR0),
+		readl(dpu->regs + DACC_CTL_LDI_SEL0),
+		readl(dpu->regs + DACC_MON_LR), readl(dpu->regs + DACC_DBG_SEL),
+		readl(dpu->regs + DACC_DBG_REG0));
 	seq_printf(s, "ldi h2=%08x v2=%08x vact=%08x vfp=%08x dsc_out_w=%u\n",
 		readl(dpu->regs + DSI_LDI_DPI0_HRZ_CTRL2),
 		readl(dpu->regs + DSI_LDI_VRT_CTRL2),
@@ -1176,11 +1209,18 @@ static int charlotte_chain_kick(struct charlotte_dpu *dpu)
 
 static void charlotte_bypass_sample(struct charlotte_dpu *dpu, const char *stage)
 {
+	/* DPU_DSC_ST_DATAIN packs datain_line_cnt[12:0] and datain_pix_cnt[28:16],
+	 * DATAOUT packs dataout_line_cnt[12:0] and dataout_byte_cnt[31:16].
+	 * Print both halves: "19 lines, 0 pixels" means the sync reaches the DSC
+	 * while the layer contributes nothing, which a raw 0x13 hides.
+	 */
 	dev_info(dpu->drm.dev,
-		 "bypass: %-20s dsc_in=%04x out=%04x fifo=%05x dppcnt=%04x crc=%06x crcen=%u dppst=%08x clrbar=%08x itfst=%08x vstate=%08x\n",
+		 "bypass: %-20s in_lc=%u in_pc=%u out_lc=%u out_bc=%u fifo=%05x dppcnt=%04x crc=%06x crcen=%u dppst=%08x clrbar=%08x itfst=%08x vstate=%08x\n",
 		 stage,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN) & 0x1fff,
+		 (readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN) >> 16) & 0x1fff,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT) & 0x1fff,
+		 (readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT) >> 16) & 0xffff,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
 		 readl(dpu->regs + DPP0_CH_DBG_CNT) & 0xffff,
 		 readl(dpu->regs + DPP0_CRC_FRM_CNT),
