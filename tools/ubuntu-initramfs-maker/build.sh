@@ -57,8 +57,11 @@ apt-get install -y --no-install-recommends \
 	usbutils pciutils i2c-tools gpiod spi-tools \
 	ca-certificates curl wget e2fsprogs dosfstools fdisk parted \
 	f2fs-tools python3 strace lsof \
-	xserver-xorg-core xserver-xorg-video-fbdev xinit xauth xterm \
-	libgl1-mesa-dri dbus-x11 mesa-utils x11-xserver-utils \
+	xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput \
+	xinit xauth xterm \
+	libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libgbm1 \
+	dbus-x11 mesa-utils x11-xserver-utils \
+	fonts-dejavu-core xfonts-base adwaita-icon-theme \
 	xfce4 xfce4-terminal
 
 echo 'root:charlotte' | chpasswd
