@@ -338,6 +338,14 @@ struct charlotte_dpu {
 	u32 boot_h2, boot_v2, boot_vact;
 	u32 boot_dpp[5];
 	u32 boot_dm[3];
+	/* Handoff scanout.  The firmware sequencer keeps fetching the buffer
+	 * the descriptor points at, so a commit only has to copy pixels into
+	 * that buffer and no per-frame restart is needed.
+	 */
+	bool handoff;
+	void __iomem *hsink;
+	dma_addr_t hsink_addr;
+	u32 hsink_stride, hsink_w, hsink_h;
 	/* Pipeline counters taken before this driver writes anything, at probe
 	 * and again at KMS init.  Two samples tell whether the firmware's own
 	 * scanout was still producing pixels when we took over.
@@ -3001,6 +3009,95 @@ static const struct file_operations charlotte_pattern_fops = {
 	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_pattern_write,
 	.llseek = noop_llseek,
 };
+/* Decisive handoff test: paint the buffer the live descriptor points at and
+ * touch no DPU register.  If the panel responds, the firmware sequencer is
+ * still running and the only thing missing is the pixels.
+ */
+static ssize_t charlotte_fbpaint_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	static const u32 bars[6] = { 0xffffffff, 0xffffff00, 0xff00ffff,
+				     0xff00ff00, 0xffff00ff, 0xffff0000 };
+	u64 addr = ((u64)(readl(dpu->regs + DM_ADDRESS_H) & 0xff) << 32) |
+		readl(dpu->regs + DM_ADDRESS_L);
+	u32 stride = readl(dpu->regs + DM_STRIDE);
+	u32 size = readl(dpu->regs + DM_LAYER_SIZE);
+	u32 w = (size & 0x1fff) + 1;
+	u32 h = ((size >> 16) & 0x1fff) + 1;
+	void __iomem *fb;
+	u32 *row;
+	u32 x, y;
+	int mode, ret;
+
+	ret = kstrtoint_from_user(buf, len, 0, &mode);
+	if (ret)
+		return ret;
+	if (mode < 1 || mode > 3)
+		return -EINVAL;
+	if (!addr || !stride || !h || h > 4096 || stride < w * 4U)
+		return -EINVAL;
+	fb = ioremap_wc((phys_addr_t)addr, (size_t)stride * h);
+	if (!fb)
+		return -ENOMEM;
+	row = kmalloc((size_t)w * 4U, GFP_KERNEL);
+	if (!row) {
+		iounmap(fb);
+		return -ENOMEM;
+	}
+	for (y = 0; y < h; y++) {
+		for (x = 0; x < w; x++) {
+			if (mode == 1)
+				row[x] = bars[x * 6U / w];
+			else
+				row[x] = (mode == 2) ? 0xffffffff : 0;
+		}
+		memcpy_toio((u8 __iomem *)fb + (size_t)y * stride, row, (size_t)w * 4U);
+	}
+	dev_info(dpu->dev, "fbpaint mode=%d %llx stride=%u %ux%u\n", mode,
+		 (unsigned long long)addr, stride, w, h);
+	kfree(row);
+	iounmap(fb);
+	return len;
+}
+static const struct file_operations charlotte_fbpaint_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = charlotte_fbpaint_write,
+	.llseek = noop_llseek,
+};
+static ssize_t charlotte_handoff_write(struct file *file, const char __user *buf,
+	size_t len, loff_t *pos)
+{
+	struct charlotte_dpu *dpu = file->private_data;
+	unsigned long flags;
+	unsigned value;
+	int ret = kstrtouint_from_user(buf, len, 0, &value);
+
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&dpu->lock, flags);
+	dpu->handoff = value != 0;
+	spin_unlock_irqrestore(&dpu->lock, flags);
+	dev_info(dpu->dev, "handoff=%u\n", dpu->handoff);
+	return len;
+}
+static int charlotte_handoff_show(struct seq_file *s, void *unused)
+{
+	struct charlotte_dpu *dpu = s->private;
+
+	seq_printf(s, "handoff=%u sink=%px addr=%llx stride=%u %ux%u\n",
+		   dpu->handoff, dpu->hsink, (unsigned long long)dpu->hsink_addr,
+		   dpu->hsink_stride, dpu->hsink_w, dpu->hsink_h);
+	return 0;
+}
+static int charlotte_handoff_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, charlotte_handoff_show, inode->i_private);
+}
+static const struct file_operations charlotte_handoff_fops = {
+	.owner = THIS_MODULE, .open = charlotte_handoff_open,
+	.write = charlotte_handoff_write, .read = seq_read,
+	.llseek = seq_lseek, .release = single_release,
+};
 
 static const struct drm_display_mode charlotte_mode = {
 	.clock = WIDTH * HEIGHT * 60 / 1000,
@@ -3086,6 +3183,42 @@ static void charlotte_retire_work(struct work_struct *work)
 	if (fb)
 		drm_framebuffer_put(fb);
 }
+/* Copy the plane buffer into whichever buffer the live descriptor points at.
+ * The firmware sequencer re-reads that buffer on every frame, so this is the
+ * whole commit: one row-wise copy, no descriptor, no chain restart.
+ */
+static void charlotte_handoff_blit(struct charlotte_dpu *dpu, struct drm_framebuffer *fb)
+{
+	struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, 0);
+	u64 addr = ((u64)(readl(dpu->regs + DM_ADDRESS_H) & 0xff) << 32) |
+		readl(dpu->regs + DM_ADDRESS_L);
+	u32 stride = readl(dpu->regs + DM_STRIDE);
+	u32 size = readl(dpu->regs + DM_LAYER_SIZE);
+	u32 w = (size & 0x1fff) + 1;
+	u32 h = ((size >> 16) & 0x1fff) + 1;
+	u32 bytes, rows, y;
+
+	if (!obj || !obj->vaddr || !addr || !stride || !h)
+		return;
+	if (dpu->hsink && (dpu->hsink_addr != addr || dpu->hsink_stride != stride)) {
+		iounmap(dpu->hsink);
+		dpu->hsink = NULL;
+	}
+	if (!dpu->hsink) {
+		dpu->hsink = ioremap_wc((phys_addr_t)addr, (size_t)stride * h);
+		if (!dpu->hsink)
+			return;
+		dpu->hsink_addr = addr;
+		dpu->hsink_stride = stride;
+		dpu->hsink_w = w;
+		dpu->hsink_h = h;
+	}
+	bytes = min3(stride, fb->pitches[0], dpu->hsink_w * 4U);
+	rows = min(fb->height, dpu->hsink_h);
+	for (y = 0; y < rows; y++)
+		memcpy_toio((u8 __iomem *)dpu->hsink + (size_t)y * dpu->hsink_stride,
+			(const u8 *)obj->vaddr + (size_t)y * fb->pitches[0], bytes);
+}
 static void charlotte_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit *state)
 {
 	struct charlotte_dpu *dpu = crtc_to_dpu(crtc);
@@ -3101,12 +3234,22 @@ static void charlotte_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 	 */
 	flush_work(&dpu->retire_work);
 	drm_framebuffer_get(plane->fb);
+	/* Outside the locks: this is a full-frame copy. */
+	if (dpu->handoff)
+		charlotte_handoff_blit(dpu, plane->fb);
 	spin_lock_irqsave(&dpu->drm.event_lock, flags);
 	spin_lock(&dpu->lock);
 	dpu->pending_fb = plane->fb;
 	reinit_completion(&dpu->flip_done);
-	queue_scanout(dpu, drm_fb_dma_get_gem_addr(plane->fb, plane, 0),
-		plane->fb->pitches[0], plane->fb->format->format);
+	if (dpu->handoff) {
+		/* The firmware picks the buffer up on its own next frame. */
+		dpu->pending = false;
+		dpu->latched = true;
+		dpu->flips++;
+	} else {
+		queue_scanout(dpu, drm_fb_dma_get_gem_addr(plane->fb, plane, 0),
+			plane->fb->pitches[0], plane->fb->format->format);
+	}
 	if (new_crtc->event) {
 		dpu->event_ref = drm_crtc_vblank_get(crtc) == 0;
 		dpu->event = new_crtc->event;
@@ -3119,6 +3262,18 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 {
 	struct charlotte_dpu *dpu = crtc_to_dpu(crtc);
 
+	if (dpu->handoff) {
+		/* The firmware owns the chain in this mode: every register write
+		 * below would either be dropped or restart a pipeline that is
+		 * already feeding the panel.  Only the panel window and the
+		 * backlight are ours.
+		 */
+		if (charlotte_dcs_region(dpu, 0, WIDTH - 1, 0, HEIGHT - 1))
+			dev_warn(dpu->dev, "panel window update failed; keeping firmware region\n");
+		drm_crtc_vblank_on(crtc);
+		charlotte_backlight_power(dpu, true);
+		return;
+	}
 	/* Loading the DACC scene is a BL31/firmware handshake, so it stays out
 	 * of the default enable path: the firmware sequencer that the
 	 * bootloader started keeps running unless userspace asks for a reload
@@ -3163,6 +3318,21 @@ static void charlotte_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_comm
 	struct drm_crtc_state *new_crtc = drm_atomic_get_new_crtc_state(state, crtc);
 	unsigned long flags;
 	flush_work(&dpu->retire_work);
+	if (dpu->handoff) {
+		/* Leave the descriptor alone: it is the buffer the firmware
+		 * sequencer keeps fetching, and re-pointing it here would only
+		 * blank the panel until the next enable restores the address.
+		 */
+		charlotte_backlight_power(dpu, false);
+		drm_crtc_vblank_off(crtc);
+		if (new_crtc->event) {
+			spin_lock_irqsave(&dpu->drm.event_lock, flags);
+			drm_crtc_send_vblank_event(crtc, new_crtc->event);
+			new_crtc->event = NULL;
+			spin_unlock_irqrestore(&dpu->drm.event_lock, flags);
+		}
+		return;
+	}
 	spin_lock_irqsave(&dpu->lock, flags);
 	reinit_completion(&dpu->flip_done);
 	/* DPMS-off must not reveal the firmware framebuffer/boot console.
@@ -3472,6 +3642,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	 */
 	debugfs_create_file("irq_test", 0200, dpu->debugfs, dpu, &charlotte_irq_fops);
 	debugfs_create_file("pattern_test", 0200, dpu->debugfs, dpu, &charlotte_pattern_fops);
+	debugfs_create_file("fbpaint", 0200, dpu->debugfs, dpu, &charlotte_fbpaint_fops);
+	debugfs_create_file("handoff", 0600, dpu->debugfs, dpu, &charlotte_handoff_fops);
 	debugfs_create_file("takeover", 0200, dpu->debugfs, dpu, &charlotte_takeover_fops);
 	debugfs_create_file("daccload", 0200, dpu->debugfs, dpu,
 		&charlotte_daccload_fops);
