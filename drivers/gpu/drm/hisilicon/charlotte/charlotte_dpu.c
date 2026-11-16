@@ -158,12 +158,18 @@
 #define DSC0_OFFSET 0xd4000
 #define ITF0_OFFSET 0xcc000
 #define PIPE_SW_OFFSET 0xcc400
-/* Per-frame transport and output counters: the only two registers that prove
- * the DPP read a layer instead of just holding the previous frame in its
- * line buffer.
+/* Per-frame transport and output counters.  DPU_DPP_CRC_FRM_CNT (0x34) only
+ * advances while DPU_DPP_CRC_CFG_EN (0x30 bit0) is set, so it is the one
+ * register that proves the DPP actually walked a frame instead of holding the
+ * bootloader picture in its line buffer.
  */
 #define DPP0_CH_DBG_CNT (DPP0_OFFSET + 0x02c)
+#define DPP0_CRC_CFG_EN (DPP0_OFFSET + 0x030)
 #define DPP0_CRC_FRM_CNT (DPP0_OFFSET + 0x034)
+/* Backdrop painted when no layer covers a pixel; a uniform panel with no
+ * layer data looks exactly like this colour.
+ */
+#define DPP0_CLRBAR_CTRL (DPP0_OFFSET + 0x014)
 /* Vendor get_dsc_out_width(): two slices of half the panel line plus the
  * four insert bytes each, mapped onto a 3x compressed 24bpp stream.
  */
@@ -1171,13 +1177,16 @@ static int charlotte_chain_kick(struct charlotte_dpu *dpu)
 static void charlotte_bypass_sample(struct charlotte_dpu *dpu, const char *stage)
 {
 	dev_info(dpu->drm.dev,
-		 "bypass: %-20s dsc_in=%04x out=%04x fifo=%05x dppcnt=%04x crc=%06x itfst=%08x vstate=%08x\n",
+		 "bypass: %-20s dsc_in=%04x out=%04x fifo=%05x dppcnt=%04x crc=%06x crcen=%u dppst=%08x clrbar=%08x itfst=%08x vstate=%08x\n",
 		 stage,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAIN) & 0x1fff,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_DATAOUT) & 0x1fff,
 		 readl(dpu->regs + DSC0_OFFSET + DSC0_ST_FIFO),
 		 readl(dpu->regs + DPP0_CH_DBG_CNT) & 0xffff,
 		 readl(dpu->regs + DPP0_CRC_FRM_CNT),
+		 readl(dpu->regs + DPP0_CRC_CFG_EN) & 1,
+		 readl(dpu->regs + DPP0_OFFSET + 0x068),
+		 readl(dpu->regs + DPP0_CLRBAR_CTRL),
 		 readl(dpu->regs + ITF0_OFFSET + ITF0_STATE),
 		 readl(dpu->regs + DSI_VSTATE));
 }
@@ -1193,6 +1202,12 @@ static int charlotte_bypass_run(struct charlotte_dpu *dpu, bool push_frames)
 	unsigned int i;
 	int ret;
 
+	/* Arm the DPP frame counter first: without CRC_CFG_EN the counter stays
+	 * at zero no matter how many frames the DPP walks, which is exactly the
+	 * ambiguity that made the previous run unreadable.
+	 */
+	writel(readl(dpu->regs + DPP0_CRC_CFG_EN) | BIT(0),
+	       dpu->regs + DPP0_CRC_CFG_EN);
 	charlotte_cmdlist_release(dpu);
 	ret = charlotte_cmdlist_start(dpu);
 	if (ret)
@@ -2297,8 +2312,11 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 	 * expanding VFP only (lane clock and PHY stay untouched).  3 = video
 	 * plus the full DACC-free frame push, 4 = video plus a single latch so
 	 * 3 and 4 together answer whether the DPP needs a per-frame commit.
+	 * 5/6 repeat 4/3 after loading the real DACC firmware through FF-A:
+	 * the core is the only consumer of the DM block, so if the frame
+	 * counters wake up only in 5/6 the missing piece is the dispatcher.
 	 */
-	if (value > 4)
+	if (value > 6)
 		return -EINVAL;
 	cancel_delayed_work_sync(&dpu->irq_stop_work);
 	mutex_lock(&dpu->diagnostic_lock);
@@ -2484,11 +2502,18 @@ static ssize_t charlotte_videomode_write(struct file *file, const char __user *b
 		 * per-frame commit in video mode.
 		 */
 		if (value >= 3) {
-			int bypass_ret = charlotte_bypass_run(dpu, value == 3);
+			bool push = (value == 3 || value == 6);
+			int bypass_ret;
 
-			dev_info(dpu->drm.dev, "video: bypass(%s) ret=%d\n",
-				 value == 3 ? "frame push" : "single latch",
-				 bypass_ret);
+			if (value >= 5)
+				charlotte_dacc_ffa_load(dpu);
+			bypass_ret = charlotte_bypass_run(dpu, push);
+			dev_info(dpu->drm.dev,
+				 "video: bypass(%s%s) ret=%d monpc=%08x dacc_int=%08x\n",
+				 value >= 5 ? "dacc-loaded " : "",
+				 push ? "frame push" : "single latch", bypass_ret,
+				 readl(dpu->regs + DACC_MONPC),
+				 readl(dpu->regs + DACC_CTRL));
 		}
 	} else if (value && dpu->video_active) {
 		dev_info(dpu->drm.dev,
