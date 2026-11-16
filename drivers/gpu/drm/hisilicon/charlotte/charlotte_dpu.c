@@ -222,6 +222,13 @@ static bool strict_handoff;
 module_param(strict_handoff, bool, 0444);
 MODULE_PARM_DESC(strict_handoff, "Refuse to take over when the firmware register signature differs from the TGR one");
 
+/* One coherent snapshot of the DPP0->DSC0->ITF0->DSI pipeline counters. */
+struct charlotte_diag_sample {
+	u32 itf_size, itf_state, dsc_in, dsc_out, dsc_fifo, dsc_lb;
+	u32 ldi_h2, ldi_v2, vstate, pld_st;
+	u64 frames, te;
+};
+
 struct charlotte_dpu {
 	struct drm_device drm;
 	struct device *dev;
@@ -265,6 +272,11 @@ struct charlotte_dpu {
 	u32 boot_h2, boot_v2, boot_vact;
 	u32 boot_dpp[5];
 	u32 boot_dm[3];
+	/* Pipeline counters taken before this driver writes anything, at probe
+	 * and again at KMS init.  Two samples tell whether the firmware's own
+	 * scanout was still producing pixels when we took over.
+	 */
+	struct charlotte_diag_sample boot_pipe, pre_kms_pipe;
 	u32 *dm_backup;
 	void *cmdlist_buf;
 	dma_addr_t cmdlist_dma;
@@ -299,6 +311,7 @@ struct charlotte_dpu {
 	u32 online_snap_val[CHARLOTTE_ONLINE_SNAP_MAX];
 };
 static const struct drm_driver charlotte_drm_driver;
+static int charlotte_dm_snapshot(struct charlotte_dpu *dpu);
 static struct charlotte_dpu *crtc_to_dpu(struct drm_crtc *crtc)
 { return container_of(crtc, struct charlotte_dpu, crtc); }
 static int charlotte_kms_init(struct charlotte_dpu *dpu);
@@ -633,6 +646,16 @@ static int charlotte_status_show(struct seq_file *s, void *unused)
 		dpu->boot_dpp[3], dpu->boot_dpp[4]);
 	seq_printf(s, "boot_dm num=%08x scene=%08x ovwidth=%08x\n",
 		dpu->boot_dm[0], dpu->boot_dm[1], dpu->boot_dm[2]);
+	seq_printf(s, "boot_pipe itf=%08x st=%08x dscin=%08x dscout=%08x fifo=%08x lb=%08x vstate=%08x pld=%08x\n",
+		dpu->boot_pipe.itf_size, dpu->boot_pipe.itf_state,
+		dpu->boot_pipe.dsc_in, dpu->boot_pipe.dsc_out,
+		dpu->boot_pipe.dsc_fifo, dpu->boot_pipe.dsc_lb,
+		dpu->boot_pipe.vstate, dpu->boot_pipe.pld_st);
+	seq_printf(s, "pre_kms itf=%08x st=%08x dscin=%08x dscout=%08x fifo=%08x lb=%08x vstate=%08x pld=%08x\n",
+		dpu->pre_kms_pipe.itf_size, dpu->pre_kms_pipe.itf_state,
+		dpu->pre_kms_pipe.dsc_in, dpu->pre_kms_pipe.dsc_out,
+		dpu->pre_kms_pipe.dsc_fifo, dpu->pre_kms_pipe.dsc_lb,
+		dpu->pre_kms_pipe.vstate, dpu->pre_kms_pipe.pld_st);
 	seq_printf(s, "dsc pic=%08x slice=%08x chunk=%08x out=%08x\n",
 		readl(dpu->regs + DSC0_OFFSET + 0x010),
 		readl(dpu->regs + DSC0_OFFSET + 0x014),
@@ -814,14 +837,21 @@ static int charlotte_cmdlist_start(struct charlotte_dpu *dpu)
 
 	if (dpu->cmdlist_buf)
 		return -EBUSY;
+	if (charlotte_dm_snapshot(dpu))
+		return -ENOMEM;
 	dpu->cmdlist_buf = dma_alloc_coherent(dev, size, &dpu->cmdlist_dma, GFP_KERNEL);
 	if (!dpu->cmdlist_buf)
 		return -ENOMEM;
 	memset(dpu->cmdlist_buf, 0, size);
 	item = (u32 *)((u8 *)dpu->cmdlist_buf + CMDLIST_HDR_SIZE);
 	dpu->cmdlist_item = item;
-	for (i = 0; i < DM_PARAM_SIZE / 4; i++)
-		item[i] = readl(dpu->regs + DM0 + i * 4);
+	/*
+	 * Build the payload from the pristine probe-time image.  Re-reading the
+	 * live window would fold in every later register poke, and the whole
+	 * point of the transport is to feed the sequencer the descriptor the
+	 * firmware itself validated.
+	 */
+	memcpy(item, dpu->dm_backup, DM_PARAM_SIZE);
 	/* Self-linked DM node: cmdlist_h_addr and cmdlist_addr0 (DM0 + 0/4). */
 	item[0] = upper_32_bits(dpu->cmdlist_dma);
 	item[1] = lower_32_bits(dpu->cmdlist_dma);
@@ -1250,12 +1280,6 @@ static int charlotte_dm_restore(struct charlotte_dpu *dpu)
 	return 0;
 }
 
-struct charlotte_diag_sample {
-	u32 itf_size, itf_state, dsc_in, dsc_out, dsc_fifo, dsc_lb;
-	u32 ldi_h2, ldi_v2, vstate, pld_st;
-	u64 frames, te;
-};
-
 /* DSC_ST_DATAIN/OUT are 13-bit counters, so deltas only make sense modulo
  * that width; frame and TE counts are the authoritative "did it advance".
  */
@@ -1492,6 +1516,28 @@ static int charlotte_dmparam_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(charlotte_dmparam);
+
+/* The probe-time descriptor, captured before this driver wrote anything.
+ * Comparing it with "dmparam" shows whether readback is faithful and what
+ * the firmware's working image actually looked like.
+ */
+static int charlotte_dmsnap_show(struct seq_file *s, void *unused)
+{
+	struct charlotte_dpu *dpu = s->private;
+	const u32 *img = dpu->dm_backup;
+	unsigned int i;
+
+	if (!img)
+		return -ENODATA;
+	seq_printf(s, "dpu_dm_param probe snapshot %06x..%06x (%u bytes)\n", DM0,
+		   DM0 + DM_PARAM_SIZE, DM_PARAM_SIZE);
+	for (i = 0; i < DM_PARAM_SIZE / 16; i++)
+		seq_printf(s, "%06x: %08x %08x %08x %08x\n", DM0 + i * 16,
+			   img[i * 4 + 0], img[i * 4 + 1], img[i * 4 + 2],
+			   img[i * 4 + 3]);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(charlotte_dmsnap);
 
 static ssize_t charlotte_selftest_write(struct file *file,
 	const char __user *buf, size_t len, loff_t *pos)
@@ -2653,6 +2699,10 @@ static int charlotte_kms_init(struct charlotte_dpu *dpu)
 	};
 	static const u64 modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 	int ret;
+	/* Second look at the handed-over pipeline, now that probe has finished
+	 * but before KMS programs anything.
+	 */
+	charlotte_diag_sample(dpu, &dpu->pre_kms_pipe);
 	ret = charlotte_backlight_init(dpu);
 	if (ret)
 		dev_warn(drm->dev, "backlight unavailable (%d), continuing without brightness control\n",
@@ -2813,6 +2863,8 @@ static int charlotte_probe(struct platform_device *pdev)
 	dpu->boot_dm[0] = readl(dpu->regs + DM0 + 0x58);
 	dpu->boot_dm[1] = readl(dpu->regs + DM0 + 0x5c);
 	dpu->boot_dm[2] = readl(dpu->regs + DM0 + 0x60);
+	/* Still untouched by this driver: the firmware's own pipeline state. */
+	charlotte_diag_sample(dpu, &dpu->boot_pipe);
 	spin_lock_init(&dpu->lock);
 	mutex_init(&dpu->diagnostic_lock);
 	mutex_init(&dpu->dcs_lock);
@@ -2862,6 +2914,8 @@ static int charlotte_probe(struct platform_device *pdev)
 		&charlotte_window_fops);
 	debugfs_create_file("dmparam", 0400, dpu->debugfs, dpu,
 		&charlotte_dmparam_fops);
+	debugfs_create_file("dmsnap", 0400, dpu->debugfs, dpu,
+			    &charlotte_dmsnap_fops);
 	debugfs_create_file("selftest", 0200, dpu->debugfs, dpu,
 		&charlotte_selftest_fops);
 	/* Diagnostics that reprogram the pipeline stay available as well: the
