@@ -2490,12 +2490,11 @@ static void charlotte_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 {
 	struct charlotte_dpu *dpu = crtc_to_dpu(crtc);
 
-	/* The DACC sequencer applies the DM descriptor to the active scene at
-	 * every frame start. Without asking BL31 to load it the core stays
-	 * parked in WFI, the bootloader descriptor keeps being scanned and the
-	 * panel never shows the buffer this driver latches.
+	/* Loading the DACC scene is a BL31/firmware handshake, so it stays out
+	 * of the default enable path: the firmware sequencer that the
+	 * bootloader started keeps running unless userspace asks for a reload
+	 * through the "daccload" (SMC) or "daccffa" (secure partition) node.
 	 */
-	charlotte_dacc_load(dpu);
 	/* Take the handoff chain out of the bootloader freeze and route it to
 	 * the panel; without this every commit and flush is silently dropped.
 	 */
