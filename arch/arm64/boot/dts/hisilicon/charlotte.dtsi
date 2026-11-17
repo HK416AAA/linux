@@ -214,7 +214,8 @@
 			#size-cells = <0>;
 
 			main_pmic: reboot@9 {
-				compatible = "hisilicon,charlotte-reboot";
+				compatible = "hisilicon,charlotte-pmic",
+					     "hisilicon,charlotte-reboot";
 				reg = <9 SPMI_USID>;
 				mode-normal = <0x10>;
 				mode-bootloader = <0x01>;
