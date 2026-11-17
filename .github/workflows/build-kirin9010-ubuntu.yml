@@ -52,16 +52,16 @@ jobs:
           sudo systemctl restart systemd-binfmt || true
           ls /proc/sys/fs/binfmt_misc/ || true
 
-      - name: Build kernel and modules
+      - name: Resolve kernel release
         run: |
           cd kernel-src
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- charlotte_mro_defconfig
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs modules
           echo "KERNEL_RELEASE=$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)" >> "$GITHUB_ENV"
 
       - name: Build Ubuntu initramfs
         run: |
           sudo -E env \
+            SKIP_MODULES=1 \
             KERNEL_SRC="$PWD/kernel-src" \
             KERNEL_RELEASE="$KERNEL_RELEASE" \
             ARCH=arm64 \
@@ -87,28 +87,10 @@ jobs:
             --ramdisk out/charlotte-rescue.cpio.gz \
             --out out/charlotte-ramdisk.img
 
-      - name: Embed device tree into Image
-        run: |
-          mkdir -p out
-          python3 tools/charlotte/embed_dtb.py \
-            --image kernel-src/arch/arm64/boot/Image \
-            --dtb kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb \
-            --out out/Image-7.3-mro-w00-dtb > out/Image-7.3-mro-w00-dtb.info.txt
-          cat out/Image-7.3-mro-w00-dtb.info.txt
-          python3 tools/charlotte/embed_dtb.py \
-            --image kernel-src/arch/arm64/boot/Image \
-            --dtb kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb \
-            --out out/Image-7.3-tgr-w00-dtb > out/Image-7.3-tgr-w00-dtb.info.txt
-          cat out/Image-7.3-tgr-w00-dtb.info.txt
-
       - name: Collect artifacts
         run: |
           mkdir -p out
-          cp kernel-src/arch/arm64/boot/Image out/Image-7.3-mro-w00
-          cp kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb out/
-          cp kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb out/
-          cp kernel-src/System.map "out/System.map-$KERNEL_RELEASE"
-          cp kernel-src/.config out/config-mro-w00
+          ls -l out
           cp tools/ubuntu-initramfs-maker/out/* out/
           (cd out && sha256sum * > SHA256SUMS.txt && ls -l)
 

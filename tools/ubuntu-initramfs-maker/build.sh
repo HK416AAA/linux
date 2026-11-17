@@ -455,10 +455,16 @@ CHROOT
 #    execute on this platform yet (fuse_init faults with an instruction
 #    abort), so the rootfs stays free of /lib/modules and systemd never
 #    triggers modprobe.  The tarball remains available for later work.
-MODTREE=$WORK/modules-tree
-make -C "$KERNEL_SRC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-	INSTALL_MOD_PATH="$MODTREE" modules_install
-depmod -b "$MODTREE" "$KERNEL_RELEASE"
+#    The kernel branch publishes its own module tarball, so the userspace
+#    build can skip that step entirely with SKIP_MODULES=1.
+if [ "${SKIP_MODULES:-0}" = "1" ]; then
+	echo "skipping module tree, the kernel branch owns it"
+else
+	MODTREE=$WORK/modules-tree
+	make -C "$KERNEL_SRC" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+		INSTALL_MOD_PATH="$MODTREE" modules_install
+	depmod -b "$MODTREE" "$KERNEL_RELEASE"
+fi
 if [ -e "$ROOTFS/lib/modules" ]; then
 	echo "rootfs must not contain /lib/modules" >&2
 	exit 1
@@ -495,10 +501,18 @@ ln -sf ../charlotte-mouse.service \
 	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-mouse.service"
 
 # 5. Publish the initramfs and a standalone module tree.
-tar -C "$MODTREE/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
+if [ "${SKIP_MODULES:-0}" != "1" ]; then
+	tar -C "$MODTREE/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
+fi
 (cd "$ROOTFS" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "$OUT/$IMAGE_NAME.cpio.gz"
 
-echo "modules : $OUT/modules-$KERNEL_RELEASE.tar.gz"
+if [ "${SKIP_MODULES:-0}" != "1" ]; then
+	echo "modules : $OUT/modules-$KERNEL_RELEASE.tar.gz"
+fi
 echo "initramfs: $OUT/$IMAGE_NAME.cpio.gz"
 ls -l "$OUT"
-sha256sum "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$OUT/$IMAGE_NAME.cpio.gz"
+if [ "${SKIP_MODULES:-0}" = "1" ]; then
+	sha256sum "$OUT/$IMAGE_NAME.cpio.gz"
+else
+	sha256sum "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$OUT/$IMAGE_NAME.cpio.gz"
+fi
