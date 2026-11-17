@@ -61,9 +61,10 @@ apt-get install -y --no-install-recommends \
 	xinit xauth xterm \
 	libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libgbm1 \
 	dbus-x11 mesa-utils x11-xserver-utils \
-	fonts-dejavu-core xfonts-base adwaita-icon-theme \
+	fonts-dejavu-core fonts-noto-cjk xfonts-base adwaita-icon-theme \
 	network-manager network-manager-gnome wpasupplicant \
 	scrot x11-apps xdotool \
+	netsurf-gtk \
 	xfce4 xfce4-terminal
 
 # GNOME is the default session; XFCE stays installed as the fallback.
