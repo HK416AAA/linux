@@ -7,9 +7,12 @@ thp transport tells us whether the chip woke up.  A rail counts as the
 touch supply when the controller pulls its IRQ line after the rail is
 switched on.
 
-Usage: touch-power-sweep [--dry-run] [--pass2]
+Usage: touch-power-sweep [--dry-run]
   --dry-run  only list rails and their current state
-  --pass2    also try explicit voltage selects when the plain sweep fails
+
+Voltage selects are never touched: writing a lower vsel to a rail that
+feeds the SoC itself takes the SPMI bus down.  The rails are already
+switched on by the bootloader, so this only reports what is live.
 """
 
 import fcntl
@@ -29,19 +32,8 @@ TMO = (1 << 30) | (4 << 16) | (THP_TYPE << 8) | 3
 GET = (3 << 30) | (24 << 16) | (THP_TYPE << 8) | 1
 IRQG = (1 << 30) | (4 << 16) | (THP_TYPE << 8) | 10
 
-# Likely candidates first, then the rest; voltage selects per rail name
-# follow the tables in drivers/regulator/hi6421v600-regulator.c.
+# Likely candidates first, then the rest.
 ORDER = ["ldo16", "ldo17", "ldo15", "ldo9", "ldo33", "ldo34", "ldo3", "ldo4"]
-VSELS = {
-    "ldo3": [8],
-    "ldo4": [3],
-    "ldo9": [1, 7],
-    "ldo15": [0, 7],
-    "ldo16": [0, 7],
-    "ldo17": [3, 7],
-    "ldo33": [3, 7],
-    "ldo34": [2, 7],
-}
 
 
 def debugfs_write(name, text):
@@ -101,16 +93,20 @@ def thp_probe():
 
 
 def restore(rails, snapshot):
-    for name, rail in rails.items():
+    for name, rail in read_rails().items():
         orig = snapshot[name]
-        debugfs_write("ldo", "%d %d %d\n" % (rail["idx"], orig["en"],
-                                             orig["vsel"]))
-    print("restored the bootloader state")
+        if rail["en"] == orig["en"] and rail["vsel"] == orig["vsel"]:
+            continue
+        try:
+            debugfs_write("ldo", "%d %d %d\n" % (rail["idx"], orig["en"],
+                                                  orig["vsel"]))
+        except OSError as err:
+            print("restore %s failed: %s" % (name, err.strerror), flush=True)
+    print("restored the bootloader state", flush=True)
 
 
 def main():
     dry = "--dry-run" in sys.argv
-    pass2 = "--pass2" in sys.argv
 
     for step in ("/sys/kernel/debug", DBG):
         if not os.path.isdir(step):
@@ -128,7 +124,7 @@ def main():
                        else 99):
         r = rails[name]
         print("  %d %-6s en=%02x vsel=%02x" % (r["idx"], name, r["en"],
-                                               r["vsel"]))
+                                               r["vsel"]), flush=True)
     if dry:
         return 0
 
@@ -136,32 +132,21 @@ def main():
                                                 if n not in ORDER]
     found = []
 
-    print("pass 1: enable each rail at its bootloader voltage")
+    print("pass: probe each rail at its current voltage", flush=True)
     for name in order:
         r = rails[name]
-        debugfs_write("ldo", "%d 1\n" % r["idx"])
+        try:
+            debugfs_write("ldo", "%d 1\n" % r["idx"])
+        except OSError as err:
+            print("  %-6s -> write refused: %s (load charlotte_pmic with "
+                  "allow_writes=1)" % (name, err.strerror), flush=True)
+            return 2
         time.sleep(0.05)
         ok, detail = thp_probe()
-        print("  %-6s -> %s %s" % (name, "AWAKE" if ok else "silent", detail))
+        print("  %-6s -> %s %s" % (name, "AWAKE" if ok else "silent", detail),
+              flush=True)
         if ok:
             found.append(name)
-            break
-
-    if not found and pass2:
-        print("pass 2: sweep voltage selects on every rail")
-        for name in order:
-            r = rails[name]
-            for vsel in VSELS.get(name, [r["vsel"]]):
-                debugfs_write("ldo", "%d 1 %d\n" % (r["idx"], vsel))
-                time.sleep(0.05)
-                ok, detail = thp_probe()
-                print("  %-6s vsel=%02x -> %s %s"
-                      % (name, vsel, "AWAKE" if ok else "silent", detail))
-                if ok:
-                    found.append(name)
-                    break
-            if found:
-                break
 
     if not found:
         print("\nnothing woke the controller; unclaimed GPIO candidates:")
