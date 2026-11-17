@@ -63,8 +63,9 @@ jobs:
         run: |
           mkdir -p out
           MODTREE="$(mktemp -d)"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            INSTALL_MOD_PATH="$MODTREE" -j"$(nproc)" modules_install
+            INSTALL_MOD_PATH="$MODTREE" modules_install
           tar -C "$MODTREE/lib/modules" -czf \
             "out/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
 
