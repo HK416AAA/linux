@@ -651,13 +651,3 @@ config CHARLOTTE_PID1MON
 	  the pstore console.  Bring-up only; remove after the boot is
 	  proven.
 
-
-config CHARLOTTE_PMIC
-	bool "Kirin 9010 (charlotte) PMIC raw register helper"
-	depends on ARCH_HISI && SPMI
-	help
-	  The published charlotte tree ships the SPMI controller but no PMIC
-	  regulator or reboot driver, so nothing can switch on rails that the
-	  bootloader leaves off.  This helper dumps the PMIC register file at
-	  probe time and exposes raw read/write plus LDO enable controls in
-	  debugfs.  Bring-up only.

@@ -78,4 +78,3 @@ obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_INTEL_SSEI)	+= issei/
 
 obj-$(CONFIG_CHARLOTTE_BBOXLOG) += charlotte-cpu-diag.o
-obj-$(CONFIG_CHARLOTTE_PMIC)	+= charlotte-pmic.o
