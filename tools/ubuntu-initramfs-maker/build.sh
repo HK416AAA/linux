@@ -481,6 +481,7 @@ install -D -m 0644 "$HERE/firmware/cfg_mro_w00_vb.ini" \
 #     Ethernet link by feeding /dev/uinput, so no USB HID role swap is
 #     needed on this board.
 install -D -m 0755 "$HERE/mouse-bridge.py" "$ROOTFS/usr/local/bin/mouse-bridge"
+install -D -m 0755 "$HERE/touch-power-sweep.py" "$ROOTFS/usr/local/bin/touch-power-sweep"
 install -D -m 0644 /dev/stdin "$ROOTFS/etc/systemd/system/charlotte-mouse.service" <<'UNIT'
 [Unit]
 Description=Phone-to-tablet virtual mouse bridge
