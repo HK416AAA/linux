@@ -471,6 +471,29 @@ install -D -m 0644 "$HERE/firmware/cfg_mro_w00_va.ini" \
 install -D -m 0644 "$HERE/firmware/cfg_mro_w00_vb.ini" \
 	"$ROOTFS/lib/firmware/hi11xx/cfg_mro_w00_vb.ini"
 
+# 4c. Virtual mouse bridge: the phone drives the X cursor over the USB
+#     Ethernet link by feeding /dev/uinput, so no USB HID role swap is
+#     needed on this board.
+install -D -m 0755 "$HERE/mouse-bridge.py" "$ROOTFS/usr/local/bin/mouse-bridge"
+install -D -m 0644 /dev/stdin "$ROOTFS/etc/systemd/system/charlotte-mouse.service" <<'UNIT'
+[Unit]
+Description=Phone-to-tablet virtual mouse bridge
+After=systemd-udevd.service
+Before=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/mouse-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+ln -sf ../charlotte-mouse.service \
+	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-mouse.service"
+
 # 5. Publish the initramfs and a standalone module tree.
 tar -C "$MODTREE/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
 (cd "$ROOTFS" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "$OUT/$IMAGE_NAME.cpio.gz"
