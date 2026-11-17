@@ -63,13 +63,14 @@ apt-get install -y --no-install-recommends \
 	dbus-x11 mesa-utils x11-xserver-utils \
 	fonts-dejavu-core xfonts-base adwaita-icon-theme \
 	network-manager network-manager-gnome wpasupplicant \
+	scrot x11-apps xdotool \
 	xfce4 xfce4-terminal
 
 # GNOME is the default session; XFCE stays installed as the fallback.
 apt-get install -y \
 	gnome-session gnome-shell gnome-settings-daemon \
 	gnome-terminal nautilus gnome-control-center \
-	xdg-desktop-portal-gnome
+	xdg-desktop-portal-gnome libglib2.0-bin dconf-cli
 
 echo 'root:charlotte' | chpasswd
 
@@ -90,6 +91,13 @@ cat > /root/.xinitrc <<'XINIT'
 #!/bin/sh
 export XDG_CURRENT_DESKTOP=GNOME
 export XDG_SESSION_TYPE=x11
+# The panel has no DRI3 device, so every GL client lands on llvmpipe.
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+# GTK4 apps default to the ngl/vulkan renderers, which draw nothing here.
+export GSK_RENDERER=cairo
+export GDK_DEBUG=nogl
+export GTK_A11Y=none
 exec dbus-run-session -- gnome-session
 XINIT
 chmod 0755 /root/.xinitrc
@@ -100,6 +108,39 @@ cat > /root/.xinitrc.xfce <<'XINIT'
 exec startxfce4
 XINIT
 chmod 0755 /root/.xinitrc.xfce
+
+# 3b. Deterministic desktop background.  Ship a plain PNG instead of the
+#     themed SVG so a missing decoder cannot leave the shell on a flat fill.
+mkdir -p /usr/share/backgrounds
+python3 - <<'PNG'
+import struct, zlib
+w, h = 2800, 1840
+rows = bytearray()
+for y in range(h):
+    t = y / (h - 1)
+    r = int(18 + 10 * t)
+    g = int(22 + 12 * t)
+    b = int(34 + 26 * t)
+    rows += b"\x00" + bytes((r, g, b)) * w
+def chunk(tag, data):
+    return (struct.pack(">I", len(data)) + tag + data +
+            struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+png = (b"\x89PNG\r\n\x1a\n" +
+       chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+       chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+       chunk(b"IEND", b""))
+open("/usr/share/backgrounds/charlotte.png", "wb").write(png)
+PNG
+
+cat > /usr/share/glib-2.0/schemas/90_charlotte.gschema.override <<'OVERRIDE'
+[org.gnome.desktop.background]
+picture-uri='file:///usr/share/backgrounds/charlotte.png'
+picture-uri-dark='file:///usr/share/backgrounds/charlotte.png'
+picture-options='scaled'
+primary-color='#121622'
+color-shading-type='solid'
+OVERRIDE
+glib-compile-schemas /usr/share/glib-2.0/schemas
 
 # Only tty1 starts X; the serial consoles keep a plain shell for recovery.
 cat > /root/.bash_profile <<'PROFILE'
@@ -515,6 +556,27 @@ UNIT
 mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 ln -sf ../charlotte-mouse.service \
 	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-mouse.service"
+
+# 4d. Touch rail search runs once per boot: it enables each PMIC LDO in
+#     turn and looks for the controller waking up on /dev/thp.  The log is
+#     the only thing needed to tell which rail feeds the panel.
+install -D -m 0644 /dev/stdin "$ROOTFS/etc/systemd/system/charlotte-touch-power.service" <<'UNIT'
+[Unit]
+Description=Find and enable the Goodix touch supply
+After=systemd-udevd.service local-fs.target
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/bin/python3 /usr/local/bin/touch-power-sweep --pass2 > /var/log/touch-power.log 2>&1'
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+ln -sf ../charlotte-touch-power.service \
+	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-touch-power.service"
 
 # 5. Publish the initramfs and a standalone module tree.
 if [ "${SKIP_MODULES:-0}" != "1" ]; then
