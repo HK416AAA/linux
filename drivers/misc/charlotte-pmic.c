@@ -19,22 +19,25 @@
 
 #define CHARLOTTE_PMIC_REGS	256
 #define CHARLOTTE_PMIC_CHUNK	16
+/* SPMI register reads are 5-bit; 0x20 and up need the extended command. */
+#define CHARLOTTE_PMIC_BASIC_MAX	0x1f
 
 struct charlotte_pmic_ldo {
-	unsigned int id;
+	const char *name;
 	u8 en_reg;
 	u8 v_reg;
+	u8 vsel_mask;
 };
 
 static const struct charlotte_pmic_ldo charlotte_pmic_ldos[] = {
-	{ 3,  0x16, 0x51 },
-	{ 4,  0x17, 0x52 },
-	{ 9,  0x1c, 0x57 },
-	{ 15, 0x21, 0x5c },
-	{ 16, 0x22, 0x5d },
-	{ 17, 0x23, 0x5e },
-	{ 33, 0x32, 0x6d },
-	{ 34, 0x33, 0x6e },
+	{ "ldo3",  0x16, 0x51, 0x0f },
+	{ "ldo4",  0x17, 0x52, 0x07 },
+	{ "ldo9",  0x1c, 0x57, 0x07 },
+	{ "ldo15", 0x21, 0x5c, 0x07 },
+	{ "ldo16", 0x22, 0x5d, 0x07 },
+	{ "ldo17", 0x23, 0x5e, 0x07 },
+	{ "ldo33", 0x32, 0x6d, 0x07 },
+	{ "ldo34", 0x33, 0x6e, 0x07 },
 };
 
 struct charlotte_pmic {
@@ -47,7 +50,10 @@ static int charlotte_pmic_read(struct charlotte_pmic *pmic, u8 reg, u8 *val)
 	int i, ret = -EIO;
 
 	for (i = 0; i < 3; i++) {
-		ret = spmi_register_read(pmic->sdev, reg, val);
+		if (reg <= CHARLOTTE_PMIC_BASIC_MAX)
+			ret = spmi_register_read(pmic->sdev, reg, val);
+		else
+			ret = spmi_ext_register_read(pmic->sdev, reg, val, 1);
 		if (!ret)
 			return 0;
 		usleep_range(50, 100);
@@ -61,7 +67,10 @@ static int charlotte_pmic_write(struct charlotte_pmic *pmic, u8 reg, u8 val)
 	int i, ret = -EIO;
 
 	for (i = 0; i < 3; i++) {
-		ret = spmi_register_write(pmic->sdev, reg, val);
+		if (reg <= CHARLOTTE_PMIC_BASIC_MAX)
+			ret = spmi_register_write(pmic->sdev, reg, val);
+		else
+			ret = spmi_ext_register_write(pmic->sdev, reg, &val, 1);
 		if (!ret) {
 			usleep_range(50, 100);
 			return 0;
@@ -186,7 +195,8 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 	const struct charlotte_pmic_ldo *ldo = NULL;
 	unsigned int id, on, vsel = 0;
 	char buf[32];
-	int i, ret;
+	u8 rb_en = 0, rb_vsel = 0;
+	int ret;
 
 	if (count == 0 || count >= sizeof(buf))
 		return -EINVAL;
@@ -196,27 +206,59 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 
 	if (sscanf(buf, "%u %u %u", &id, &on, &vsel) < 2)
 		return -EINVAL;
-
-	for (i = 0; i < ARRAY_SIZE(charlotte_pmic_ldos); i++) {
-		if (charlotte_pmic_ldos[i].id == id) {
-			ldo = &charlotte_pmic_ldos[i];
-			break;
-		}
-	}
-	if (!ldo)
+	if (id >= ARRAY_SIZE(charlotte_pmic_ldos))
 		return -EINVAL;
 
-	ret = charlotte_pmic_write(pmic, ldo->v_reg, vsel & 0xff);
+	ldo = &charlotte_pmic_ldos[id];
+	if (sscanf(buf, "%u %u %u", &id, &on, &vsel) == 3 &&
+	    vsel > ldo->vsel_mask)
+		return -EINVAL;
+
+	ret = charlotte_pmic_write(pmic, ldo->v_reg, vsel & ldo->vsel_mask);
 	if (ret)
 		return ret;
-
+	usleep_range(200, 400);
 	ret = charlotte_pmic_write(pmic, ldo->en_reg, on ? 0x01 : 0x00);
 	if (ret)
 		return ret;
+	usleep_range(2000, 4000);
 
-	dev_info(&pmic->sdev->dev, "ldo%u vsel %02x en %u\n", id,
-		 vsel & 0xff, on ? 1 : 0);
+	charlotte_pmic_read(pmic, ldo->en_reg, &rb_en);
+	charlotte_pmic_read(pmic, ldo->v_reg, &rb_vsel);
+	dev_info(&pmic->sdev->dev, "%s vsel %02x en %u (readback en %02x vsel %02x)\n",
+		 ldo->name, vsel & ldo->vsel_mask, on ? 1 : 0, rb_en, rb_vsel);
 	return count;
+}
+
+static ssize_t charlotte_pmic_ldo_read(struct file *file, char __user *ubuf,
+				       size_t count, loff_t *ppos)
+{
+	struct charlotte_pmic *pmic = file->private_data;
+	char *buf;
+	ssize_t ret;
+	size_t i;
+	int n = 0;
+
+	buf = kzalloc(512, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(charlotte_pmic_ldos); i++) {
+		const struct charlotte_pmic_ldo *ldo = &charlotte_pmic_ldos[i];
+		u8 en = 0xff, vsel = 0xff;
+
+		charlotte_pmic_read(pmic, ldo->en_reg, &en);
+		charlotte_pmic_read(pmic, ldo->v_reg, &vsel);
+		n += scnprintf(buf + n, 512 - n,
+			       "%zu %s en_reg %02x v_reg %02x en %02x vsel %02x\n",
+			       i, ldo->name, ldo->en_reg, ldo->v_reg, en, vsel);
+	}
+	n += scnprintf(buf + n, 512 - n,
+		       "write: echo \"<index> <0|1> [vsel]\" > ldo\n");
+
+	ret = simple_read_from_buffer(ubuf, count, ppos, buf, n);
+	kfree(buf);
+	return ret;
 }
 
 static int charlotte_pmic_open(struct inode *inode, struct file *file)
@@ -239,6 +281,7 @@ static const struct file_operations charlotte_pmic_rw_fops = {
 
 static const struct file_operations charlotte_pmic_ldo_fops = {
 	.open = charlotte_pmic_open,
+	.read = charlotte_pmic_ldo_read,
 	.write = charlotte_pmic_ldo_write,
 	.llseek = noop_llseek,
 };
@@ -261,7 +304,7 @@ static int charlotte_pmic_probe(struct spmi_device *sdev)
 				    &charlotte_pmic_regs_fops);
 		debugfs_create_file("rw", 0200, pmic->root, pmic,
 				    &charlotte_pmic_rw_fops);
-		debugfs_create_file("ldo", 0200, pmic->root, pmic,
+		debugfs_create_file("ldo", 0600, pmic->root, pmic,
 				    &charlotte_pmic_ldo_fops);
 	}
 
