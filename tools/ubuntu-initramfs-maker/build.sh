@@ -65,6 +65,12 @@ apt-get install -y --no-install-recommends \
 	network-manager network-manager-gnome wpasupplicant \
 	xfce4 xfce4-terminal
 
+# GNOME is the default session; XFCE stays installed as the fallback.
+apt-get install -y \
+	gnome-session gnome-shell gnome-settings-daemon \
+	gnome-terminal nautilus gnome-control-center \
+	xdg-desktop-portal-gnome
+
 echo 'root:charlotte' | chpasswd
 
 # 3a. Graphical session on the panel.  The panel is driven through the
@@ -82,9 +88,18 @@ XORG
 
 cat > /root/.xinitrc <<'XINIT'
 #!/bin/sh
-exec startxfce4
+export XDG_CURRENT_DESKTOP=GNOME
+export XDG_SESSION_TYPE=x11
+exec dbus-run-session -- gnome-session
 XINIT
 chmod 0755 /root/.xinitrc
+
+# Fallback session: copy this over .xinitrc and restart X.
+cat > /root/.xinitrc.xfce <<'XINIT'
+#!/bin/sh
+exec startxfce4
+XINIT
+chmod 0755 /root/.xinitrc.xfce
 
 # Only tty1 starts X; the serial consoles keep a plain shell for recovery.
 cat > /root/.bash_profile <<'PROFILE'
