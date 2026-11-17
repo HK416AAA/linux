@@ -39,18 +39,11 @@ jobs:
       - name: Configure for MRO-W00
         run: |
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- charlotte_mro_defconfig
+          echo "KERNEL_RELEASE=$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)" >> "$GITHUB_ENV"
 
       - name: Build Image and device trees
         run: |
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs
-
-      - name: Pack the rescue ramdisk
-        run: |
-          mkdir -p out
-          sudo bash tools/charlotte/initramfs/pack.sh out/charlotte-rescue.cpio.gz
-          python3 tools/charlotte/mkbootimg.py \
-            --ramdisk out/charlotte-rescue.cpio.gz \
-            --out out/charlotte-ramdisk.img
 
       - name: Embed device tree into Image
         run: |
@@ -66,13 +59,22 @@ jobs:
             --out out/Image-7.3-tgr-w00-dtb > out/Image-7.3-tgr-w00-dtb.info.txt
           cat out/Image-7.3-tgr-w00-dtb.info.txt
 
+      - name: Build and pack modules
+        run: |
+          mkdir -p out
+          MODTREE="$(mktemp -d)"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$MODTREE" -j"$(nproc)" modules_install
+          tar -C "$MODTREE/lib/modules" -czf \
+            "out/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
+
       - name: Collect artifacts
         run: |
           mkdir -p out
           cp arch/arm64/boot/Image out/Image-7.3-mro-w00
           cp arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb out/
           cp arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb out/
-          cp System.map out/System.map-7.3-mro-w00
+          cp System.map "out/System.map-$KERNEL_RELEASE"
           cp .config out/config-mro-w00
           (cd out && sha256sum * > SHA256SUMS.txt && ls -l)
 
