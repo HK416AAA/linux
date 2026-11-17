@@ -196,7 +196,7 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 	unsigned int id, on, vsel = 0;
 	char buf[32];
 	u8 rb_en = 0, rb_vsel = 0;
-	int ret;
+	int nargs, ret;
 
 	if (count == 0 || count >= sizeof(buf))
 		return -EINVAL;
@@ -204,20 +204,26 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 		return -EFAULT;
 	buf[count] = '\0';
 
-	if (sscanf(buf, "%u %u %u", &id, &on, &vsel) < 2)
+	nargs = sscanf(buf, "%u %u %u", &id, &on, &vsel);
+	if (nargs < 2)
 		return -EINVAL;
 	if (id >= ARRAY_SIZE(charlotte_pmic_ldos))
 		return -EINVAL;
 
 	ldo = &charlotte_pmic_ldos[id];
-	if (sscanf(buf, "%u %u %u", &id, &on, &vsel) == 3 &&
-	    vsel > ldo->vsel_mask)
-		return -EINVAL;
+	if (nargs == 3) {
+		if (vsel > ldo->vsel_mask)
+			return -EINVAL;
+		ret = charlotte_pmic_write(pmic, ldo->v_reg, vsel);
+		if (ret)
+			return ret;
+		usleep_range(200, 400);
+	} else {
+		u8 cur = 0;
 
-	ret = charlotte_pmic_write(pmic, ldo->v_reg, vsel & ldo->vsel_mask);
-	if (ret)
-		return ret;
-	usleep_range(200, 400);
+		charlotte_pmic_read(pmic, ldo->v_reg, &cur);
+		vsel = cur;
+	}
 	ret = charlotte_pmic_write(pmic, ldo->en_reg, on ? 0x01 : 0x00);
 	if (ret)
 		return ret;
@@ -226,7 +232,7 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 	charlotte_pmic_read(pmic, ldo->en_reg, &rb_en);
 	charlotte_pmic_read(pmic, ldo->v_reg, &rb_vsel);
 	dev_info(&pmic->sdev->dev, "%s vsel %02x en %u (readback en %02x vsel %02x)\n",
-		 ldo->name, vsel & ldo->vsel_mask, on ? 1 : 0, rb_en, rb_vsel);
+		 ldo->name, vsel, on ? 1 : 0, rb_en, rb_vsel);
 	return count;
 }
 
@@ -254,7 +260,7 @@ static ssize_t charlotte_pmic_ldo_read(struct file *file, char __user *ubuf,
 			       i, ldo->name, ldo->en_reg, ldo->v_reg, en, vsel);
 	}
 	n += scnprintf(buf + n, 512 - n,
-		       "write: echo \"<index> <0|1> [vsel]\" > ldo\n");
+		       "write: echo \"<index> <0|1> [vsel]\" > ldo (omit vsel to keep it)\n");
 
 	ret = simple_read_from_buffer(ubuf, count, ppos, buf, n);
 	kfree(buf);
