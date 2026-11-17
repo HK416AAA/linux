@@ -62,6 +62,7 @@ apt-get install -y --no-install-recommends \
 	libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libgbm1 \
 	dbus-x11 mesa-utils x11-xserver-utils \
 	fonts-dejavu-core xfonts-base adwaita-icon-theme \
+	network-manager network-manager-gnome wpasupplicant \
 	xfce4 xfce4-terminal
 
 echo 'root:charlotte' | chpasswd
