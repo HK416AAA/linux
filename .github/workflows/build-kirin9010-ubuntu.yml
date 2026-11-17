@@ -14,9 +14,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Checkout
+      - name: Checkout userspace tree
         uses: actions/checkout@v4
         with:
+          fetch-depth: 1
+
+      - name: Checkout kernel tree
+        uses: actions/checkout@v4
+        with:
+          ref: 261110-feat-kirin9010-kernel
+          path: kernel-src
           fetch-depth: 1
 
       - name: Install build dependencies
@@ -47,6 +54,7 @@ jobs:
 
       - name: Build kernel and modules
         run: |
+          cd kernel-src
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- charlotte_mro_defconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs modules
           echo "KERNEL_RELEASE=$(make -s ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)" >> "$GITHUB_ENV"
@@ -54,7 +62,7 @@ jobs:
       - name: Build Ubuntu initramfs
         run: |
           sudo -E env \
-            KERNEL_SRC="$PWD" \
+            KERNEL_SRC="$PWD/kernel-src" \
             KERNEL_RELEASE="$KERNEL_RELEASE" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -83,24 +91,24 @@ jobs:
         run: |
           mkdir -p out
           python3 tools/charlotte/embed_dtb.py \
-            --image arch/arm64/boot/Image \
-            --dtb arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb \
+            --image kernel-src/arch/arm64/boot/Image \
+            --dtb kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb \
             --out out/Image-7.3-mro-w00-dtb > out/Image-7.3-mro-w00-dtb.info.txt
           cat out/Image-7.3-mro-w00-dtb.info.txt
           python3 tools/charlotte/embed_dtb.py \
-            --image arch/arm64/boot/Image \
-            --dtb arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb \
+            --image kernel-src/arch/arm64/boot/Image \
+            --dtb kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb \
             --out out/Image-7.3-tgr-w00-dtb > out/Image-7.3-tgr-w00-dtb.info.txt
           cat out/Image-7.3-tgr-w00-dtb.info.txt
 
       - name: Collect artifacts
         run: |
           mkdir -p out
-          cp arch/arm64/boot/Image out/Image-7.3-mro-w00
-          cp arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb out/
-          cp arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb out/
-          cp System.map "out/System.map-$KERNEL_RELEASE"
-          cp .config out/config-mro-w00
+          cp kernel-src/arch/arm64/boot/Image out/Image-7.3-mro-w00
+          cp kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-mro-w00.dtb out/
+          cp kernel-src/arch/arm64/boot/dts/hisilicon/charlotte-tgr-w00.dtb out/
+          cp kernel-src/System.map "out/System.map-$KERNEL_RELEASE"
+          cp kernel-src/.config out/config-mro-w00
           cp tools/ubuntu-initramfs-maker/out/* out/
           (cd out && sha256sum * > SHA256SUMS.txt && ls -l)
 
