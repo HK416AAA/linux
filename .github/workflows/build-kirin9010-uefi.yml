@@ -56,13 +56,18 @@ jobs:
         working-directory: uefi
         run: python3 build_uefi.py -d mro -r DEBUG -c
 
+      - name: Pack the boot image
+        working-directory: uefi
+        run: ./pack_boot.sh
+
       - name: Upload UEFI images
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: uefi-mro
           path: |
-            uefi/Mu-mro*.img
-            uefi/Mu-mro*.bin
+            uefi/Mu-mro.bin
+            uefi/Mu-mro-boot.img
+            uefi/Image
             uefi/Build/mroPkg/*/FV/*.fd
           if-no-files-found: warn

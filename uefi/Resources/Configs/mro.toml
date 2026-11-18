@@ -15,14 +15,10 @@ base = 0x9FC00000
 size = 0x300000
 
 #
-# Android Boot Image Kernel Configs
+# Payload Output Configs
 #
-[boot_image_kernel]
-kernel_compression = "none"
-append_dtb         = false
-
+# Emit the raw "Image" style payload: the boot shim with the firmware FD
+# appended. pack_boot.sh wraps it into an Android boot image.
 #
-# Android Boot Image Configs
-#
-[boot_image]
-header_version = 0
+[payload]
+type = "raw"

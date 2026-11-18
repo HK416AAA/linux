@@ -40,21 +40,28 @@ cd uefi
 ```
 
 `build.sh` clones `Mu_Basecore`, `Common/Mu`, `Common/Mu_OEM_Sample`,
-`Silicium-ACPI` and OpenSSL on first run, then produces `Mu-mro.img` (Android
-boot image) and `Mu-mro.bin` (raw payload).
+`Silicium-ACPI` and OpenSSL at the pinned reference commits, then produces
+`Mu-mro.bin`, the flat "Image" style payload (boot shim + firmware FD).
 
 CI runs the same flow on every push to `261118-feat-kirin9010-uefi`
 (`.github/workflows/build-kirin9010-uefi.yml`).
 
-## Flash
+## Pack and flash
 
 ```bash
-fastboot flash kernel Mu-mro.img
+./pack_boot.sh
 ```
 
-The boot image uses header version 0 with a 2048 byte page size, matching
-`tools/charlotte/mkbootimg.py`. If the bootloader rejects the image, switch
-`header_version` in `Resources/Configs/mro.toml` to `1` and rebuild.
+This copies the payload to `Image` and wraps it into `Mu-mro-boot.img` with
+`../tools/charlotte/mkbootimg.py` (page size 2048, kernel at `0x10008000`,
+header version 0):
+
+```bash
+fastboot flash boot Mu-mro-boot.img
+```
+
+`Mu-mro.bin` and `Image` are the same flat payload, so either can also be
+placed in a boot image by other tooling.
 
 ## Register map assumptions
 
@@ -81,3 +88,5 @@ framebuffer node.
 - Display re-trigger inside SEC (`EnableFrameBufferWrites`) is a no-op. Verify
   that the bootloader leaves the DPU scanning out before adding a DPU write.
 - UFS, keypad (PMIC side keys) and the UniXNU payload are not wired yet.
+- The boot image carries no ramdisk; the firmware runs entirely from
+  `Mu-mro.bin`.
