@@ -59,6 +59,14 @@
 
 [LibraryClasses]
   #
+  # Debug output
+  #
+  # Mirror DEBUG() output into the ramoops console zone so it survives a
+  # reset and can be read from /sys/fs/pstore/console-ramoops-0.
+  #
+  SerialPortLib|mroPkg/Library/PstoreSerialPortLib/PstoreSerialPortLib.inf
+
+  #
   # Memory Libraries
   #
   MemoryMapLib|mroPkg/Library/MemoryMapLib/MemoryMapLib.inf

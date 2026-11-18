@@ -74,10 +74,30 @@ placed in a boot image by other tooling.
 | GICD       | `0xFF000000` | `0x10000` |
 | GICR       | `0xFF040000` | `0x180000` |
 | UART6      | `0xFFB82000` | `0x1000` |
+| Ramoops    | `0x2FC40000` | `0x100000` |
 
 The GIC values come from the device tree (`interrupt-controller@ff000000`).
 The scanout buffer comes from `scanout-fb@53458000` and the `simpledrm`
 framebuffer node.
+
+## Firmware log (pstore)
+
+`SerialPortLib` is mapped to `PstoreSerialPortLib`, so every `DEBUG()`
+message is appended to the ramoops console zone at `0x2FCA0000` while the
+firmware runs. The zone survives a watchdog reset, so after the device
+reboots into Linux:
+
+```bash
+cat /sys/fs/pstore/console-ramoops-0
+```
+
+The kernel consumes the zone on boot (`PRZ_FLAG_ZAP_OLD`), which keeps the
+previous boot's text available as the first pstore record.
+
+Zone layout comes from the device tree (`ramoops@2fc40000`): three
+`0x20000` dump records, then the `0x80000` console zone, then the `0x20000`
+pmsg zone. Each zone starts with `struct persistent_ram_buffer`
+(`"DBGC"` signature, start offset, payload size).
 
 ## Open items
 
