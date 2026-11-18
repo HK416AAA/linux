@@ -88,7 +88,7 @@
   #
   gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut|3
   gEfiMdeModulePkgTokenSpaceGuid.PcdBootManagerMenuFile|{ 0xDC, 0x5B, 0xC2, 0xEE, 0xF2, 0x67, 0x95, 0x4D, 0xB1, 0xD5, 0xF8, 0x1B, 0x20, 0x39, 0xD1, 0x1D }
-  gEfiMdeModulePkgTokenSpaceGuid.PcdBootManagerInBootOrder|FALSE
+  gEfiMdeModulePkgTokenSpaceGuid.PcdBootManagerInBootOrder|TRUE
   gEfiMdeModulePkgTokenSpaceGuid.PcdPlatformRecoverySupport|FALSE
 
   #

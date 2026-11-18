@@ -7,7 +7,7 @@ this device.
 The firmware boots from the `kernel` partition through `BootShim`, relocates the
 FD to `0x9FC00000`, and hands control to the generic Silicium DXE core. Display
 output uses `SimpleFbDxe`, which reuses the scanout buffer left running by the
-bootloader (`0x53458000`, 2800x1840, 32bpp).
+bootloader (`0x34380000`, 1840x2800, 32bpp, `x8b8g8r8`).
 
 ## Layout
 
@@ -70,15 +70,18 @@ placed in a boot image by other tooling.
 | UEFI FD    | `0x9FC00000` | `0x300000` |
 | UEFI Stack | `0x9FF00000` | `0x40000` |
 | DXE Heap   | `0xA0000000` | `0x10000000` |
-| Scanout    | `0x53458000` | `0x2000000` |
+| Scanout    | `0x34380000` | `0x13AA000` |
 | GICD       | `0xFF000000` | `0x10000` |
 | GICR       | `0xFF040000` | `0x180000` |
 | UART6      | `0xFFB82000` | `0x1000` |
 | Ramoops    | `0x2FC40000` | `0x100000` |
 
 The GIC values come from the device tree (`interrupt-controller@ff000000`).
-The scanout buffer comes from `scanout-fb@53458000` and the `simpledrm`
-framebuffer node.
+The scanout buffer comes from the `framebuffer@34380000` node of the Linux
+device tree (`simple-framebuffer`, stride `7360` = 1840 x 4, format
+`x8b8g8r8`, i.e. bytes in memory are B, G, R, X). The earlier
+`0x53458000` / 2800x1840 / 11200 values were wrong: the DPU never scanned
+that page, so every GOP blit stayed invisible.
 
 ## Firmware log (pstore)
 
@@ -101,9 +104,14 @@ pmsg zone. Each zone starts with `struct persistent_ram_buffer`
 
 ## User interface
 
-`BootMenuDxe` registers `BootManagerMenuApp` as the first boot option, so BDS
-opens the Boot Manager menu instead of stopping at "no bootable device".
-The menu renders through `GraphicsConsoleDxe` on the bootloader framebuffer.
+`PcdBootManagerInBootOrder` is `TRUE`, so `EfiBootManagerGetBootManagerMenu`
+appends `BootManagerMenuApp` to `BootOrder` while BDS initialises. The menu
+opens on every boot and renders through `GraphicsConsoleDxe` on the
+bootloader framebuffer. A separate driver is not needed: the one that used to
+do this registered an EndOfDxe hook, but `UefiBootManagerLib` pulls in
+`UefiHiiServicesLib`, whose library depex (`PcdProtocol`, `HiiString`,
+`HiiDatabase`, `HiiConfigRouting`) is ANDed onto the module depex, so the
+image was loaded but never dispatched.
 
 Keypad input is not wired yet: charlotte volume keys are mediated by the
 PMIC (`powerkey` node with `hisilicon,volume-keys`), so the GPIO based
@@ -111,12 +119,11 @@ PMIC (`powerkey` node with `hisilicon,volume-keys`), so the GPIO based
 
 ## Open items
 
-- `SimpleFbDxe` needs the charlotte framebuffer descriptor source; the reference
-  platform reads it through `GetFrameBufferInfos()`, which is SoC specific.
 - `RamManagerLib` is currently Samsung's implementation; a charlotte version is
   required to publish the correct runtime memory partitions.
-- Display re-trigger inside SEC (`EnableFrameBufferWrites`) is a no-op. Verify
-  that the bootloader leaves the DPU scanning out before adding a DPU write.
+- The bootloader keeps the DPU scanning out the logo buffer, so no DPU/DSI
+  bring-up is needed in firmware; `EnableFrameBufferWrites` in SEC stays a
+  no-op.
 - UFS, keypad (PMIC side keys) and the UniXNU payload are not wired yet.
 - The boot image carries no ramdisk; the firmware runs entirely from
   `Mu-mro.bin`.

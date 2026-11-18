@@ -53,8 +53,8 @@
   #
   # Simple Frame Buffer
   #
-  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferWidth|2800
-  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferHeight|1840
+  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferWidth|1840
+  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferHeight|2800
   gSiliciumPkgTokenSpaceGuid.PcdFrameBufferColorDepth|32
 
 [LibraryClasses]
@@ -76,11 +76,6 @@
   # ACPI Tables
   #
   #mro/AcpiTables.inf
-
-  #
-  # Boot Manager
-  #
-  mroPkg/Drivers/BootMenuDxe/BootMenuDxe.inf
 
   #
   # Input

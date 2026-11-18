@@ -17,7 +17,6 @@ APRIORI DXE {
   INF MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
   INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf
   INF MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
-  INF mroPkg/Drivers/BootMenuDxe/BootMenuDxe.inf
   INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
 
 !if $(USE_CUSTOM_DISPLAY_DRIVER) == 0
