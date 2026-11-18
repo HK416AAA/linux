@@ -20,8 +20,8 @@
   #
   # CPU
   #
-  gArmTokenSpaceGuid.PcdCoreCount|12
-  gArmTokenSpaceGuid.PcdClusterCount|3
+  gArmPlatformTokenSpaceGuid.PcdCoreCount|12
+  gArmPlatformTokenSpaceGuid.PcdClusterCount|3
 
   #
   # GIC
