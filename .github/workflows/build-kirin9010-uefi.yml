@@ -47,6 +47,11 @@ jobs:
           fetch_pinned Silicium-ACPI https://github.com/Project-Silicium/Silicium-ACPI.git 2d465ad77c25de908f0ec7bdfcb57f865b61233c
           fetch_pinned Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl https://github.com/openssl/openssl.git 67b5686b4419b4cb8caa502711c41815f5279751
 
+          # mu_basecore .dec files reference submodule include trees
+          for dep in Mu_Basecore Common/Mu Common/Mu_OEM_Sample; do
+            git -C "${dep}" submodule update --init --recursive --depth 1
+          done
+
       - name: Build UEFI
         working-directory: uefi
         run: python3 build_uefi.py -d mro -r DEBUG -c

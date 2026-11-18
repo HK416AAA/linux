@@ -61,4 +61,9 @@ fetch_pinned Silicium-ACPI https://github.com/Project-Silicium/Silicium-ACPI.git
 fetch_pinned Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl \
   https://github.com/openssl/openssl.git "${OPENSSL_SHA}"
 
+# mu_basecore .dec files reference submodule include trees
+for dep in Mu_Basecore Common/Mu Common/Mu_OEM_Sample; do
+  git -C "${dep}" submodule update --init --recursive --depth 1
+done
+
 python3 build_uefi.py -d mro -r "${TARGET}" -c
