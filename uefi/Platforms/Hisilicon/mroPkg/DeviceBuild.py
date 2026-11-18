@@ -35,6 +35,7 @@ class CommonPlatform ():
         "Common/Mu_OEM_Sample",
         "Mu_Basecore",
         "Silicon/Hisilicon",
+        "Silicon/Samsung",
         "Silicon/Silicium",
         "Silicium-ACPI"
     )
