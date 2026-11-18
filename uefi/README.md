@@ -99,6 +99,16 @@ Zone layout comes from the device tree (`ramoops@2fc40000`): three
 pmsg zone. Each zone starts with `struct persistent_ram_buffer`
 (`"DBGC"` signature, start offset, payload size).
 
+## User interface
+
+`BootMenuDxe` registers `BootManagerMenuApp` as the first boot option, so BDS
+opens the Boot Manager menu instead of stopping at "no bootable device".
+The menu renders through `GraphicsConsoleDxe` on the bootloader framebuffer.
+
+Keypad input is not wired yet: charlotte volume keys are mediated by the
+PMIC (`powerkey` node with `hisilicon,volume-keys`), so the GPIO based
+`KeypadDeviceLib` from the reference platforms does not apply.
+
 ## Open items
 
 - `SimpleFbDxe` needs the charlotte framebuffer descriptor source; the reference

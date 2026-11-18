@@ -78,6 +78,11 @@
   #mro/AcpiTables.inf
 
   #
+  # Boot Manager
+  #
+  mroPkg/Drivers/BootMenuDxe/BootMenuDxe.inf
+
+  #
   # Input
   #
   #SiliciumPkg/Drivers/KeypadDxe/KeypadDxe.inf

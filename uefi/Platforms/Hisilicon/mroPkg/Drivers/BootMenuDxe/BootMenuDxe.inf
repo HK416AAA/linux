@@ -1,0 +1,27 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = BootMenuDxe
+  FILE_GUID                      = 5A7C31E4-8D62-4F19-B0C5-2E9A47D3F168
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = BootMenuEntry
+
+[Sources]
+  BootMenuDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  BaseMemoryLib
+  DebugLib
+  UefiBootManagerLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Protocols]
+  gEfiVariableArchProtocolGuid
+
+[Depex]
+  gEfiVariableArchProtocolGuid
