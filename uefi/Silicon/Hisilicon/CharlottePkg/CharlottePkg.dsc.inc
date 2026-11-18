@@ -37,6 +37,14 @@
 
 [LibraryClasses]
   #
+  # Memory Libraries
+  #
+  # The Samsung implementation reads a Samsung specific DRAM size register.
+  # Kirin 9010 uses the null implementation until a charlotte variant exists.
+  #
+  RamManagerLib|SiliciumNullPkg/Library/RamManagerLibNull/RamManagerLibNull.inf
+
+  #
   # SEC Libraries
   #
   PlatformSecLib|CharlottePkg/Library/PlatformSecLib/PlatformSecLib.inf
