@@ -40,11 +40,6 @@ static const struct charlotte_pmic_ldo charlotte_pmic_ldos[] = {
 	{ "ldo34", 0x33, 0x6e, 0x07 },
 };
 
-static bool allow_writes;
-module_param(allow_writes, bool, 0644);
-MODULE_PARM_DESC(allow_writes,
-		 "permit SPMI register writes from debugfs (default off: a wrong voltage select can brown out the SoC)");
-
 struct charlotte_pmic {
 	struct spmi_device *sdev;
 	struct dentry *root;
@@ -179,8 +174,6 @@ static ssize_t charlotte_pmic_rw_write(struct file *file,
 			return ret;
 		dev_info(&pmic->sdev->dev, "reg %02x = %02x\n", reg, cur);
 	} else if (op == 'w') {
-		if (!allow_writes)
-			return -EPERM;
 		if (sscanf(buf, " %c %x %x", &op, &reg, &val) != 3)
 			return -EINVAL;
 		ret = charlotte_pmic_write(pmic, reg, val & 0xff);
@@ -210,9 +203,6 @@ static ssize_t charlotte_pmic_ldo_write(struct file *file,
 	if (copy_from_user(buf, ubuf, count))
 		return -EFAULT;
 	buf[count] = '\0';
-
-	if (!allow_writes)
-		return -EPERM;
 
 	nargs = sscanf(buf, "%u %u %u", &id, &on, &vsel);
 	if (nargs < 2)
