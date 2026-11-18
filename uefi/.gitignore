@@ -1,0 +1,10 @@
+Build/
+Conf/
+Mu-mro*
+Mu_Basecore/
+Common/Mu/
+Common/Mu_OEM_Sample/
+Silicium-ACPI/
+Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl/
+BootShim/BootShim.elf
+BootShim/BootShim.bin

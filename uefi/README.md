@@ -1,0 +1,83 @@
+# Kirin 9010 (charlotte) UEFI
+
+A Mu-Silicium based UEFI firmware port for the Kirin 9010 / charlotte platform,
+vendored from the Project Silicium reference tree (`uefi-sheng`) and adapted to
+this device.
+
+The firmware boots from the `kernel` partition through `BootShim`, relocates the
+FD to `0x9FC00000`, and hands control to the generic Silicium DXE core. Display
+output uses `SimpleFbDxe`, which reuses the scanout buffer left running by the
+bootloader (`0x53458000`, 2800x1840, 32bpp).
+
+## Layout
+
+```
+uefi/
+  build_uefi.py                  Build driver (device config + FD + boot image)
+  build.sh                       Fetches Mu/EDK2 dependencies and builds
+  BootShim/                      Relocation shim prepended to the FD
+  Common/                        Mu and Mu_OEM_Sample (cloned by build.sh)
+  Mu_Basecore/                   EDK2 base (cloned by build.sh)
+  Platforms/Hisilicon/mroPkg/
+    mro.dsc / mro.fdf            Platform description and flash layout
+    DeviceBuild.py               Stuart build configuration
+    Include/APRIORI.inc          DXE dispatch order
+    Include/DXE.inc              DXE module list
+    Library/MemoryMapLib/        DRAM / MMIO region table
+  Resources/Configs/mro.toml     FD base/size and boot image settings
+  Silicon/Hisilicon/CharlottePkg/
+    CharlottePkg.dsc.inc         SoC PCDs (GIC, CPU, SMBIOS, timer)
+    Library/PlatformSecLib/      SEC-time platform hook
+  Silicon/Silicium/SiliciumPkg/  Generic Silicium drivers (SimpleFb, SMBIOS, ...)
+```
+
+## Build
+
+```bash
+cd uefi
+./build.sh            # DEBUG
+./build.sh RELEASE    # RELEASE
+```
+
+`build.sh` clones `Mu_Basecore`, `Common/Mu`, `Common/Mu_OEM_Sample`,
+`Silicium-ACPI` and OpenSSL on first run, then produces `Mu-mro.img` (Android
+boot image) and `Mu-mro.bin` (raw payload).
+
+CI runs the same flow on every push to `261118-feat-kirin9010-uefi`
+(`.github/workflows/build-kirin9010-uefi.yml`).
+
+## Flash
+
+```bash
+fastboot flash kernel Mu-mro.img
+```
+
+The boot image uses header version 0 with a 2048 byte page size, matching
+`tools/charlotte/mkbootimg.py`. If the bootloader rejects the image, switch
+`header_version` in `Resources/Configs/mro.toml` to `1` and rebuild.
+
+## Register map assumptions
+
+| Region     | Address      | Size     |
+| ---------- | ------------ | -------- |
+| UEFI FD    | `0x9FC00000` | `0x300000` |
+| UEFI Stack | `0x9FF00000` | `0x40000` |
+| DXE Heap   | `0xA0000000` | `0x10000000` |
+| Scanout    | `0x53458000` | `0x2000000` |
+| GICD       | `0xFF000000` | `0x10000` |
+| GICR       | `0xFF040000` | `0x180000` |
+| UART6      | `0xFFB82000` | `0x1000` |
+
+The GIC values come from the device tree (`interrupt-controller@ff000000`).
+The scanout buffer comes from `scanout-fb@53458000` and the `simpledrm`
+framebuffer node.
+
+## Open items
+
+- `SimpleFbDxe` needs the charlotte framebuffer descriptor source; the reference
+  platform reads it through `GetFrameBufferInfos()`, which is SoC specific.
+- `RamManagerLib` is currently Samsung's implementation; a charlotte version is
+  required to publish the correct runtime memory partitions.
+- Display re-trigger inside SEC (`EnableFrameBufferWrites`) is a no-op. Verify
+  that the bootloader leaves the DPU scanning out before adding a DPU write.
+- UFS, keypad (PMIC side keys) and the UniXNU payload are not wired yet.
