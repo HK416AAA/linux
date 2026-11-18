@@ -557,27 +557,6 @@ mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 ln -sf ../charlotte-mouse.service \
 	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-mouse.service"
 
-# 4d. Touch rail search runs once per boot: it enables each PMIC LDO in
-#     turn and looks for the controller waking up on /dev/thp.  The log is
-#     the only thing needed to tell which rail feeds the panel.
-install -D -m 0644 /dev/stdin "$ROOTFS/etc/systemd/system/charlotte-touch-power.service" <<'UNIT'
-[Unit]
-Description=Find and enable the Goodix touch supply
-After=systemd-udevd.service local-fs.target
-Before=getty@tty1.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c '/usr/bin/python3 /usr/local/bin/touch-power-sweep --pass2 > /var/log/touch-power.log 2>&1'
-RemainAfterExit=yes
-TimeoutStartSec=180
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-ln -sf ../charlotte-touch-power.service \
-	"$ROOTFS/etc/systemd/system/multi-user.target.wants/charlotte-touch-power.service"
-
 # 5. Publish the initramfs and a standalone module tree.
 if [ "${SKIP_MODULES:-0}" != "1" ]; then
 	tar -C "$MODTREE/lib/modules" -czf "$OUT/modules-$KERNEL_RELEASE.tar.gz" "$KERNEL_RELEASE"
