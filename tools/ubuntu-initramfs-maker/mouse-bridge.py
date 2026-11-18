@@ -13,21 +13,15 @@ Commands (one per line):
   U <btn>       button release
   W <steps>     vertical wheel, positive scrolls up
   H <steps>     horizontal wheel, positive scrolls right
-  S <text>      type UTF-8 text (Chinese comes from the phone IME)
-  K <combo>     press and release a key combo, e.g. Return, ctrl+l
   P             ping, answers OK
-
-Text and keys are injected through xdotool, which needs the X session on
-$MOUSE_BRIDGE_DISPLAY (default :0) to be up.
 """
 
+import ctypes
+import errno
 import fcntl
 import os
-import re
-import shutil
 import socket
 import struct
-import subprocess
 import sys
 import time
 import threading
@@ -57,8 +51,6 @@ INPUT_EVENT = struct.Struct("@llHHi")
 USER_DEV = struct.Struct("80sHHHHI" + "i" * 256)
 
 LISTEN_PORT = int(os.environ.get("MOUSE_BRIDGE_PORT", "7788"))
-DISPLAY = os.environ.get("MOUSE_BRIDGE_DISPLAY", ":0")
-KEY_COMBO = re.compile(r"^[A-Za-z0-9_+\-]+$")
 
 
 class UInput:
@@ -115,53 +107,16 @@ class UInput:
             self.sync()
 
 
-class XInput:
-    """Types text and key combos into the running X session."""
-
-    def __init__(self):
-        self.xdotool = shutil.which("xdotool")
-        self.env = dict(os.environ, DISPLAY=DISPLAY)
-        self.lock = threading.Lock()
-
-    def _run(self, args):
-        if not self.xdotool:
-            return "xdotool not installed"
-        try:
-            done = subprocess.run([self.xdotool] + args, env=self.env,
-                                  capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return str(exc)
-        if done.returncode:
-            return (done.stderr or done.stdout or "xdotool failed").strip()
-        return None
-
-    def text(self, text):
-        with self.lock:
-            return self._run(["type", "--clearmodifiers", "--delay", "12",
-                              "--", text])
-
-    def key(self, combo):
-        if not KEY_COMBO.match(combo):
-            return "bad key combo"
-        with self.lock:
-            return self._run(["key", "--clearmodifiers", "--delay", "12",
-                              combo])
-
-
 class Client(threading.Thread):
-    def __init__(self, conn, addr, dev, xinput, rest_x, rest_y):
+    def __init__(self, conn, addr, dev, rest_x, rest_y):
         super().__init__(daemon=True)
         self.conn = conn
         self.addr = addr
         self.dev = dev
-        self.xinput = xinput
         self.rest = [rest_x, rest_y]
 
-    def log(self, msg):
-        print("[mouse] %s %s" % (self.addr[0], msg), flush=True)
-
     def run(self):
-        log = self.log
+        log = lambda msg: print("[mouse] %s %s" % (self.addr[0], msg), flush=True)
         log("connected")
         buf = b""
         try:
@@ -172,7 +127,7 @@ class Client(threading.Thread):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    self.handle(line.decode("utf-8", "replace").strip("\r"))
+                    self.handle(line.decode("ascii", "ignore").strip())
         except OSError as exc:
             log("socket error: %s" % exc)
         finally:
@@ -216,16 +171,6 @@ class Client(threading.Thread):
             self.dev.wheel(int(float(parts[1])))
         elif cmd == "H" and len(parts) >= 2:
             self.dev.wheel(int(float(parts[1])), horizontal=True)
-        elif cmd == "S":
-            text = line[2:] if line[:2] in ("S ", "s ") else ""
-            if text:
-                err = self.xinput.text(text)
-                if err:
-                    self.log("type failed: %s" % err)
-        elif cmd == "K" and len(parts) >= 2:
-            err = self.xinput.key(parts[1])
-            if err:
-                self.log("key failed: %s" % err)
         elif cmd == "P":
             try:
                 self.conn.sendall(b"OK\n")
@@ -240,11 +185,6 @@ def main():
         print("[mouse] cannot open /dev/uinput: %s" % exc, file=sys.stderr,
               flush=True)
         return 1
-
-    xinput = XInput()
-    if not xinput.xdotool:
-        print("[mouse] xdotool missing, text and key injection disabled",
-              file=sys.stderr, flush=True)
 
     print("[mouse] virtual mouse ready on port %d" % LISTEN_PORT, flush=True)
 
@@ -261,7 +201,7 @@ def main():
                 continue
             raise
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        Client(conn, addr, dev, xinput, 0.0, 0.0).start()
+        Client(conn, addr, dev, 0.0, 0.0).start()
 
 
 if __name__ == "__main__":
