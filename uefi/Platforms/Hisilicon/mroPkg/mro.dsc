@@ -24,6 +24,8 @@
   SKUID_IDENTIFIER               = DEFAULT
   FLASH_DEFINITION               = mroPkg/mro.fdf
   USE_CUSTOM_DISPLAY_DRIVER      = 0
+  # SamsungPkg's errata library needs an explicit value for this macro
+  HAS_CNTFRQ_EL0_EMPTY_ERRATA    = 0
 
 !include CharlottePkg/CharlottePkg.dsc.inc
 
