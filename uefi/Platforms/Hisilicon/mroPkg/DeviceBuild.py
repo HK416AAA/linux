@@ -57,7 +57,6 @@ class SettingsManager (UpdateSettingsManager, SetupSettingsManager, PrEvalSettin
 
     def GetRequiredSubmodules (self):
         return [
-            RequiredSubmodule ("Binaries", True),
             RequiredSubmodule ("Common/Mu", True),
             RequiredSubmodule ("Common/Mu_OEM_Sample", True),
             RequiredSubmodule ("Mu_Basecore", True),
