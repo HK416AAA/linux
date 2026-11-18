@@ -167,7 +167,11 @@ def handle_git_patch (submodule_path: Path, patch_name: str, remove: bool) -> bo
         cmd.append ("-R")
 
     # Apply/Undo Path
-    return subprocess.run (cmd, cwd=submodule_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    result = subprocess.run (cmd, cwd=submodule_path, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.debug (f"git apply {'-R ' if remove else ''}{patch_name} failed:\n{result.stderr}")
+
+    return result.returncode == 0
 
 def update_local_repo () -> bool:
     # Pull Latest Changes
