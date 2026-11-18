@@ -20,8 +20,8 @@
   UefiBootServicesTableLib
   UefiDriverEntryPoint
 
-[Protocols]
-  gEfiVariableArchProtocolGuid
+[Guids]
+  gEfiEndOfDxeEventGroupGuid
 
 [Depex]
-  gEfiVariableArchProtocolGuid
+  TRUE
