@@ -56,13 +56,9 @@ class SettingsManager (UpdateSettingsManager, SetupSettingsManager, PrEvalSettin
         return CommonPlatform.TargetsSupported
 
     def GetRequiredSubmodules (self):
-        return [
-            RequiredSubmodule ("Common/Mu", True),
-            RequiredSubmodule ("Common/Mu_OEM_Sample", True),
-            RequiredSubmodule ("Mu_Basecore", True),
-            RequiredSubmodule ("Silicium-ACPI", True),
-            RequiredSubmodule ("Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl", True)
-        ]
+        # The Mu / EDK2 dependencies are fetched by build.sh and the CI
+        # workflow, so nothing has to be resolved through .gitmodules.
+        return []
 
     def SetArchitectures (self, list_of_requested_architectures):
         unsupported = set(list_of_requested_architectures) - set(self.GetArchitecturesSupported())
