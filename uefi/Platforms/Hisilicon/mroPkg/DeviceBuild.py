@@ -36,9 +36,7 @@ class CommonPlatform ():
         "Mu_Basecore",
         "Silicon/Hisilicon",
         "Silicon/Silicium",
-        "Silicium-ACPI",
-        "Silicium-ACPI/Platforms/Hisilicon",
-        "Silicium-ACPI/Silicon/Hisilicon"
+        "Silicium-ACPI"
     )
 
 # ####################################################################################### #
