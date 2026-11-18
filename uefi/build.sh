@@ -12,6 +12,13 @@ cd "$(dirname "$0")"
 
 TARGET="${1:-DEBUG}"
 
+# Commits used by the Project Silicium reference tree (uefi-sheng)
+MU_BASECORE_SHA="cfb93724a06ff86ff5ba971413368a7809ee42a5"
+MU_SHA="b8d46c71610318e36a661819e1e3c0b8bdda413a"
+MU_OEM_SHA="b70b4b7bb02c43bf9db2172dfb3ed0457e2361d6"
+SILICIUM_ACPI_SHA="2d465ad77c25de908f0ec7bdfcb57f865b61233c"
+OPENSSL_SHA="67b5686b4419b4cb8caa502711c41815f5279751"
+
 install_dependencies() {
   if ! command -v aarch64-linux-gnu-gcc >/dev/null; then
     echo "aarch64-linux-gnu-gcc is missing"
@@ -23,48 +30,35 @@ install_dependencies() {
   fi
 }
 
-clone_dependency() {
-  local url="$1"
-  local path="$2"
-  local branch="$3"
+# The reference tree pins every dependency by commit hash, so fetch the
+# commit directly instead of tracking a moving branch tip.
+fetch_pinned() {
+  local path="$1"
+  local url="$2"
+  local sha="$3"
 
   if [ -d "${path}/.git" ]; then
     return
   fi
 
-  if [ -n "${branch}" ]; then
-    git clone --depth 1 -b "${branch}" "${url}" "${path}"
-  else
-    git clone --depth 1 "${url}" "${path}"
-  fi
-}
-
-clone_pinned_openssl() {
-  local path="Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"
-  local sha="67b5686b4419b4cb8caa502711c41815f5279751"
-
-  if [ -d "${path}/.git" ]; then
-    return
-  fi
-
-  # The pinned revision is a commit hash, fetch it explicitly instead of -b
   mkdir -p "${path}"
   git -C "${path}" init -q
-  git -C "${path}" remote add origin https://github.com/openssl/openssl.git
-  # Secure Boot is disabled by default, so a missing pin must not abort the build
-  if git -C "${path}" fetch -q --depth 1 origin "${sha}"; then
-    git -C "${path}" checkout -q FETCH_HEAD
-  else
-    echo "warning: unable to fetch openssl ${sha}, continuing without it"
+  git -C "${path}" remote add origin "${url}"
+
+  if ! git -C "${path}" fetch -q --depth 1 origin "${sha}"; then
+    git -C "${path}" fetch -q origin
   fi
+
+  git -C "${path}" checkout -q "${sha}"
 }
 
 install_dependencies
 
-clone_dependency https://github.com/microsoft/mu_basecore.git Mu_Basecore release/202608
-clone_dependency https://github.com/microsoft/mu_plus.git Common/Mu release/202608
-clone_dependency https://github.com/microsoft/mu_oem_sample.git Common/Mu_OEM_Sample release/202608
-clone_dependency https://github.com/Project-Silicium/Silicium-ACPI.git Silicium-ACPI ""
-clone_pinned_openssl
+fetch_pinned Mu_Basecore https://github.com/microsoft/mu_basecore.git "${MU_BASECORE_SHA}"
+fetch_pinned Common/Mu https://github.com/microsoft/mu_plus.git "${MU_SHA}"
+fetch_pinned Common/Mu_OEM_Sample https://github.com/microsoft/mu_oem_sample.git "${MU_OEM_SHA}"
+fetch_pinned Silicium-ACPI https://github.com/Project-Silicium/Silicium-ACPI.git "${SILICIUM_ACPI_SHA}"
+fetch_pinned Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl \
+  https://github.com/openssl/openssl.git "${OPENSSL_SHA}"
 
 python3 build_uefi.py -d mro -r "${TARGET}" -c

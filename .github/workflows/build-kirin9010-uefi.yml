@@ -28,20 +28,24 @@ jobs:
       - name: Fetch Mu / EDK2 dependencies
         working-directory: uefi
         run: |
-          git clone --depth 1 -b release/202608 https://github.com/microsoft/mu_basecore.git Mu_Basecore
-          git clone --depth 1 -b release/202608 https://github.com/microsoft/mu_plus.git Common/Mu
-          git clone --depth 1 -b release/202608 https://github.com/microsoft/mu_oem_sample.git Common/Mu_OEM_Sample
-          git clone --depth 1 https://github.com/Project-Silicium/Silicium-ACPI.git Silicium-ACPI
-          # The pinned revision is a commit hash, fetch it explicitly instead of -b
-          mkdir -p Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl
-          git -C Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl init -q
-          git -C Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl remote add origin https://github.com/openssl/openssl.git
-          # Secure Boot is disabled, so a missing pin must not fail the build
-          if git -C Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl fetch -q --depth 1 origin 67b5686b4419b4cb8caa502711c41815f5279751; then
-            git -C Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl checkout -q FETCH_HEAD
-          else
-            echo "warning: unable to fetch openssl pin, continuing"
-          fi
+          # The reference tree pins every dependency by commit hash
+          fetch_pinned() {
+            local path="$1" url="$2" sha="$3"
+            [ -d "${path}/.git" ] && return 0
+            mkdir -p "${path}"
+            git -C "${path}" init -q
+            git -C "${path}" remote add origin "${url}"
+            if ! git -C "${path}" fetch -q --depth 1 origin "${sha}"; then
+              git -C "${path}" fetch -q origin
+            fi
+            git -C "${path}" checkout -q "${sha}"
+          }
+
+          fetch_pinned Mu_Basecore https://github.com/microsoft/mu_basecore.git cfb93724a06ff86ff5ba971413368a7809ee42a5
+          fetch_pinned Common/Mu https://github.com/microsoft/mu_plus.git b8d46c71610318e36a661819e1e3c0b8bdda413a
+          fetch_pinned Common/Mu_OEM_Sample https://github.com/microsoft/mu_oem_sample.git b70b4b7bb02c43bf9db2172dfb3ed0457e2361d6
+          fetch_pinned Silicium-ACPI https://github.com/Project-Silicium/Silicium-ACPI.git 2d465ad77c25de908f0ec7bdfcb57f865b61233c
+          fetch_pinned Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl https://github.com/openssl/openssl.git 67b5686b4419b4cb8caa502711c41815f5279751
 
       - name: Build UEFI
         working-directory: uefi
